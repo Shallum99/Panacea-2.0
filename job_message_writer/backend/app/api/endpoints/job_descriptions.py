@@ -9,9 +9,7 @@ from app.db.database import get_db
 from app.db import models
 from app.schemas.job_description import JobDescriptionBase, JobDescriptionCreate, JobDescriptionResponse
 from app.llm.claude_client import ClaudeClient
-
-# Import the helper function from resumes
-from app.api.endpoints.resumes import get_or_create_default_user
+from app.api.endpoints.auth import get_current_user  # Import the authentication dependency
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -33,12 +31,13 @@ async def analyze_job_description(
 @router.post("/", response_model=JobDescriptionResponse)
 async def create_job_description(
     job_desc: JobDescriptionCreate,
+    current_user: models.User = Depends(get_current_user),  # Use authenticated user
     db: Session = Depends(get_db)
 ) -> Any:
     """Create a new job description with Claude analysis."""
     try:
-        # Get or create default user
-        user = get_or_create_default_user(db)
+        # Use authenticated user
+        user = current_user
         
         # Extract company info using Claude
         claude_client = ClaudeClient()
@@ -72,12 +71,13 @@ async def create_job_description(
 def read_job_descriptions(
     skip: int = 0,
     limit: int = 100,
+    current_user: models.User = Depends(get_current_user),  # Use authenticated user
     db: Session = Depends(get_db)
 ) -> Any:
     """Get all job descriptions."""
     try:
-        # Get default user
-        user = get_or_create_default_user(db)
+        # Use authenticated user
+        user = current_user
         
         # Get job descriptions for this user
         job_descriptions = db.query(models.JobDescription).filter(
@@ -107,11 +107,16 @@ def read_job_descriptions(
 @router.get("/{jd_id}", response_model=JobDescriptionResponse)
 def read_job_description(
     jd_id: int,
+    current_user: models.User = Depends(get_current_user),  # Use authenticated user
     db: Session = Depends(get_db)
 ) -> Any:
     """Get a specific job description by ID."""
     try:
-        jd = db.query(models.JobDescription).filter(models.JobDescription.id == jd_id).first()
+        # Get the job description that belongs to the current user
+        jd = db.query(models.JobDescription).filter(
+            models.JobDescription.id == jd_id,
+            models.JobDescription.owner_id == current_user.id
+        ).first()
         
         if not jd:
             raise HTTPException(status_code=404, detail="Job description not found")

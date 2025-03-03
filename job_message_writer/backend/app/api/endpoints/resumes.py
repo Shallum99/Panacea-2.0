@@ -10,26 +10,10 @@ from app.db import models
 from app.schemas.resume import ResumeResponse, ResumeContentResponse
 from app.llm.claude_client import ClaudeClient
 from app.utils.pdf_extractor import extract_text_from_pdf
+from app.api.endpoints.auth import get_current_user  # Import the authentication dependency
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-
-# Helper function to get or create a default user for development
-def get_or_create_default_user(db: Session):
-    """Get or create a default user for development purposes."""
-    db_user = db.query(models.User).first()
-    
-    if not db_user:
-        db_user = models.User(
-            email="user@example.com",
-            hashed_password="dummy_hashed_password",
-            is_active=True
-        )
-        db.add(db_user)
-        db.commit()
-        db.refresh(db_user)
-        
-    return db_user
 
 # Helper function to ensure correct types in extracted info
 def ensure_correct_types(extracted_info: Dict[str, Any]) -> Dict[str, Any]:
@@ -207,12 +191,13 @@ async def create_resume(
     title: str = Form(...),  # Profile name (e.g., "My Backend Developer Resume")
     file: UploadFile = File(...),  # Now this is required
     make_active: bool = Form(True),  # Whether to make this the active profile
+    current_user: models.User = Depends(get_current_user),  # Use authenticated user
     db: Session = Depends(get_db)
 ) -> Any:
     """Create a new resume profile from a PDF file."""
     try:
-        # Get or create default user
-        user = get_or_create_default_user(db)
+        # Use authenticated user
+        user = current_user
         
         # Check if file is a PDF
         if not file.filename.lower().endswith('.pdf'):
@@ -311,12 +296,13 @@ async def create_resume(
 def read_resumes(
     skip: int = 0,
     limit: int = 100,
+    current_user: models.User = Depends(get_current_user),  # Use authenticated user
     db: Session = Depends(get_db)
 ) -> Any:
     """Get all resume profiles for the current user."""
     try:
-        # Get default user
-        user = get_or_create_default_user(db)
+        # Use authenticated user
+        user = current_user
         
         # Get resumes for this user
         resumes = db.query(models.Resume).filter(
@@ -368,12 +354,13 @@ def read_resumes(
 
 @router.get("/active", response_model=ResumeResponse)
 def get_active_resume(
+    current_user: models.User = Depends(get_current_user),  # Use authenticated user
     db: Session = Depends(get_db)
 ) -> Any:
     """Get the user's active resume profile."""
     try:
-        # Get default user
-        user = get_or_create_default_user(db)
+        # Use authenticated user
+        user = current_user
         
         # Get active resume
         resume = db.query(models.Resume).filter(
@@ -437,12 +424,13 @@ def get_active_resume(
 @router.post("/{resume_id}/set-active", response_model=ResumeResponse)
 def set_active_resume(
     resume_id: int,
+    current_user: models.User = Depends(get_current_user),  # Use authenticated user
     db: Session = Depends(get_db)
 ) -> Any:
     """Set a specific resume profile as the active one."""
     try:
-        # Get default user
-        user = get_or_create_default_user(db)
+        # Use authenticated user
+        user = current_user
         
         # Check if the resume exists and belongs to the user
         resume = db.query(models.Resume).filter(
@@ -508,12 +496,13 @@ def set_active_resume(
 @router.get("/{resume_id}", response_model=ResumeResponse)
 def read_resume(
     resume_id: int,
+    current_user: models.User = Depends(get_current_user),  # Use authenticated user
     db: Session = Depends(get_db)
 ) -> Any:
     """Get a specific resume by ID with extracted information."""
     try:
-        # Get default user
-        user = get_or_create_default_user(db)
+        # Use authenticated user
+        user = current_user
         
         resume = db.query(models.Resume).filter(
             models.Resume.id == resume_id,
@@ -567,12 +556,13 @@ def read_resume(
 @router.get("/{resume_id}/content", response_model=ResumeContentResponse)
 def read_resume_content(
     resume_id: int,
+    current_user: models.User = Depends(get_current_user),  # Use authenticated user
     db: Session = Depends(get_db)
 ) -> Any:
     """Get the content of a specific resume with extracted information."""
     try:
-        # Get default user
-        user = get_or_create_default_user(db)
+        # Use authenticated user
+        user = current_user
         
         resume = db.query(models.Resume).filter(
             models.Resume.id == resume_id,

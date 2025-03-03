@@ -11,20 +11,21 @@ from app.schemas.message import MessageRequest, MessageResponse
 from app.llm.claude_client import ClaudeClient
 
 # Import the helper function from resumes
-from app.api.endpoints.resumes import get_or_create_default_user
+from app.api.endpoints.auth import get_current_user
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 @router.post("/generate", response_model=MessageResponse)
 async def generate_message(
-    request: MessageRequest, 
+    request: MessageRequest,
+    current_user: models.User = Depends(get_current_user), 
     db: Session = Depends(get_db)
 ) -> Any:
     """Generate a personalized message based on resume ID (or active profile), job description, and message type."""
     try:
         # Get or create default user
-        user = get_or_create_default_user(db)
+        user = current_user
         
         # Get resume from database - either the specified one or the active one
         if request.resume_id:
@@ -160,9 +161,10 @@ async def generate_message(
         Tone: {type_details['tone']}
         Structure: {type_details['structure']}
         
-        {f"6. RECRUITER NAME: {request.recruiter_name}" if request.recruiter_name else ""}
+        {f"6. RECRUITER NAME: {request.recruiter_name}" if request.recruiter_name else "Hiring Team"}
         
         Requirements:
+        - If recruiter name is provided, address them directly or use a general greeting
         - Include applicant's name and contact information
         - Keep the message appropriate for {type_details['format']} with {type_details['length']}
         - Follow the structure: {type_details['structure']}
