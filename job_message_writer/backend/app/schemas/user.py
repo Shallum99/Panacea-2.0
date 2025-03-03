@@ -13,3 +13,12 @@ class UserResponse(UserBase):
     
     class Config:
         orm_mode = True
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user_id: int
+    email: str
+
+class TokenData(BaseModel):
+    email: Optional[str] = None

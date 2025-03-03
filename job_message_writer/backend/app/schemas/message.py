@@ -14,6 +14,7 @@ class MessageRequest(BaseModel):
     resume_id: Optional[int] = None  # Optional - if not provided, use active profile
     job_description: str
     message_type: str  # "linkedin", "inmail", "email", "ycombinator"
+    recruiter_name: Optional[str] = None  # Optional recruiter name
 
 class MessageResponse(BaseModel):
     message: str

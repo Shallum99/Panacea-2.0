@@ -71,6 +71,60 @@ async def generate_message(
         company_info = await claude_client.extract_company_info(request.job_description)
         
         # Generate message using resume content, profile type, and extracted info
+        # Define message type characteristics
+        message_type_info = {
+            "linkedin_message": {
+                "format": "LinkedIn Message",
+                "length": "around 300 characters",
+                "purpose": "a direct message to a LinkedIn connection",
+                "tone": "professional yet conversational",
+                "structure": "brief introduction, interest in position, 1-2 key qualifications, call to action"
+            },
+            "linkedin_connection": {
+                "format": "LinkedIn Connection Request",
+                "length": "around 200 characters",
+                "purpose": "a request to connect on LinkedIn",
+                "tone": "brief and professional",
+                "structure": "very brief introduction, reason for connecting, 1 key qualification, polite closing"
+            },
+            "linkedin_inmail": {
+                "format": "LinkedIn InMail",
+                "length": "around 2000 characters",
+                "purpose": "a more detailed message to a recruiter not in your network",
+                "tone": "professional and confident",
+                "structure": "formal greeting, introduction, background summary, key qualifications that match the job, specific company interest, call to action"
+            },
+            "email_short": {
+                "format": "Short Email",
+                "length": "around 1000 characters",
+                "purpose": "a concise job application email",
+                "tone": "professional and direct",
+                "structure": "greeting, brief introduction, 2-3 key qualifications, interest in company, call to action"
+            },
+            "email_detailed": {
+                "format": "Detailed Email",
+                "length": "around 3000 characters",
+                "purpose": "a comprehensive job application",
+                "tone": "formal and detailed",
+                "structure": "formal greeting, full introduction, detailed background, achievements, multiple qualifications aligned with job requirements, company-specific interest, detailed closing with call to action"
+            },
+            "ycombinator": {
+                "format": "Y Combinator Application",
+                "length": "around 500 characters",
+                "purpose": "a startup-focused application",
+                "tone": "direct, innovative, and impactful",
+                "structure": "concise intro, highlight of innovative abilities, entrepreneurial mindset, growth metrics if applicable, direct closing"
+            }
+        }
+        
+        # Get the message type info
+        msg_type = request.message_type
+        if msg_type not in message_type_info:
+            msg_type = "linkedin_message"  # Default fallback
+        
+        type_details = message_type_info[msg_type]
+        
+        # Generate message using resume content, profile type, and extracted info
         system_prompt = """
         You are an expert job application assistant. Your task is to craft personalized, 
         professional outreach messages from job seekers to recruiters or hiring managers.
@@ -78,8 +132,12 @@ async def generate_message(
         show interest in the company, and have an appropriate tone for the platform.
         """
         
+        recruiter_greeting = ""
+        if request.recruiter_name:
+            recruiter_greeting = f"Hi {request.recruiter_name},"
+        
         user_prompt = f"""
-        Create a personalized {request.message_type} message from a job seeker to a recruiter based on:
+        Create a personalized {type_details['format']} from a job seeker to a recruiter based on:
 
         1. RESUME CONTENT:
         {resume_content}
@@ -95,17 +153,26 @@ async def generate_message(
         4. COMPANY INFO:
         {json.dumps(company_info, indent=2)}
 
-        5. MESSAGE TYPE: {request.message_type}
+        5. MESSAGE TYPE DETAILS:
+        Format: {type_details['format']}
+        Length: {type_details['length']}
+        Purpose: {type_details['purpose']}
+        Tone: {type_details['tone']}
+        Structure: {type_details['structure']}
+        
+        {f"6. RECRUITER NAME: {request.recruiter_name}" if request.recruiter_name else ""}
         
         Requirements:
-        - Include applicants name and contact information
-        - Keep the message appropriate for the {request.message_type} format
+        - Include applicant's name and contact information
+        - Keep the message appropriate for {type_details['format']} with {type_details['length']}
+        - Follow the structure: {type_details['structure']}
+        - Use the tone: {type_details['tone']}
         - Highlight the most relevant skills from the resume that match the job
         - Reference specific company information and emphasize experience relevant to this specific role
-        - Use an appropriate professional tone for the platform
         - Include a clear call to action
         - DO NOT use generic phrases like "I am writing to express my interest"
         - Emphasize the candidate's experience specifically as a {resume.profile_type}
+        {f"- Start the message with '{recruiter_greeting}'" if request.recruiter_name else ""}
 
         Return ONLY the message text without any additional explanation or context.
         """
