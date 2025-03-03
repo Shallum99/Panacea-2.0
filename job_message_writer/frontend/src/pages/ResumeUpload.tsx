@@ -27,7 +27,7 @@ const ResumeUpload = () => {
     },
   });
 
-  const { getRootProps, getInputProps, isDragActive, acceptedFiles } = useDropzone({
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
     accept: {
       'application/pdf': ['.pdf'],
     },
@@ -66,7 +66,8 @@ const ResumeUpload = () => {
     const progressInterval = simulateProgress();
 
     try {
-      const response = await uploadResume(file, data.title, data.makeActive);
+      await uploadResume(file, data.title, data.makeActive);
+
       clearInterval(progressInterval);
       setUploadProgress(100);
       toast.success('Resume uploaded successfully!');

@@ -1,4 +1,3 @@
-# File: backend/app/api/endpoints/auth.py
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
@@ -11,6 +10,7 @@ import logging
 from app.db.database import get_db
 from app.db import models
 from app.schemas.user import UserCreate, UserResponse, Token
+from app.core.config import settings  # Import settings
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -21,10 +21,10 @@ router = APIRouter()
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# JWT Configuration
-SECRET_KEY = "YOUR_SECRET_KEY"  # Change this to a secure random key in production
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+# JWT Configuration - Use settings from config
+SECRET_KEY = settings.SECRET_KEY
+ALGORITHM = settings.ALGORITHM
+ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
