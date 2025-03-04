@@ -23,7 +23,7 @@ services:
 
   frontend:
     build: ./frontend
-    container_name: job_message_writer_frontend
+    container_name: job_message_writer_frontend_new
     ports:
       - "80:80"
     depends_on:
@@ -33,10 +33,10 @@ services:
 
   db:
     image: postgres:14
-    container_name: job_message_writer_db
+    container_name: job_message_writer_db_new
     restart: always
     ports:
-      - "5432:5432"
+      - "5433:5432"
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=password

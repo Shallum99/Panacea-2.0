@@ -1,6 +1,16 @@
 # File: backend/app/core/config.py
 import os
 from dotenv import load_dotenv
+# Near the top of the file, add:
+# Near the top of the file, add this import:
+
+# In the Settings class, modify the DATABASE_URL definition:
+def __init__(self):
+    # Your existing code...
+    
+    # Handle Render's postgres:// format by converting to postgresql://
+    if self.DATABASE_URL and self.DATABASE_URL.startswith("postgres://"):
+        self.DATABASE_URL = self.DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 # Load environment variables from .env file
 load_dotenv()
