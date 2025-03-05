@@ -5,14 +5,7 @@ from dotenv import load_dotenv
 # Near the top of the file, add this import:
 
 # In the Settings class, modify the DATABASE_URL definition:
-def __init__(self):
-    # Your existing code...
-    
-    # Handle Render's postgres:// format by converting to postgresql://
-    if self.DATABASE_URL and self.DATABASE_URL.startswith("postgres://"):
-        self.DATABASE_URL = self.DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# Load environment variables from .env file
 load_dotenv()
 
 class Settings:
@@ -25,13 +18,8 @@ class Settings:
     POSTGRES_SERVER: str = os.getenv("POSTGRES_SERVER", "localhost")
     POSTGRES_PORT: str = os.getenv("POSTGRES_PORT", "5432")
     POSTGRES_DB: str = os.getenv("POSTGRES_DB", "job_message_writer")
-    DATABASE_URL: str = os.getenv("DATABASE_URL")
+    DATABASE_URL: str = os.getenv("DATABASE_URL", f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_SERVER}:{POSTGRES_PORT}/{POSTGRES_DB}")
     
-    # Very important for Render deployment
-    if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-
     # LLM settings
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3:8b")

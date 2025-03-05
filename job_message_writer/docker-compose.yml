@@ -23,20 +23,20 @@ services:
 
   frontend:
     build: ./frontend
-    container_name: job_message_writer_frontend_new
+    container_name: job_message_writer_frontend
     ports:
       - "80:80"
     depends_on:
       - backend
     environment:
-      - VITE_API_BASE_URL=http://localhost:8000/api
+      - VITE_API_BASE_URL=http://localhost:8000
 
   db:
     image: postgres:14
-    container_name: job_message_writer_db_new
+    container_name: job_message_writer_db
     restart: always
     ports:
-      - "5433:5432"
+      - "5432:5432"
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=password

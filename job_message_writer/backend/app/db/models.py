@@ -66,7 +66,7 @@ class Resume(Base):
     __tablename__ = "resumes"
     __table_args__ = {'extend_existing': True}
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     title = Column(String)  # This will be the profile name (e.g., "My Backend Resume", "My Frontend Resume")
     content = Column(Text)
     file_path = Column(String, nullable=True)  # Path to resume file in S3
