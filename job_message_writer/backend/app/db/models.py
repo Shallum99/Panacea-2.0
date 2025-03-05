@@ -18,18 +18,6 @@ class User(Base):
     job_descriptions = relationship("JobDescription", back_populates="owner")
     messages = relationship("Message", back_populates="owner")
 
-class Resume(Base):
-    __tablename__ = "resumes"
-
-    id = Column(Integer, primary_key=True, index=True)
-    title = Column(String)
-    content = Column(Text)
-    file_path = Column(String, nullable=True)  # Path to resume file in S3
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-    owner_id = Column(Integer, ForeignKey("users.id"))
-    
-    owner = relationship("User", back_populates="resumes")
 
 class JobDescription(Base):
     __tablename__ = "job_descriptions"
