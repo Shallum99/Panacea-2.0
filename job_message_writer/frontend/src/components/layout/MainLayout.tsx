@@ -33,6 +33,9 @@ const MainLayout = () => {
                   <Link to="/message-generator" className="text-neutral-700 dark:text-neutral-300 hover:text-primary-600 dark:hover:text-primary-400">
                     Generate Message
                   </Link>
+                  <Link to="/resume-tailor" className="text-neutral-700 dark:text-neutral-300 hover:text-primary-600 dark:hover:text-primary-400">
+                    Tailor Resume                
+                  </Link>
                 </>
               )}
             </nav>
