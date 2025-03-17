@@ -17,6 +17,7 @@ const Signup = lazy(() => import('./pages/Signup'));
 const ResumeUpload = lazy(() => import('./pages/ResumeUpload'));
 const Dashboard = lazy(() => import('./pages/Dashboard'));
 const MessageGenerator = lazy(() => import('./pages/MessageGenerator'));
+const ResumeTailor = lazy(() => import('./pages/ResumeTailor'));
 
 // Loading component
 const Loading = () => (
@@ -59,6 +60,7 @@ function App() {
             >
               <Route path="/resume-upload" element={<ResumeUpload />} />
               <Route path="/dashboard" element={<Dashboard />} />
+              <Route path="/resume-tailor" element={<ResumeTailor />} />
               <Route path="/message-generator" element={<MessageGenerator />} />
             </Route>
             
