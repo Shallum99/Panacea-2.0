@@ -17,6 +17,7 @@ const Signup = lazy(() => import('./pages/Signup'));
 const ResumeUpload = lazy(() => import('./pages/ResumeUpload'));
 const Dashboard = lazy(() => import('./pages/Dashboard'));
 const MessageGenerator = lazy(() => import('./pages/MessageGenerator'));
+const AgentChat = lazy(() => import('./pages/AgentChat'));
 
 // Loading component
 const Loading = () => (
@@ -57,6 +58,7 @@ function App() {
                 </ProtectedRoute>
               }
             >
+              <Route path="/agent" element={<AgentChat />} />
               <Route path="/resume-upload" element={<ResumeUpload />} />
               <Route path="/dashboard" element={<Dashboard />} />
               <Route path="/message-generator" element={<MessageGenerator />} />
