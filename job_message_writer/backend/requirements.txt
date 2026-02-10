@@ -13,3 +13,4 @@ pyjwt==2.6.0
 python-jose==3.3.0
 bcrypt==4.0.1
 pdfplumber==0.11.5
+PyMuPDF
