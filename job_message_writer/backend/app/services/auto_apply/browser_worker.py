@@ -14,7 +14,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-from playwright.async_api import async_playwright, Page, Browser
+try:
+    from playwright.async_api import async_playwright, Page, Browser
+except ImportError:
+    async_playwright = None
+    Page = None
+    Browser = None
 
 logger = logging.getLogger(__name__)
 
