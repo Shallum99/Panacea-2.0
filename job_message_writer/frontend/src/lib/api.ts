@@ -8,8 +8,12 @@ const api = axios.create({
   },
 });
 
-// Attach Supabase token to every request
+// Attach Supabase token to every request (skip in dev mode)
 api.interceptors.request.use(async (config) => {
+  if (process.env.NEXT_PUBLIC_DEV_MODE === "true") {
+    return config;
+  }
+
   const supabase = createClient();
   const {
     data: { session },
@@ -26,7 +30,7 @@ api.interceptors.request.use(async (config) => {
 api.interceptors.response.use(
   (response) => response,
   async (error) => {
-    if (error.response?.status === 401) {
+    if (error.response?.status === 401 && process.env.NEXT_PUBLIC_DEV_MODE !== "true") {
       const supabase = createClient();
       await supabase.auth.signOut();
       window.location.href = "/login";

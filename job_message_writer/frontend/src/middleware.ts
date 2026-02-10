@@ -4,6 +4,11 @@ import { NextResponse, type NextRequest } from "next/server";
 const publicPaths = ["/", "/login", "/signup", "/callback"];
 
 export async function middleware(request: NextRequest) {
+  // Dev mode: skip all auth, let everything through
+  if (process.env.NEXT_PUBLIC_DEV_MODE === "true") {
+    return NextResponse.next({ request });
+  }
+
   let supabaseResponse = NextResponse.next({ request });
 
   const supabase = createServerClient(

@@ -3,6 +3,7 @@ Supabase Auth dependency for FastAPI.
 Validates Supabase JWT tokens using JWKS and auto-creates local user records.
 """
 
+import os
 import jwt
 import httpx
 import logging
@@ -17,7 +18,7 @@ from app.db import models
 
 logger = logging.getLogger(__name__)
 
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)  # Don't auto-error so dev mode can skip
 
 # Cache the JWKS for performance
 _jwks_cache = None
@@ -82,6 +83,28 @@ async def get_current_user(
     Validate Supabase JWT and return the local user record.
     Auto-creates user if they don't exist yet.
     """
+    # Dev mode: return first user or create a dev user
+    if os.environ.get("DEV_MODE", "").lower() == "true":
+        user = db.query(models.User).first()
+        if not user:
+            user = models.User(
+                email="dev@localhost",
+                supabase_id="dev-local-user",
+                is_active=True,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            logger.info("Dev mode: created dev user")
+        return user
+
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     token = credentials.credentials
 
     credentials_exception = HTTPException(

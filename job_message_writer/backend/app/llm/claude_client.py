@@ -22,18 +22,20 @@ class ClaudeClient:
             "content-type": "application/json"
         }
         self.model = os.environ.get("ANTHROPIC_MODEL", "claude-3-sonnet-20240229")
-        logger.info(f"Initialized ClaudeClient with model: {self.model}")
+        self.fast_model = os.environ.get("ANTHROPIC_FAST_MODEL", "claude-haiku-4-5-20251001")
+        logger.info(f"Initialized ClaudeClient with model: {self.model}, fast_model: {self.fast_model}")
         
-    async def _send_request(self, system_prompt: str, user_prompt: str, max_tokens: int = 4096) -> str:
+    async def _send_request(self, system_prompt: str, user_prompt: str, max_tokens: int = 4096, model: str = None) -> str:
         """Send a request to the Claude API."""
-        logger.info(f"Sending request to Claude API with model: {self.model}")
+        use_model = model or self.model
+        logger.info(f"Sending request to Claude API with model: {use_model}")
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     self.base_url,
                     headers=self.headers,
                     json={
-                        "model": self.model,
+                        "model": use_model,
                         "system": system_prompt,
                         "messages": [
                             {
@@ -57,6 +59,44 @@ class ClaudeClient:
         except Exception as e:
             logger.error(f"Error in Claude API request: {str(e)}")
             raise
+
+    async def _stream_request(self, system_prompt: str, user_prompt: str, max_tokens: int = 4096, model: str = None):
+        """Stream a request to the Claude API, yielding text chunks."""
+        use_model = model or self.model
+        logger.info(f"Streaming request to Claude API with model: {use_model}")
+        async with httpx.AsyncClient() as client:
+            async with client.stream(
+                "POST",
+                self.base_url,
+                headers=self.headers,
+                json={
+                    "model": use_model,
+                    "system": system_prompt,
+                    "messages": [{"role": "user", "content": user_prompt}],
+                    "max_tokens": max_tokens,
+                    "stream": True,
+                },
+                timeout=120.0,
+            ) as response:
+                if response.status_code != 200:
+                    body = await response.aread()
+                    logger.error(f"Streaming API request failed: {response.status_code}: {body.decode()}")
+                    raise Exception(f"API request failed with status code {response.status_code}")
+
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(data_str)
+                        if data.get("type") == "content_block_delta":
+                            text = data.get("delta", {}).get("text", "")
+                            if text:
+                                yield text
+                    except json.JSONDecodeError:
+                        continue
 
     async def extract_company_info(self, job_description: str) -> Dict[str, Any]:
         """Extract company information from a job description."""
@@ -86,8 +126,10 @@ class ClaudeClient:
         """
         
         try:
-            response_text = await self._send_request(system_prompt, user_prompt)
-            
+            response_text = await self._send_request(
+                system_prompt, user_prompt, max_tokens=1024, model=self.fast_model
+            )
+
             # Try to parse the JSON response
             try:
                 return json.loads(response_text)

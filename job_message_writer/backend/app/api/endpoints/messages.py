@@ -173,10 +173,21 @@ async def generate_message(
         Return ONLY the message text without any additional explanation or context.
         """
 
+        # Cap max_tokens based on message type to speed up generation
+        max_tokens_map = {
+            "linkedin_message": 512,
+            "linkedin_connection": 256,
+            "linkedin_inmail": 1536,
+            "email_short": 1024,
+            "email_detailed": 2048,
+            "ycombinator": 512,
+        }
+        msg_max_tokens = max_tokens_map.get(msg_type, 2048)
+
         # Run company info extraction and message generation in parallel
         company_info, message = await asyncio.gather(
             claude_client.extract_company_info(request.job_description),
-            claude_client._send_request(system_prompt, user_prompt),
+            claude_client._send_request(system_prompt, user_prompt, max_tokens=msg_max_tokens),
         )
         
         # Save the generated message in the database

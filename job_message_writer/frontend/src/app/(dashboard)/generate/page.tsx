@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
+import { createClient } from "@/lib/supabase/client";
 import { getResumes, type Resume } from "@/lib/api/resumes";
 import {
-  createApplication,
+  streamApplication,
   type Application,
   type CreateApplicationRequest,
 } from "@/lib/api/applications";
@@ -63,6 +64,7 @@ export default function GeneratePage() {
     }
     setGenerating(true);
     setResult(null);
+    setEditedMessage("");
 
     try {
       const payload: CreateApplicationRequest = {
@@ -74,18 +76,28 @@ export default function GeneratePage() {
         position_title: positionTitle || undefined,
         job_url: jobUrl || undefined,
       };
-      const app = await createApplication(payload);
-      setResult(app);
-      setEditedMessage(app.generated_message || "");
-      toast.success("Message generated");
+
+      await streamApplication(
+        payload,
+        (text) => setEditedMessage((prev) => prev + text),
+        (app) => {
+          setResult(app);
+          setGenerating(false);
+          toast.success("Message generated");
+        },
+        (error) => {
+          toast.error(error || "Failed to generate message");
+          setGenerating(false);
+        },
+        async () => {
+          const supabase = createClient();
+          const { data: { session } } = await supabase.auth.getSession();
+          return session?.access_token || null;
+        },
+      );
     } catch (err: unknown) {
-      const msg =
-        err && typeof err === "object" && "response" in err
-          ? (err as { response?: { data?: { detail?: string } } }).response
-              ?.data?.detail
-          : undefined;
-      toast.error(msg || "Failed to generate message");
-    } finally {
+      const msg = err instanceof Error ? err.message : "Failed to generate message";
+      toast.error(msg);
       setGenerating(false);
     }
   }
@@ -238,14 +250,29 @@ export default function GeneratePage() {
         {/* Right column — result */}
         <div>
           {generating ? (
-            <div className="border border-border rounded-lg p-6 space-y-3 animate-pulse">
-              <div className="h-4 bg-muted rounded w-1/3" />
-              <div className="h-3 bg-muted rounded w-full" />
-              <div className="h-3 bg-muted rounded w-5/6" />
-              <div className="h-3 bg-muted rounded w-4/6" />
-              <div className="h-3 bg-muted rounded w-full" />
-              <div className="h-3 bg-muted rounded w-3/4" />
-            </div>
+            editedMessage ? (
+              <div className="border border-accent/30 rounded-lg overflow-hidden">
+                <div className="px-4 py-3 border-b border-border flex items-center gap-2">
+                  <div className="h-2 w-2 bg-accent rounded-full animate-pulse" />
+                  <p className="text-sm font-medium text-muted-foreground">
+                    Generating...
+                  </p>
+                </div>
+                <div className="px-4 py-3 text-sm font-mono leading-relaxed whitespace-pre-wrap min-h-[300px] max-h-[500px] overflow-y-auto">
+                  {editedMessage}
+                  <span className="inline-block w-2 h-4 bg-accent/70 animate-pulse ml-0.5 align-text-bottom" />
+                </div>
+              </div>
+            ) : (
+              <div className="border border-border rounded-lg p-6 space-y-3 animate-pulse">
+                <div className="h-4 bg-muted rounded w-1/3" />
+                <div className="h-3 bg-muted rounded w-full" />
+                <div className="h-3 bg-muted rounded w-5/6" />
+                <div className="h-3 bg-muted rounded w-4/6" />
+                <div className="h-3 bg-muted rounded w-full" />
+                <div className="h-3 bg-muted rounded w-3/4" />
+              </div>
+            )
           ) : result ? (
             <div className="border border-border rounded-lg overflow-hidden">
               <div className="px-4 py-3 border-b border-border flex items-center justify-between">

@@ -3,6 +3,7 @@ Application endpoints — create, list, update, approve, send email.
 """
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
 from typing import List, Optional
@@ -177,10 +178,21 @@ Requirements:
 Return ONLY the message text without any additional explanation or context.
 """
 
+        # Cap max_tokens based on message type
+        max_tokens_map = {
+            "linkedin_message": 512,
+            "linkedin_connection": 256,
+            "linkedin_inmail": 1536,
+            "email_short": 1024,
+            "email_detailed": 2048,
+            "ycombinator": 512,
+        }
+        msg_max_tokens = max_tokens_map.get(msg_type, 2048)
+
         # Run company info extraction and message generation in parallel
         company_info, generated_message = await asyncio.gather(
             claude.extract_company_info(request.job_description),
-            claude._send_request(system_prompt, user_prompt),
+            claude._send_request(system_prompt, user_prompt, max_tokens=msg_max_tokens),
         )
         company_name = company_info.get("company_name", "Unknown")
 
@@ -218,6 +230,212 @@ Return ONLY the message text without any additional explanation or context.
         logger.error(f"Error creating application: {e}")
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/stream")
+async def stream_application(
+    request: ApplicationCreate,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Stream message generation via SSE. Same logic as create_application but
+    streams tokens as they're generated instead of waiting for the full response.
+    """
+    # Resolve resume (same as create_application)
+    resume = None
+    if request.resume_id:
+        resume = (
+            db.query(models.Resume)
+            .filter(
+                models.Resume.id == request.resume_id,
+                models.Resume.owner_id == current_user.id,
+            )
+            .first()
+        )
+        if not resume:
+            raise HTTPException(status_code=404, detail="Resume not found")
+    else:
+        resume = (
+            db.query(models.Resume)
+            .filter(
+                models.Resume.owner_id == current_user.id,
+                models.Resume.is_active == True,
+            )
+            .first()
+        )
+        if not resume:
+            resume = (
+                db.query(models.Resume)
+                .filter(models.Resume.owner_id == current_user.id)
+                .order_by(models.Resume.created_at.desc())
+                .first()
+            )
+        if not resume:
+            raise HTTPException(
+                status_code=404,
+                detail="No resume found. Upload a resume first.",
+            )
+
+    # Save job description (commit now so it's available inside the stream generator)
+    job_desc = models.JobDescription(
+        title=request.position_title or "Untitled",
+        content=request.job_description,
+        owner_id=current_user.id,
+    )
+    db.add(job_desc)
+    db.commit()
+    db.refresh(job_desc)
+
+    # Build prompt
+    claude = ClaudeClient()
+    resume_content = resume.content or ""
+
+    message_type_info = {
+        "linkedin_message": {"format": "LinkedIn Message", "length": "around 300 characters", "tone": "professional yet conversational", "structure": "brief introduction, interest in position, 1-2 key qualifications, call to action"},
+        "linkedin_connection": {"format": "LinkedIn Connection Request", "length": "around 200 characters", "tone": "brief and professional", "structure": "very brief introduction, reason for connecting, 1 key qualification, polite closing"},
+        "linkedin_inmail": {"format": "LinkedIn InMail", "length": "around 2000 characters", "tone": "professional and confident", "structure": "formal greeting, introduction, background summary, key qualifications, specific company interest, call to action"},
+        "email_short": {"format": "Short Email", "length": "around 1000 characters", "tone": "professional and direct", "structure": "greeting, brief introduction, 2-3 key qualifications, interest in company, call to action"},
+        "email_detailed": {"format": "Detailed Email", "length": "around 3000 characters", "tone": "formal and detailed", "structure": "formal greeting, full introduction, detailed background, achievements, qualifications aligned with job, company-specific interest, closing with call to action"},
+        "ycombinator": {"format": "Y Combinator Application", "length": "around 500 characters", "tone": "direct, innovative, and impactful", "structure": "concise intro, highlight of innovative abilities, entrepreneurial mindset, growth metrics if applicable, direct closing"},
+    }
+
+    msg_type = request.message_type
+    if msg_type not in message_type_info:
+        msg_type = "email_detailed"
+    type_details = message_type_info[msg_type]
+
+    recruiter_greeting = ""
+    if request.recruiter_name:
+        recruiter_greeting = f"Hi {request.recruiter_name},"
+
+    system_prompt = (
+        "You are an expert job application assistant. Craft personalized, "
+        "professional outreach messages from job seekers to recruiters or hiring managers."
+    )
+
+    user_prompt = f"""
+Create a personalized {type_details['format']} from a job seeker to a recruiter based on:
+
+1. RESUME CONTENT:
+{resume_content}
+
+2. PROFILE TYPE: {resume.profile_type}
+Primary languages: {resume.primary_languages}
+Frameworks: {resume.frameworks}
+Experience level: {resume.seniority} with {resume.years_experience}
+
+3. JOB DESCRIPTION:
+{request.job_description}
+
+4. MESSAGE TYPE DETAILS:
+Format: {type_details['format']}
+Length: {type_details['length']}
+Tone: {type_details['tone']}
+Structure: {type_details['structure']}
+
+{f"5. RECRUITER NAME: {request.recruiter_name}" if request.recruiter_name else "Hiring Team"}
+
+Requirements:
+- If recruiter name is provided, address them directly
+- Include applicant's name and contact information
+- Keep the message appropriate for {type_details['format']} with {type_details['length']}
+- Highlight the most relevant skills that match the job
+- Reference specific company details from the job description
+- Include a clear call to action
+- DO NOT use generic phrases like "I am writing to express my interest"
+- Emphasize the candidate's experience as a {resume.profile_type}
+{f"- Start the message with '{recruiter_greeting}'" if request.recruiter_name else ""}
+
+Return ONLY the message text without any additional explanation or context.
+"""
+
+    max_tokens_map = {
+        "linkedin_message": 512, "linkedin_connection": 256,
+        "linkedin_inmail": 1536, "email_short": 1024,
+        "email_detailed": 2048, "ycombinator": 512,
+    }
+    msg_max_tokens = max_tokens_map.get(msg_type, 2048)
+
+    # Capture variables needed inside the generator
+    user_id = current_user.id
+    resume_id = resume.id
+    job_desc_id = job_desc.id
+
+    async def event_stream():
+        # Start company_info extraction in parallel (Haiku, fast)
+        company_info_task = asyncio.create_task(
+            claude.extract_company_info(request.job_description)
+        )
+
+        # Stream message tokens
+        full_message = ""
+        try:
+            async for chunk in claude._stream_request(
+                system_prompt, user_prompt, max_tokens=msg_max_tokens
+            ):
+                full_message += chunk
+                yield f"data: {json.dumps({'type': 'token', 'text': chunk})}\n\n"
+        except Exception as e:
+            logger.error(f"Streaming error: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'detail': str(e)})}\n\n"
+            return
+
+        # Get company info (should be done by now)
+        company_info = await company_info_task
+        company_name = company_info.get("company_name", "Unknown")
+
+        # Save to DB using a fresh session (original Depends session may be closed)
+        from app.db.database import SessionLocal
+        save_db = SessionLocal()
+        try:
+            method = models.ApplicationMethod.EMAIL.value if request.recipient_email else models.ApplicationMethod.MANUAL.value
+            job_desc_record = save_db.query(models.JobDescription).get(job_desc_id)
+            if job_desc_record:
+                job_desc_record.company_info = json.dumps(company_info)
+                save_db.flush()
+
+            application = models.Application(
+                owner_id=user_id,
+                resume_id=resume_id,
+                job_description_id=job_desc_id,
+                status=models.ApplicationStatus.MESSAGE_GENERATED.value,
+                method=method,
+                company_name=company_name,
+                position_title=request.position_title,
+                recipient_email=request.recipient_email,
+                job_url=request.job_url,
+                message_type=request.message_type,
+                generated_message=full_message,
+                final_message=full_message,
+            )
+            save_db.add(application)
+            save_db.commit()
+            save_db.refresh(application)
+
+            app_data = {
+                "id": application.id,
+                "status": application.status,
+                "method": application.method,
+                "company_name": application.company_name,
+                "position_title": application.position_title,
+                "recipient_email": application.recipient_email,
+                "message_type": application.message_type,
+                "generated_message": application.generated_message,
+                "final_message": application.final_message,
+                "resume_id": application.resume_id,
+                "job_description_id": application.job_description_id,
+                "created_at": str(application.created_at) if application.created_at else None,
+            }
+            yield f"data: {json.dumps({'type': 'done', 'application': app_data})}\n\n"
+        except Exception as e:
+            logger.error(f"Error saving streamed application: {e}")
+            save_db.rollback()
+            yield f"data: {json.dumps({'type': 'error', 'detail': str(e)})}\n\n"
+        finally:
+            save_db.close()
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @router.get("/", response_model=List[ApplicationResponse])

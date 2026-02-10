@@ -522,11 +522,14 @@ async def generate_optimized_content(
 
     # ── Define all optimization tasks as async functions ──
 
+    BULLET_BATCH_SIZE = 7  # Split large bullet sets into parallel batches
+
     async def _optimize_bullets() -> Dict[int, List[str]]:
         replacements: Dict[int, List[str]] = {}
         if not bullets:
             return replacements
 
+        # Build bullet texts with ORIGINAL indices preserved
         bullet_texts = []
         for i, bp in enumerate(bullets):
             if bp.section_name.upper().strip() in SKIP_SECTIONS:
@@ -547,7 +550,10 @@ async def generate_optimized_content(
             "to the specific job."
         )
 
-        usr_prompt = f"""Rewrite these resume bullet points to be strongly tailored for the job description below.
+        async def _process_bullet_batch(batch_texts: List[str], batch_max_tokens: int) -> Dict[int, List[str]]:
+            """Process a batch of bullets — same prompt, same parsing, same rules."""
+            batch_result: Dict[int, List[str]] = {}
+            usr_prompt = f"""Rewrite these resume bullet points to be strongly tailored for the job description below.
 
 RULES:
 1. Incorporate keywords, phrases, and terminology directly from the job description
@@ -563,7 +569,7 @@ JOB DESCRIPTION:
 {job_description[:3000]}
 
 BULLET POINTS TO OPTIMIZE:
-{chr(10).join(bullet_texts)}
+{chr(10).join(batch_texts)}
 
 OUTPUT FORMAT — Return ONLY this JSON, no explanation:
 {{
@@ -578,24 +584,41 @@ OUTPUT FORMAT — Return ONLY this JSON, no explanation:
 
 IMPORTANT: Make each bullet clearly targeted to THIS specific job. A reader should be able to tell which job this resume was tailored for.
 """
-        try:
-            logger.info(f"[BULLET OPT] Sending {len(bullet_texts)} bullets to Claude for optimization")
-            logger.info(f"[BULLET OPT] JD preview: {job_description[:200]}")
-            response = await claude._send_request(sys_prompt, usr_prompt, max_tokens=8192)
-            logger.info(f"[BULLET OPT] Claude response (first 500): {response[:500]}")
-            logger.info(f"[BULLET OPT] Claude response (last 500): {response[-500:]}")
-            parsed = _parse_json_response(response)
-            if parsed and "bullets" in parsed:
-                for item in parsed["bullets"]:
-                    idx = item.get("index", 0) - 1
-                    lines = item.get("lines", [])
-                    if 0 <= idx < len(bullets) and lines:
-                        replacements[idx] = lines
-                logger.info(f"[BULLET OPT] Parsed {len(replacements)} bullet replacements")
-            else:
-                logger.error(f"[BULLET OPT] Failed to parse response. Parsed: {parsed}")
-        except Exception as e:
-            logger.error(f"Failed to optimize bullets: {e}", exc_info=True)
+            try:
+                response = await claude._send_request(sys_prompt, usr_prompt, max_tokens=batch_max_tokens)
+                parsed = _parse_json_response(response)
+                if parsed and "bullets" in parsed:
+                    for item in parsed["bullets"]:
+                        idx = item.get("index", 0) - 1  # Original 0-based index
+                        lines = item.get("lines", [])
+                        if 0 <= idx < len(bullets) and lines:
+                            batch_result[idx] = lines
+            except Exception as e:
+                logger.error(f"Failed to optimize bullet batch: {e}", exc_info=True)
+            return batch_result
+
+        if len(bullet_texts) <= BULLET_BATCH_SIZE:
+            # Small enough for a single call
+            logger.info(f"[BULLET OPT] Sending {len(bullet_texts)} bullets in single call")
+            replacements = await _process_bullet_batch(bullet_texts, 8192)
+            logger.info(f"[BULLET OPT] Parsed {len(replacements)} bullet replacements")
+        else:
+            # Split into batches and run in parallel
+            batches = [
+                bullet_texts[i:i + BULLET_BATCH_SIZE]
+                for i in range(0, len(bullet_texts), BULLET_BATCH_SIZE)
+            ]
+            # Scale max_tokens per batch proportionally
+            tokens_per_batch = max(4096, 8192 // len(batches) * 2)
+            logger.info(f"[BULLET OPT] Splitting {len(bullet_texts)} bullets into {len(batches)} parallel batches")
+
+            batch_results = await asyncio.gather(
+                *[_process_bullet_batch(batch, tokens_per_batch) for batch in batches]
+            )
+            for batch_result in batch_results:
+                replacements.update(batch_result)
+            logger.info(f"[BULLET OPT] Parsed {len(replacements)} bullet replacements from {len(batches)} batches")
+
         return replacements
 
     async def _optimize_skills() -> Dict[int, str]:
