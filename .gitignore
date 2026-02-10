@@ -184,5 +184,11 @@ cython_debug/
 __pycache__/
 *.py[cod]
 
+# Uploaded files (keep directory structure via .gitkeep)
+job_message_writer/backend/uploads/resumes/*
+job_message_writer/backend/uploads/screenshots/*
+job_message_writer/backend/uploads/tailored/*
+!job_message_writer/backend/uploads/**/.gitkeep
+
 # Node modules
 node_modules/

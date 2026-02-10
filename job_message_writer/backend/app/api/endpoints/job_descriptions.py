@@ -9,7 +9,7 @@ from app.db.database import get_db
 from app.db import models
 from app.schemas.job_description import JobDescriptionBase, JobDescriptionCreate, JobDescriptionResponse
 from app.llm.claude_client import ClaudeClient
-from app.api.endpoints.auth import get_current_user  # Import the authentication dependency
+from app.core.supabase_auth import get_current_user
 
 router = APIRouter()
 logger = logging.getLogger(__name__)

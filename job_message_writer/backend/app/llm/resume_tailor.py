@@ -9,32 +9,52 @@ from app.schemas.resume_tailor import ResumeSection
 
 logger = logging.getLogger(__name__)
 
-async def extract_resume_sections(resume_content: str) -> Dict[str, str]:
-    """
-    Extract different sections from resume content.
-    """
+async def extract_resume_sections(resume_content):
     try:
-        # Define patterns to identify different sections
-        patterns = {
-            ResumeSection.SKILLS: r'(?:SKILLS|TECHNICAL SKILLS|CORE COMPETENCIES)(?::|.*?)$(.*?)(?=^[A-Z\s]+(?::|$)|\Z)',
-            ResumeSection.PROJECTS: r'(?:PROJECTS|PROJECT EXPERIENCE|TECHNICAL PROJECTS)(?::|.*?)$(.*?)(?=^[A-Z\s]+(?::|$)|\Z)',
-            ResumeSection.EXPERIENCE: r'(?:EXPERIENCE|WORK EXPERIENCE|PROFESSIONAL EXPERIENCE|EMPLOYMENT HISTORY)(?::|.*?)$(.*?)(?=^[A-Z\s]+(?::|$)|\Z)'
-        }
-        
-        sections = {}
-        # Make the text search friendly by ensuring each section starts on a new line
+        # Make the text search friendly
         resume_lines = resume_content.split('\n')
         resume_for_search = '\n'.join(line.strip() for line in resume_lines if line.strip())
         
-        # Extract each section using regex
-        for section_type, pattern in patterns.items():
-            matches = re.search(pattern, resume_for_search, re.MULTILINE | re.DOTALL | re.IGNORECASE)
-            if matches:
-                sections[section_type] = matches.group(1).strip()
+        # First, identify where each section begins
+        section_starts = {}
+        section_names = {
+            ResumeSection.SKILLS: ['SKILLS', 'TECHNICAL SKILLS', 'CORE COMPETENCIES'],
+            ResumeSection.PROJECTS: ['PROJECTS', 'PROJECTS - (LIVE)', 'PROJECT EXPERIENCE', 'TECHNICAL PROJECTS'],
+            ResumeSection.EXPERIENCE: ['EXPERIENCE', 'WORK EXPERIENCE', 'PROFESSIONAL EXPERIENCE', 'EMPLOYMENT HISTORY']
+        }
+        
+        lines = resume_for_search.split('\n')
+        for i, line in enumerate(lines):
+            for section_type, headers in section_names.items():
+                for header in headers:
+                    if line.startswith(header):
+                        section_starts[section_type] = i
+                        break
+        
+        # Sort the sections by their position in the document
+        sorted_sections = sorted(section_starts.items(), key=lambda x: x[1])
+        
+        # Extract content between sections
+        sections = {}
+        for i, (section_type, start_line) in enumerate(sorted_sections):
+            start_idx = start_line + 1  # Start from the line after the heading
+            
+            # Find the end of this section (start of next section or end of document)
+            if i < len(sorted_sections) - 1:
+                end_idx = sorted_sections[i+1][1]
             else:
+                end_idx = len(lines)
+                
+            # Extract and join the content
+            content = '\n'.join(lines[start_idx:end_idx])
+            sections[section_type] = content.strip()
+        
+        # Add empty values for any missing sections
+        for section_type in [ResumeSection.SKILLS, ResumeSection.PROJECTS, ResumeSection.EXPERIENCE]:
+            if section_type not in sections:
                 sections[section_type] = ""
         
-        # If we couldn't extract any sections, try letting Claude do it
+        # If we couldn't extract any sections, try the LLM approach
         if all(not content for content in sections.values()):
             sections = await extract_sections_with_llm(resume_content)
             

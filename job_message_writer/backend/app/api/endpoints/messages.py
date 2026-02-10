@@ -11,7 +11,7 @@ from app.schemas.message import MessageRequest, MessageResponse
 from app.llm.claude_client import ClaudeClient
 
 # Import the helper function from resumes
-from app.api.endpoints.auth import get_current_user
+from app.core.supabase_auth import get_current_user
 
 router = APIRouter()
 logger = logging.getLogger(__name__)

@@ -1,22 +1,43 @@
 # File: backend/app/db/models.py
-from sqlalchemy import Boolean, Column, ForeignKey, Integer, String, Text, DateTime
+from sqlalchemy import Boolean, Column, ForeignKey, Integer, String, Text, DateTime, Float, Enum as SQLEnum
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
+import enum
 
 from app.db.database import Base
+
+
+class ApplicationStatus(str, enum.Enum):
+    DRAFT = "draft"
+    MESSAGE_GENERATED = "message_generated"
+    APPROVED = "approved"
+    SENDING = "sending"
+    SENT = "sent"
+    DELIVERED = "delivered"
+    OPENED = "opened"
+    REPLIED = "replied"
+    FAILED = "failed"
+
+
+class ApplicationMethod(str, enum.Enum):
+    MANUAL = "manual"
+    EMAIL = "email"
+    AUTO_APPLY_URL = "auto_apply_url"
 
 class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
+    supabase_id = Column(String, unique=True, index=True, nullable=True)
     email = Column(String, unique=True, index=True)
-    hashed_password = Column(String)
+    hashed_password = Column(String, nullable=True)  # No longer needed with Supabase auth
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     
     resumes = relationship("Resume", back_populates="owner")
     job_descriptions = relationship("JobDescription", back_populates="owner")
     messages = relationship("Message", back_populates="owner")
+    applications = relationship("Application", back_populates="owner")
 
 
 class JobDescription(Base):
@@ -87,3 +108,47 @@ class Resume(Base):
     owner_id = Column(Integer, ForeignKey("users.id"))
     
     owner = relationship("User", back_populates="resumes")
+    applications = relationship("Application", back_populates="resume")
+
+
+class Application(Base):
+    __tablename__ = "applications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    resume_id = Column(Integer, ForeignKey("resumes.id"), nullable=True)
+    job_description_id = Column(Integer, ForeignKey("job_descriptions.id"), nullable=True)
+
+    # Application details
+    status = Column(String, default=ApplicationStatus.DRAFT.value, index=True)
+    method = Column(String, default=ApplicationMethod.MANUAL.value)
+
+    # Target info
+    company_name = Column(String, nullable=True)
+    position_title = Column(String, nullable=True)
+    recipient_email = Column(String, nullable=True)
+    recipient_name = Column(String, nullable=True)
+    job_url = Column(String, nullable=True)
+
+    # Generated content
+    message_type = Column(String, nullable=True)
+    generated_message = Column(Text, nullable=True)
+    edited_message = Column(Text, nullable=True)
+    final_message = Column(Text, nullable=True)
+
+    # Email tracking
+    email_message_id = Column(String, nullable=True)
+    sent_at = Column(DateTime(timezone=True), nullable=True)
+    opened_at = Column(DateTime(timezone=True), nullable=True)
+    replied_at = Column(DateTime(timezone=True), nullable=True)
+
+    # ATS scores
+    ats_score_before = Column(Float, nullable=True)
+    ats_score_after = Column(Float, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    owner = relationship("User", back_populates="applications")
+    resume = relationship("Resume", back_populates="applications")
+    job_description = relationship("JobDescription")

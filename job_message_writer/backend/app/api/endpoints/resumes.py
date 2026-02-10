@@ -4,13 +4,14 @@ from sqlalchemy.orm import Session
 from typing import Any, List, Dict, Optional
 import json
 import logging
+import os
 
 from app.db.database import get_db
 from app.db import models
 from app.schemas.resume import ResumeResponse, ResumeContentResponse
 from app.llm.claude_client import ClaudeClient
 from app.utils.pdf_extractor import extract_text_from_pdf
-from app.api.endpoints.auth import get_current_user  # Import the authentication dependency
+from app.core.supabase_auth import get_current_user
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -207,6 +208,16 @@ async def create_resume(
         file_content = await file.read()
         logger.info(f"Read {len(file_content)} bytes from uploaded file {file.filename}")
         
+        # Save PDF to disk for format-preservation later
+        upload_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "uploads", "resumes")
+        os.makedirs(upload_dir, exist_ok=True)
+        import uuid
+        safe_filename = f"{uuid.uuid4().hex}_{file.filename}"
+        saved_path = os.path.join(upload_dir, safe_filename)
+        with open(saved_path, "wb") as f:
+            f.write(file_content)
+        logger.info(f"Saved PDF to {saved_path}")
+
         # Extract text from PDF
         content = await extract_text_from_pdf(file_content)
         
@@ -244,7 +255,7 @@ async def create_resume(
         db_resume = models.Resume(
             title=title,
             content=content,
-            file_path=file.filename,
+            file_path=saved_path,
             owner_id=user.id,
             is_active=make_active,
             

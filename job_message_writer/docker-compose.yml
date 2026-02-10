@@ -1,48 +1,26 @@
-version: '3.8'
-
 services:
-  backend:
-    build: ./backend
-    container_name: job_message_writer_backend
-    ports:
-      - "8000:8000"
-    depends_on:
-      - db
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=password
-      - POSTGRES_SERVER=db
-      - POSTGRES_PORT=5432
-      - POSTGRES_DB=job_message_writer
-      - SECRET_KEY=${SECRET_KEY}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL}
-      - CORS_ORIGINS=http://localhost,https://yourproductiondomain.com
-    volumes:
-      - ./backend:/app
-
-  frontend:
-    build: ./frontend
-    container_name: job_message_writer_frontend
-    ports:
-      - "80:80"
-    depends_on:
-      - backend
-    environment:
-      - VITE_API_BASE_URL=http://localhost:8000
-
   db:
     image: postgres:14
-    container_name: job_message_writer_db
+    container_name: panacea_db
     restart: always
     ports:
-      - "5432:5432"
+      - "5433:5432"
     environment:
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=password
+      - POSTGRES_PASSWORD=shallum
       - POSTGRES_DB=job_message_writer
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  redis:
+    image: redis:7-alpine
+    container_name: panacea_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
 volumes:
   postgres_data:
+  redis_data:

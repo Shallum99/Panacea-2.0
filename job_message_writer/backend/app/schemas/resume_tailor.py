@@ -46,3 +46,22 @@ class SectionOptimizationRequest(BaseModel):
 
 class SectionOptimizationResponse(BaseModel):
     optimized_content: str
+
+
+class PDFOptimizeRequest(BaseModel):
+    job_description: str
+    resume_id: Optional[int] = None
+
+
+class PDFOptimizeResponse(BaseModel):
+    download_id: str
+    sections_found: List[str]
+    sections_optimized: List[str]
+    original_ats_score: float
+    optimized_ats_score: float
+
+
+class PDFSectionMapResponse(BaseModel):
+    total_spans: int
+    total_lines: int
+    sections: List[Dict[str, Any]]

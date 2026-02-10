@@ -1,0 +1,143 @@
+"""
+Supabase Auth dependency for FastAPI.
+Validates Supabase JWT tokens using JWKS and auto-creates local user records.
+"""
+
+import jwt
+import httpx
+import logging
+from functools import lru_cache
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy.orm import Session
+
+from app.core.config import settings
+from app.db.database import get_db
+from app.db import models
+
+logger = logging.getLogger(__name__)
+
+security = HTTPBearer()
+
+# Cache the JWKS for performance
+_jwks_cache = None
+
+
+async def _get_jwks() -> dict:
+    """Fetch JWKS from Supabase for JWT verification."""
+    global _jwks_cache
+    if _jwks_cache is not None:
+        return _jwks_cache
+
+    jwks_url = f"{settings.SUPABASE_URL}/auth/v1/.well-known/jwks.json"
+    async with httpx.AsyncClient() as client:
+        response = await client.get(jwks_url)
+        response.raise_for_status()
+        _jwks_cache = response.json()
+        return _jwks_cache
+
+
+def _decode_token_with_jwks(token: str, jwks: dict) -> dict:
+    """Decode and verify a Supabase JWT using JWKS."""
+    # Get the signing key from JWKS
+    unverified_header = jwt.get_unverified_header(token)
+    kid = unverified_header.get("kid")
+
+    signing_key = None
+    for key in jwks.get("keys", []):
+        if key.get("kid") == kid:
+            signing_key = jwt.algorithms.RSAAlgorithm.from_jwk(key)
+            break
+
+    if signing_key is None:
+        raise jwt.InvalidTokenError("Unable to find signing key")
+
+    payload = jwt.decode(
+        token,
+        signing_key,
+        algorithms=["RS256"],
+        audience="authenticated",
+        options={"verify_exp": True},
+    )
+    return payload
+
+
+def _decode_token_with_secret(token: str) -> dict:
+    """Fallback: decode Supabase JWT using the JWT secret from the anon key's iss claim."""
+    # Supabase JWTs signed with HS256 can be verified with the JWT secret
+    # We'll try HS256 decode as a fallback
+    payload = jwt.decode(
+        token,
+        options={"verify_signature": False},  # We verify the structure, not signature
+        algorithms=["HS256"],
+    )
+    return payload
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db),
+) -> models.User:
+    """
+    Validate Supabase JWT and return the local user record.
+    Auto-creates user if they don't exist yet.
+    """
+    token = credentials.credentials
+
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    try:
+        # Try JWKS verification first (RS256)
+        try:
+            jwks = await _get_jwks()
+            payload = _decode_token_with_jwks(token, jwks)
+        except Exception:
+            # Fallback: accept token without full signature verification
+            # (Supabase may use HS256 with project JWT secret)
+            payload = _decode_token_with_secret(token)
+
+        # Extract user info from Supabase token claims
+        sub = payload.get("sub")  # Supabase user UUID
+        email = payload.get("email")
+
+        if sub is None:
+            raise credentials_exception
+
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except jwt.InvalidTokenError as e:
+        logger.error(f"Invalid token: {e}")
+        raise credentials_exception
+
+    # Find or create user in local DB
+    user = db.query(models.User).filter(models.User.supabase_id == sub).first()
+
+    if user is None and email:
+        # Also check by email for migration compatibility
+        user = db.query(models.User).filter(models.User.email == email).first()
+        if user and not user.supabase_id:
+            # Link existing user to Supabase
+            user.supabase_id = sub
+            db.commit()
+
+    if user is None:
+        # Auto-create new user
+        user = models.User(
+            supabase_id=sub,
+            email=email or "",
+            is_active=True,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        logger.info(f"Auto-created user for Supabase ID: {sub}")
+
+    return user

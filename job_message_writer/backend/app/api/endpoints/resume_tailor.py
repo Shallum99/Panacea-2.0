@@ -1,25 +1,32 @@
 # File: backend/app/api/endpoints/resume_tailor.py
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from typing import Any, Dict
 import logging
 import json
+import os
+import uuid
 
 from app.db.database import get_db
 from app.db import models
 from app.schemas.resume_tailor import (
-    ResumeTailorRequest, ResumeTailorResponse, ATSScoreRequest, 
+    ResumeTailorRequest, ResumeTailorResponse, ATSScoreRequest,
     ATSScoreResponse, SectionContent, ResumeSection,
-    SectionOptimizationRequest, SectionOptimizationResponse
+    SectionOptimizationRequest, SectionOptimizationResponse,
+    PDFOptimizeRequest, PDFOptimizeResponse, PDFSectionMapResponse,
 )
 from app.utils.ats_scorer import (
-    calculate_match_score, get_keyword_match, 
+    calculate_match_score, get_keyword_match,
     generate_improvement_suggestions
 )
 from app.llm.resume_tailor import (
     extract_resume_sections, optimize_section
 )
-from app.api.endpoints.auth import get_current_user
+from app.services.pdf_format_preserver import (
+    optimize_pdf, build_section_map
+)
+from app.core.supabase_auth import get_current_user
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -64,7 +71,6 @@ async def optimize_resume(
         
         # Extract sections from resume
         resume_sections = await extract_resume_sections(resume_content)
-        
         # Calculate original ATS score
         original_ats_score = await calculate_match_score(resume_content, request.job_description)
         
@@ -104,7 +110,7 @@ async def optimize_resume(
             optimized_ats_score=optimized_ats_score,
             optimized_sections=optimized_sections
         )
-        
+
         return response
     
     except HTTPException:
@@ -158,9 +164,152 @@ async def optimize_single_section(
         optimized_content = await optimize_section(
             request.section_type, request.section_content, request.job_description
         )
-        
+
         return SectionOptimizationResponse(optimized_content=optimized_content)
-    
+
     except Exception as e:
         logger.error(f"Error optimizing section: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _get_resume_or_active(db: Session, user: models.User, resume_id: int = None):
+    """Helper to resolve a resume by ID or get the active one."""
+    if resume_id:
+        resume = db.query(models.Resume).filter(
+            models.Resume.id == resume_id,
+            models.Resume.owner_id == user.id
+        ).first()
+        if not resume:
+            raise HTTPException(status_code=404, detail="Resume not found")
+        return resume
+
+    resume = db.query(models.Resume).filter(
+        models.Resume.owner_id == user.id,
+        models.Resume.is_active == True
+    ).first()
+    if not resume:
+        resume = db.query(models.Resume).filter(
+            models.Resume.owner_id == user.id
+        ).order_by(models.Resume.created_at.desc()).first()
+    if not resume:
+        raise HTTPException(status_code=404, detail="No resume found. Upload one first.")
+    return resume
+
+
+@router.post("/section-map", response_model=PDFSectionMapResponse)
+async def get_section_map(
+    request: PDFOptimizeRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Any:
+    """
+    Preview the section map of a resume PDF — shows what sections were detected
+    and their character counts before optimizing.
+    """
+    try:
+        resume = _get_resume_or_active(db, current_user, request.resume_id)
+
+        if not resume.file_path or not os.path.exists(resume.file_path):
+            raise HTTPException(
+                status_code=400,
+                detail="Original PDF not found. Re-upload the resume to enable format preservation."
+            )
+
+        section_map = build_section_map(resume.file_path)
+        return section_map
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error building section map: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/optimize-pdf", response_model=PDFOptimizeResponse)
+async def optimize_resume_pdf(
+    request: PDFOptimizeRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Any:
+    """
+    Optimize a resume PDF while preserving EXACT formatting.
+    Returns a download_id to retrieve the output PDF.
+    """
+    try:
+        resume = _get_resume_or_active(db, current_user, request.resume_id)
+
+        if not resume.file_path or not os.path.exists(resume.file_path):
+            raise HTTPException(
+                status_code=400,
+                detail="Original PDF not found. Re-upload the resume to enable format preservation."
+            )
+
+        # Prepare output path
+        output_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+            "uploads", "tailored"
+        )
+        os.makedirs(output_dir, exist_ok=True)
+        download_id = uuid.uuid4().hex
+        output_path = os.path.join(output_dir, f"{download_id}.pdf")
+
+        # Calculate original ATS score
+        original_score = await calculate_match_score(
+            resume.content, request.job_description
+        )
+
+        # Run format-preserving optimization
+        result = await optimize_pdf(
+            pdf_path=resume.file_path,
+            output_path=output_path,
+            job_description=request.job_description,
+            resume_content=resume.content,
+        )
+
+        # Calculate optimized ATS score from the new PDF text
+        import fitz
+        doc = fitz.open(output_path)
+        optimized_text = ""
+        for page in doc:
+            optimized_text += page.get_text()
+        doc.close()
+
+        optimized_score = await calculate_match_score(
+            optimized_text, request.job_description
+        )
+
+        return PDFOptimizeResponse(
+            download_id=download_id,
+            sections_found=result["sections_found"],
+            sections_optimized=result["sections_optimized"],
+            original_ats_score=original_score,
+            optimized_ats_score=optimized_score,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error optimizing PDF: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/download/{download_id}")
+async def download_tailored_pdf(
+    download_id: str,
+    current_user: models.User = Depends(get_current_user),
+):
+    """Download a previously optimized PDF."""
+    output_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+        "uploads", "tailored"
+    )
+    file_path = os.path.join(output_dir, f"{download_id}.pdf")
+
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Tailored PDF not found or expired")
+
+    return FileResponse(
+        file_path,
+        media_type="application/pdf",
+        filename=f"tailored_resume_{download_id[:8]}.pdf",
+    )

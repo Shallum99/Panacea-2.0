@@ -24,7 +24,7 @@ class ClaudeClient:
         self.model = os.environ.get("ANTHROPIC_MODEL", "claude-3-sonnet-20240229")
         logger.info(f"Initialized ClaudeClient with model: {self.model}")
         
-    async def _send_request(self, system_prompt: str, user_prompt: str) -> str:
+    async def _send_request(self, system_prompt: str, user_prompt: str, max_tokens: int = 4096) -> str:
         """Send a request to the Claude API."""
         logger.info(f"Sending request to Claude API with model: {self.model}")
         try:
@@ -41,9 +41,9 @@ class ClaudeClient:
                                 "content": user_prompt
                             }
                         ],
-                        "max_tokens": 1024
+                        "max_tokens": max_tokens
                     },
-                    timeout=60.0
+                    timeout=120.0
                 )
                 
                 if response.status_code != 200:

@@ -1,0 +1,1067 @@
+"""
+PDF Format Preserver — uses PyMuPDF to do in-place text replacement.
+Keeps exact same layout, fonts, sizes, colors. Only bullet-point content changes.
+
+Approach:
+1. Parse original PDF → extract every text span with formatting metadata
+2. Classify lines: BULLET_TEXT, SKILL_CONTENT, or STRUCTURE (untouched)
+3. Group bullet text into logical bullet points
+4. Send ONLY modifiable content to Claude with strict keyword-only constraints
+5. Redact target spans → re-insert new text at identical positions
+6. Apply all redactions ONCE per page → output new PDF
+"""
+
+import fitz  # PyMuPDF
+import json
+import logging
+import os
+import re
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass, field
+from enum import Enum
+
+logger = logging.getLogger(__name__)
+
+
+# ─── Data classes ───────────────────────────────────────────────────────────
+
+class LineType(Enum):
+    STRUCTURE = "structure"       # Don't touch: headers, company, dates, locations
+    BULLET_MARKER = "bullet_marker"  # The ● character itself
+    BULLET_TEXT = "bullet_text"   # Modifiable bullet point text
+    SKILL_CONTENT = "skill_content"  # Modifiable skill values after bold label
+    ZWS_PADDING = "zws_padding"  # Zero-width space padding from Google Docs
+
+
+@dataclass
+class TextSpan:
+    """A single text span with formatting metadata."""
+    page_num: int
+    bbox: Tuple[float, float, float, float]  # (x0, y0, x1, y1)
+    text: str
+    font_name: str
+    font_size: float
+    color: int
+    flags: int
+    origin: Tuple[float, float]
+
+    @property
+    def is_bold(self) -> bool:
+        return bool(self.flags & (1 << 4))
+
+    @property
+    def is_bullet_char(self) -> bool:
+        clean = self.text.replace("\u200b", "").strip()
+        return clean in ("●", "•", "◦", "○", "■", "▪")
+
+    @property
+    def is_zwsp_only(self) -> bool:
+        return not self.text.replace("\u200b", "").replace(" ", "").strip()
+
+
+@dataclass
+class ClassifiedLine:
+    """A visual line (spans grouped by y-position) with its classification."""
+    spans: List[TextSpan]
+    line_type: LineType
+    page_num: int
+    y_pos: float  # y-origin of the line
+
+    @property
+    def text(self) -> str:
+        return " ".join(s.text for s in self.spans if not s.is_zwsp_only)
+
+    @property
+    def clean_text(self) -> str:
+        return self.text.replace("\u200b", "").strip()
+
+
+@dataclass
+class BulletPoint:
+    """A complete bullet point (may span multiple visual lines)."""
+    marker_line: Optional[ClassifiedLine]  # The ● line
+    text_lines: List[ClassifiedLine]       # The text lines
+    section_name: str
+
+    @property
+    def full_text(self) -> str:
+        return " ".join(line.clean_text for line in self.text_lines)
+
+    @property
+    def line_texts(self) -> List[str]:
+        """Get text for each line, stripping bullet characters."""
+        result = []
+        for line in self.text_lines:
+            # Join only non-bullet, non-ZWS spans
+            parts = [s.text for s in line.spans
+                     if not s.is_bullet_char and not s.is_zwsp_only]
+            text = " ".join(parts).replace("\u200b", "").strip()
+            result.append(text)
+        return result
+
+    @property
+    def line_char_counts(self) -> List[int]:
+        return [len(t) for t in self.line_texts]
+
+
+@dataclass
+class SkillLine:
+    """A skills line: bold label + modifiable content."""
+    label_spans: List[TextSpan]   # Bold label ("Languages: ")
+    content_spans: List[TextSpan]  # Regular content ("Python, R, SQL...")
+    section_name: str
+
+    @property
+    def label_text(self) -> str:
+        return "".join(s.text for s in self.label_spans).replace("\u200b", "")
+
+    @property
+    def content_text(self) -> str:
+        return "".join(s.text for s in self.content_spans).replace("\u200b", "").strip()
+
+
+@dataclass
+class TitleSkillLine:
+    """A job title line with parenthesized tech stack, e.g. 'Software Engineer (React, Node, AWS)'."""
+    full_spans: List[TextSpan]     # All spans that make up the title
+    title_part: str                # "Software Engineer"
+    skills_part: str               # "React, Node, AWS"
+    full_text: str                 # "Software Engineer (React, Node, AWS)"
+
+
+# ─── Step 1: Extract spans ─────────────────────────────────────────────────
+
+def extract_spans_from_pdf(pdf_path: str) -> List[TextSpan]:
+    """Extract all text spans from a PDF with their formatting metadata."""
+    doc = fitz.open(pdf_path)
+    all_spans = []
+
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
+
+        for block in blocks:
+            if block["type"] != 0:
+                continue
+            for line in block["lines"]:
+                for span in line["spans"]:
+                    ts = TextSpan(
+                        page_num=page_num,
+                        bbox=tuple(span["bbox"]),
+                        text=span["text"],
+                        font_name=span["font"],
+                        font_size=span["size"],
+                        color=span["color"],
+                        flags=span["flags"],
+                        origin=tuple(span["origin"]),
+                    )
+                    all_spans.append(ts)
+
+    doc.close()
+    return all_spans
+
+
+# ─── Step 2: Group into visual lines ───────────────────────────────────────
+
+def group_into_visual_lines(spans: List[TextSpan]) -> List[List[TextSpan]]:
+    """Group spans by y-position into visual lines."""
+    if not spans:
+        return []
+
+    sorted_spans = sorted(spans, key=lambda s: (s.page_num, s.origin[1], s.origin[0]))
+    lines: List[List[TextSpan]] = []
+    current: List[TextSpan] = [sorted_spans[0]]
+
+    for span in sorted_spans[1:]:
+        prev = current[-1]
+        if span.page_num == prev.page_num and abs(span.origin[1] - prev.origin[1]) < 3:
+            current.append(span)
+        else:
+            lines.append(current)
+            current = [span]
+
+    if current:
+        lines.append(current)
+
+    return lines
+
+
+# ─── Step 3: Classify lines ───────────────────────────────────────────────
+
+SECTION_HEADERS = {
+    "SKILLS", "TECHNICAL SKILLS", "CORE COMPETENCIES", "TECHNOLOGIES",
+    "EXPERIENCE", "WORK EXPERIENCE", "PROFESSIONAL EXPERIENCE", "EMPLOYMENT",
+    "PROJECTS", "PROJECT EXPERIENCE", "TECHNICAL PROJECTS",
+    "EDUCATION", "CERTIFICATIONS", "CERTIFICATES",
+    "SUMMARY", "PROFESSIONAL SUMMARY", "OBJECTIVE", "ABOUT",
+    "ACHIEVEMENTS", "AWARDS", "PUBLICATIONS", "VOLUNTEER",
+    "LANGUAGES", "INTERESTS", "REFERENCES",
+    "CONTACT", "CONTACT INFORMATION",
+    "AWARDS & ACHIEVEMENTS", "AWARDS & ACHIEVEMENTS:",
+}
+
+
+def classify_lines(
+    visual_lines: List[List[TextSpan]],
+) -> Tuple[List[ClassifiedLine], Dict[str, str]]:
+    """
+    Classify each visual line and track which section it belongs to.
+    Returns classified lines and a mapping of y_pos -> section_name.
+    """
+    classified: List[ClassifiedLine] = []
+    current_section = "HEADER"  # Before first section header
+
+    # First pass: find all bullet marker y-positions
+    bullet_y_positions = set()
+    for line in visual_lines:
+        for span in line:
+            if span.is_bullet_char:
+                bullet_y_positions.add(round(span.origin[1], 1))
+
+    # Median font size for header detection
+    all_sizes = [s.font_size for line in visual_lines for s in line if not s.is_zwsp_only]
+    median_size = sorted(all_sizes)[len(all_sizes) // 2] if all_sizes else 10
+
+    for line in visual_lines:
+        page_num = line[0].page_num
+        y_pos = line[0].origin[1]
+        y_rounded = round(y_pos, 1)
+
+        # Get the combined clean text
+        clean = "".join(s.text for s in line).replace("\u200b", "").strip()
+        clean_upper = clean.upper()
+
+        # Skip completely empty / ZWS-only lines
+        if not clean:
+            classified.append(ClassifiedLine(
+                spans=line, line_type=LineType.ZWS_PADDING,
+                page_num=page_num, y_pos=y_pos,
+            ))
+            continue
+
+        # Check if this is a section header
+        is_header = False
+        for header in SECTION_HEADERS:
+            if clean_upper == header or clean_upper.startswith(header + " "):
+                is_header = True
+                current_section = clean
+                break
+
+        # Also detect by formatting: bold + short + larger font
+        if not is_header:
+            non_zwsp = [s for s in line if not s.is_zwsp_only]
+            if non_zwsp and len(clean) < 40:
+                first = non_zwsp[0]
+                if first.is_bold and first.font_size > median_size + 0.5:
+                    is_header = True
+                    current_section = clean
+
+        if is_header:
+            classified.append(ClassifiedLine(
+                spans=line, line_type=LineType.STRUCTURE,
+                page_num=page_num, y_pos=y_pos,
+            ))
+            continue
+
+        # Precompute span properties
+        non_zwsp = [s for s in line if not s.is_zwsp_only]
+        has_bullet_span = any(s.is_bullet_char for s in line)
+        text_spans = [s for s in line if not s.is_bullet_char and not s.is_zwsp_only and s.text.strip()]
+
+        # Check if this line IS a standalone bullet marker (● only, no text)
+        if non_zwsp and all(s.is_bullet_char for s in non_zwsp):
+            classified.append(ClassifiedLine(
+                spans=line, line_type=LineType.BULLET_MARKER,
+                page_num=page_num, y_pos=y_pos,
+            ))
+            continue
+
+        # ── SKILLS CHECK (must come before bullet_text check) ──
+        # Skills lines: ● Languages: Python, R, SQL... → has bullet + bold label + regular content
+        is_skill_section = current_section.upper() in (
+            "SKILLS", "TECHNICAL SKILLS", "CORE COMPETENCIES", "TECHNOLOGIES",
+        )
+        if is_skill_section and non_zwsp:
+            non_bullet = [s for s in non_zwsp if not s.is_bullet_char]
+            has_bold = any(s.is_bold for s in non_bullet)
+            has_regular = any(not s.is_bold for s in non_bullet)
+            if has_bold and has_regular:
+                classified.append(ClassifiedLine(
+                    spans=line, line_type=LineType.SKILL_CONTENT,
+                    page_num=page_num, y_pos=y_pos,
+                ))
+                continue
+            # Continuation line in skills (regular only, no bold label)
+            if not has_bold and has_regular:
+                prev_skills = [c for c in classified if c.line_type == LineType.SKILL_CONTENT]
+                if prev_skills and abs(y_pos - prev_skills[-1].y_pos) < 15:
+                    classified.append(ClassifiedLine(
+                        spans=line, line_type=LineType.SKILL_CONTENT,
+                        page_num=page_num, y_pos=y_pos,
+                    ))
+                    continue
+
+        # ── BULLET TEXT CHECK ──
+        # Only in sections that can have bullets (not HEADER, EDUCATION, SKILLS, etc.)
+        is_bullet_section = current_section.upper().strip() in (
+            "WORK EXPERIENCE", "EXPERIENCE", "PROFESSIONAL EXPERIENCE",
+            "PROJECTS", "PROJECT EXPERIENCE", "TECHNICAL PROJECTS",
+            "AWARDS", "ACHIEVEMENTS", "AWARDS & ACHIEVEMENTS", "AWARDS & ACHIEVEMENTS:",
+            "CERTIFICATIONS", "PUBLICATIONS",
+        )
+
+        # Line contains both ● and text on same visual line
+        if has_bullet_span and text_spans and is_bullet_section:
+            classified.append(ClassifiedLine(
+                spans=line, line_type=LineType.BULLET_TEXT,
+                page_num=page_num, y_pos=y_pos,
+            ))
+            continue
+
+        # Line is text-only but shares y with a bullet marker
+        if y_rounded in bullet_y_positions and text_spans and not has_bullet_span and is_bullet_section:
+            classified.append(ClassifiedLine(
+                spans=line, line_type=LineType.BULLET_TEXT,
+                page_num=page_num, y_pos=y_pos,
+            ))
+            continue
+
+        # Continuation of bullet text (same x as previous bullet's text, in bullet sections)
+        # Bold check removed: wrapped bold phrases (e.g. "availability" continuing bold from prev line)
+        # are valid continuations. The x-match + y-proximity is sufficient to distinguish from structure.
+        if non_zwsp and is_bullet_section:
+            first_non_zwsp = non_zwsp[0]
+            prev_bullets = [c for c in classified if c.line_type == LineType.BULLET_TEXT]
+            if prev_bullets:
+                last_bullet = prev_bullets[-1]
+                last_bullet_y = last_bullet.y_pos
+                # Close in y: same page within ~15 units, OR first line of new page
+                # (page break = last bullet on prev page, continuation on next page top)
+                same_page = (page_num == last_bullet.page_num)
+                y_close = same_page and abs(y_pos - last_bullet_y) < 15
+                page_break_continuation = (
+                    not same_page
+                    and page_num == last_bullet.page_num + 1
+                    and y_pos < 120  # near top of new page
+                )
+                if y_close or page_break_continuation:
+                    # Get text x of previous bullet (first non-bullet, non-zwsp span)
+                    last_text_x = None
+                    for s in last_bullet.spans:
+                        if not s.is_bullet_char and not s.is_zwsp_only and s.text.strip():
+                            last_text_x = s.origin[0]
+                            break
+                    cur_x = first_non_zwsp.origin[0]
+                    # Match if x is close to previous bullet's text x (±15 units)
+                    if last_text_x is not None and abs(cur_x - last_text_x) < 15:
+                        classified.append(ClassifiedLine(
+                            spans=line, line_type=LineType.BULLET_TEXT,
+                            page_num=page_num, y_pos=y_pos,
+                        ))
+                        continue
+
+        # Project description lines (at left margin, in PROJECTS section)
+        if (current_section.upper() in ("PROJECTS", "PROJECT EXPERIENCE", "TECHNICAL PROJECTS")
+                and non_zwsp
+                and non_zwsp[0].origin[0] < 20):
+            first_span = non_zwsp[0]
+            if not first_span.is_bold:
+                # Starts with regular text — definitely a description line
+                classified.append(ClassifiedLine(
+                    spans=line, line_type=LineType.BULLET_TEXT,
+                    page_num=page_num, y_pos=y_pos,
+                ))
+                continue
+            elif first_span.is_bold:
+                # Starts bold — could be a project title or a description continuation
+                # Project titles have patterns like "Name: description | tech"
+                first_bold_text = first_span.text.replace("\u200b", "").strip()
+                is_likely_title = (":" in first_bold_text or "|" in first_bold_text
+                                   or "–" in first_bold_text)
+                # It's a continuation ONLY if not a title and close to previous bullet line
+                if not is_likely_title:
+                    prev_bt = [c for c in classified if c.line_type == LineType.BULLET_TEXT]
+                    if prev_bt and abs(y_pos - prev_bt[-1].y_pos) < 15:
+                        classified.append(ClassifiedLine(
+                            spans=line, line_type=LineType.BULLET_TEXT,
+                            page_num=page_num, y_pos=y_pos,
+                        ))
+                        continue
+
+        # Everything else is structure (company names, dates, locations, titles)
+        classified.append(ClassifiedLine(
+            spans=line, line_type=LineType.STRUCTURE,
+            page_num=page_num, y_pos=y_pos,
+        ))
+
+    return classified, {}
+
+
+# ─── Step 4: Group bullet text into bullet points ──────────────────────────
+
+def group_bullet_points(
+    classified: List[ClassifiedLine],
+) -> Tuple[List[BulletPoint], List[SkillLine], List[TitleSkillLine]]:
+    """Group bullet text lines into logical bullet points, skill lines, and title skill lines."""
+    bullets: List[BulletPoint] = []
+    skills: List[SkillLine] = []
+    title_skills: List[TitleSkillLine] = []
+    current_section = "HEADER"
+
+    current_bullet: Optional[BulletPoint] = None
+
+    for cl in classified:
+        # Track current section
+        if cl.line_type == LineType.STRUCTURE:
+            clean_upper = cl.clean_text.upper()
+            for header in SECTION_HEADERS:
+                if clean_upper == header or clean_upper.startswith(header + " "):
+                    current_section = cl.clean_text
+                    break
+
+            # Detect title skill lines: "(Tech1, Tech2, ...)" pattern in STRUCTURE
+            clean = cl.clean_text
+            paren_match = re.search(r'\(([^)]*,\s*[^)]+)\)', clean)
+            if paren_match and current_section.upper().strip() in (
+                "WORK EXPERIENCE", "EXPERIENCE", "PROFESSIONAL EXPERIENCE",
+            ):
+                title_part = clean[:paren_match.start()].strip()
+                skills_part = paren_match.group(1).strip()
+                # Only if it looks like a tech list (multiple comma-separated items)
+                if len(skills_part.split(",")) >= 2:
+                    # Get the bold spans that contain the title text
+                    bold_spans = [s for s in cl.spans if s.is_bold and s.text.strip()]
+                    if bold_spans:
+                        title_skills.append(TitleSkillLine(
+                            full_spans=bold_spans,
+                            title_part=title_part,
+                            skills_part=skills_part,
+                            full_text=clean.strip(),
+                        ))
+
+        if cl.line_type == LineType.BULLET_MARKER:
+            # Standalone bullet marker — start a new bullet point
+            if current_bullet and current_bullet.text_lines:
+                bullets.append(current_bullet)
+            current_bullet = BulletPoint(
+                marker_line=cl, text_lines=[], section_name=current_section,
+            )
+
+        elif cl.line_type == LineType.BULLET_TEXT:
+            # Check if this line contains a bullet char (● + text on same line)
+            has_bullet_char = any(s.is_bullet_char for s in cl.spans)
+            if has_bullet_char:
+                # This is a NEW bullet point (● is inline with text)
+                if current_bullet and current_bullet.text_lines:
+                    bullets.append(current_bullet)
+                current_bullet = BulletPoint(
+                    marker_line=None, text_lines=[], section_name=current_section,
+                )
+            elif current_bullet is None:
+                # Continuation text without a marker — treat as its own bullet
+                current_bullet = BulletPoint(
+                    marker_line=None, text_lines=[], section_name=current_section,
+                )
+            current_bullet.text_lines.append(cl)
+
+        elif cl.line_type == LineType.SKILL_CONTENT:
+            # Split into label spans (bold) and content spans (regular)
+            # Skip bullet chars and ZWS-only spans
+            label_spans = []
+            content_spans = []
+            for span in cl.spans:
+                if span.is_zwsp_only or span.is_bullet_char:
+                    continue
+                if span.is_bold:
+                    label_spans.append(span)
+                else:
+                    content_spans.append(span)
+
+            if content_spans:
+                skills.append(SkillLine(
+                    label_spans=label_spans,
+                    content_spans=content_spans,
+                    section_name=current_section,
+                ))
+
+        else:
+            # Non-bullet/skill line — finalize any pending bullet
+            if current_bullet and current_bullet.text_lines:
+                bullets.append(current_bullet)
+                current_bullet = None
+
+    # Don't forget last bullet
+    if current_bullet and current_bullet.text_lines:
+        bullets.append(current_bullet)
+
+    return bullets, skills, title_skills
+
+
+# ─── Step 5: Claude optimization ──────────────────────────────────────────
+
+async def generate_optimized_content(
+    bullets: List[BulletPoint],
+    skills: List[SkillLine],
+    job_description: str,
+    title_skills: Optional[List[TitleSkillLine]] = None,
+) -> Tuple[Dict[int, List[str]], Dict[int, str], Dict[int, str]]:
+    """
+    Send bullet points, skills, and title tech stacks to Claude for optimization.
+    Returns:
+        bullet_replacements: {bullet_index: [line1_text, line2_text, ...]}
+        skill_replacements: {skill_index: "new content text"}
+        title_replacements: {title_index: "new skills part text"}
+    """
+    from app.llm.claude_client import ClaudeClient
+    claude = ClaudeClient()
+
+    # ── Optimize bullet points ──
+    bullet_replacements: Dict[int, List[str]] = {}
+
+    # Filter out awards/achievements bullets (factual, not optimizable)
+    SKIP_SECTIONS = {"AWARDS", "ACHIEVEMENTS", "AWARDS & ACHIEVEMENTS", "AWARDS & ACHIEVEMENTS:"}
+
+    if bullets:
+        bullet_texts = []
+        for i, bp in enumerate(bullets):
+            if bp.section_name.upper().strip() in SKIP_SECTIONS:
+                continue
+            lines_info = []
+            for j, lt in enumerate(bp.line_texts):
+                lines_info.append(f"    Line {j+1} ({len(lt)} chars): {lt}")
+            bullet_texts.append(f"  BULLET {i+1} ({bp.section_name}):\n" + "\n".join(lines_info))
+
+        system_prompt = (
+            "You are an expert resume optimizer. You tailor resume bullet points to match "
+            "specific job descriptions by incorporating relevant keywords, rephrasing to "
+            "emphasize relevant experience, and using terminology from the job posting. "
+            "You must make REAL, MEANINGFUL changes that make the resume clearly targeted "
+            "to the specific job."
+        )
+
+        user_prompt = f"""Rewrite these resume bullet points to be strongly tailored for the job description below.
+
+RULES:
+1. Incorporate keywords, phrases, and terminology directly from the job description
+2. Rephrase to emphasize skills and experience most relevant to this specific role
+3. Use action verbs and terminology that mirror the job posting's language
+4. PRESERVE: company names, metrics, percentages, dates, and factual claims — do NOT fabricate
+5. Each bullet must have EXACTLY the same number of lines as the original
+6. Each line should be SIMILAR length to the original (±15% character count) to fit the PDF layout
+7. Every bullet MUST be modified — do not return any bullet unchanged
+8. Focus on what the job description specifically asks for and weave those themes into each bullet
+
+JOB DESCRIPTION:
+{job_description[:3000]}
+
+BULLET POINTS TO OPTIMIZE:
+{chr(10).join(bullet_texts)}
+
+OUTPUT FORMAT — Return ONLY this JSON, no explanation:
+{{
+  "bullets": [
+    {{
+      "index": 1,
+      "lines": ["line 1 text", "line 2 text"]
+    }},
+    ...
+  ]
+}}
+
+IMPORTANT: Make each bullet clearly targeted to THIS specific job. A reader should be able to tell which job this resume was tailored for.
+"""
+        try:
+            logger.info(f"[BULLET OPT] Sending {len(bullet_texts)} bullets to Claude for optimization")
+            logger.info(f"[BULLET OPT] JD preview: {job_description[:200]}")
+            response = await claude._send_request(system_prompt, user_prompt, max_tokens=8192)
+            logger.info(f"[BULLET OPT] Claude response (first 500): {response[:500]}")
+            logger.info(f"[BULLET OPT] Claude response (last 500): {response[-500:]}")
+            parsed = _parse_json_response(response)
+            if parsed and "bullets" in parsed:
+                for item in parsed["bullets"]:
+                    idx = item.get("index", 0) - 1  # Convert 1-indexed to 0-indexed
+                    lines = item.get("lines", [])
+                    if 0 <= idx < len(bullets) and lines:
+                        bullet_replacements[idx] = lines
+                logger.info(f"[BULLET OPT] Parsed {len(bullet_replacements)} bullet replacements")
+            else:
+                logger.error(f"[BULLET OPT] Failed to parse response. Parsed: {parsed}")
+        except Exception as e:
+            logger.error(f"Failed to optimize bullets: {e}", exc_info=True)
+
+    # ── Optimize skills ──
+    skill_replacements: Dict[int, str] = {}
+
+    if skills:
+        skill_texts = []
+        for i, sk in enumerate(skills):
+            skill_texts.append(f"  {i+1}. {sk.label_text} {sk.content_text}")
+
+        system_prompt = (
+            "You are an expert resume skills optimizer. You reorder, substitute, and emphasize "
+            "skills to strongly match a specific job description."
+        )
+
+        user_prompt = f"""Optimize these skill lines to best match the job description below.
+
+RULES:
+1. REORDER skills to put the most job-relevant ones FIRST
+2. Substitute equivalent terms to match JD language (e.g., "PostgreSQL" → "Postgres", "JS" → "JavaScript", "REST" → "RESTful APIs")
+3. You may add 1-2 closely related skills if they appear in the JD and the candidate likely has them based on their other skills
+4. You may remove less relevant skills to make room for more relevant ones
+5. Keep the SAME comma-separated format
+6. Each line should be SIMILAR length to the original (±15% character count)
+7. Return ONLY the values after the label (e.g., for "Languages: Python, R, SQL" return "Python, R, SQL" — NOT "Languages: Python, R, SQL")
+8. The ordering should CLEARLY reflect what this specific job prioritizes
+
+JOB DESCRIPTION:
+{job_description[:3000]}
+
+SKILL LINES:
+{chr(10).join(skill_texts)}
+
+OUTPUT FORMAT — Return ONLY this JSON:
+{{
+  "skills": [
+    {{"index": 1, "content": "reordered, skill, values, here"}},
+    ...
+  ]
+}}
+"""
+        try:
+            response = await claude._send_request(system_prompt, user_prompt)
+            parsed = _parse_json_response(response)
+            if parsed and "skills" in parsed:
+                for item in parsed["skills"]:
+                    idx = item.get("index", 0) - 1
+                    content = item.get("content", "")
+                    if 0 <= idx < len(skills) and content:
+                        # Strip label prefix if Claude included it
+                        # e.g., "Languages: Python, R, SQL" → "Python, R, SQL"
+                        label = skills[idx].label_text.strip()
+                        if label and content.startswith(label):
+                            content = content[len(label):].strip()
+                        # Also try without trailing colon/space variations
+                        label_base = label.rstrip(": ").strip()
+                        if label_base and content.startswith(label_base):
+                            content = content[len(label_base):].lstrip(": ").strip()
+                        skill_replacements[idx] = content
+        except Exception as e:
+            logger.error(f"Failed to optimize skills: {e}")
+
+    # ── Optimize title tech stacks ──
+    title_replacements: Dict[int, str] = {}
+
+    if title_skills:
+        title_texts = []
+        for i, ts in enumerate(title_skills):
+            title_texts.append(f"  {i+1}. {ts.title_part} ({ts.skills_part})")
+
+        system_prompt = (
+            "You are a resume title optimizer. You replace the tech stack in job title "
+            "parentheses to match a target job description's technology requirements."
+        )
+
+        user_prompt = f"""Replace the tech stacks in these job title parentheses to match the job description.
+
+RULES:
+1. ONLY change the technologies inside the parentheses — do NOT change the job title itself
+2. Use technologies from the JD that the candidate actually knows (based on their current tech stacks)
+3. Keep the SAME number of technologies (same comma-separated count)
+4. Return ONLY the parenthesized content (e.g., "Node, Express, MongoDB, PostgreSQL, GCP")
+
+JOB DESCRIPTION:
+{job_description[:3000]}
+
+TITLE LINES:
+{chr(10).join(title_texts)}
+
+OUTPUT FORMAT — Return ONLY this JSON:
+{{
+  "titles": [
+    {{"index": 1, "skills": "Tech1, Tech2, Tech3"}},
+    ...
+  ]
+}}
+"""
+        try:
+            response = await claude._send_request(system_prompt, user_prompt)
+            parsed = _parse_json_response(response)
+            if parsed and "titles" in parsed:
+                for item in parsed["titles"]:
+                    idx = item.get("index", 0) - 1
+                    new_skills = item.get("skills", "")
+                    if 0 <= idx < len(title_skills) and new_skills:
+                        title_replacements[idx] = new_skills
+        except Exception as e:
+            logger.error(f"Failed to optimize title skills: {e}")
+
+    return bullet_replacements, skill_replacements, title_replacements
+
+
+def _parse_json_response(response: str) -> Optional[Dict]:
+    """Parse JSON from Claude's response, handling markdown code blocks."""
+    response = response.strip()
+    # Strip markdown code block (handle triple backticks anywhere)
+    if "```" in response:
+        # Extract content between first ``` and last ```
+        match = re.search(r'```(?:json)?\s*\n?([\s\S]*?)\n?\s*```', response)
+        if match:
+            response = match.group(1).strip()
+        else:
+            # Just strip leading/trailing ```
+            response = re.sub(r'^```(?:json)?\s*\n?', '', response)
+            response = re.sub(r'\n?\s*```\s*$', '', response)
+    try:
+        return json.loads(response)
+    except json.JSONDecodeError as e:
+        logger.warning(f"[JSON PARSE] First attempt failed: {e}")
+        logger.warning(f"[JSON PARSE] Response start: {response[:200]}")
+        logger.warning(f"[JSON PARSE] Response end: {response[-200:]}")
+        # Try to find JSON object in response
+        match = re.search(r'(\{[\s\S]*\})', response)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError as e2:
+                logger.warning(f"[JSON PARSE] Second attempt failed: {e2}")
+        # Try finding JSON array wrapper
+        match = re.search(r'(\[[\s\S]*\])', response)
+        if match:
+            try:
+                obj = json.loads(match.group(1))
+                return {"bullets": obj} if isinstance(obj, list) else None
+            except json.JSONDecodeError:
+                pass
+    return None
+
+
+# ─── Step 6: Apply changes to PDF ─────────────────────────────────────────
+
+def apply_changes_to_pdf(
+    pdf_path: str,
+    output_path: str,
+    bullets: List[BulletPoint],
+    skills: List[SkillLine],
+    bullet_replacements: Dict[int, List[str]],
+    skill_replacements: Dict[int, str],
+    title_skills: Optional[List[TitleSkillLine]] = None,
+    title_replacements: Optional[Dict[int, str]] = None,
+) -> str:
+    """Apply optimized text back to the PDF.
+
+    Strategy: redact original text → clean_contents → insert_text at original coords.
+    clean_contents() normalizes the content stream so insert_text coordinates work correctly.
+    """
+    doc = fitz.open(pdf_path)
+    page_width = doc[0].rect.width
+    right_margin = 14.4
+
+    # Collect operations per page: redactions and insertions
+    page_ops: Dict[int, Dict] = {}  # {page_num: {"redacts": [...], "inserts": [...]}}
+
+    def ensure_page(pn: int):
+        if pn not in page_ops:
+            page_ops[pn] = {"redacts": [], "inserts": []}
+
+    def add_replacement(page_num: int, spans: List[TextSpan], new_text: str):
+        """Queue a text replacement: redact spans, then insert new text."""
+        ensure_page(page_num)
+
+        # Redact each span individually
+        for s in spans:
+            page_ops[page_num]["redacts"].append(s.bbox)
+
+        # Queue insertion at first span's origin
+        first = spans[0]
+        font = _map_to_usable_font(first.font_name)
+        color = _int_to_rgb(first.color)
+        available_width = page_width - first.origin[0] - right_margin
+        fitted_text, fitted_size = _fit_text(new_text, font, first.font_size, available_width)
+
+        page_ops[page_num]["inserts"].append({
+            "point": first.origin,
+            "text": fitted_text,
+            "font": font,
+            "size": fitted_size,
+            "color": color,
+        })
+
+    # ── Process bullet replacements ──
+    bullet_ops_count = 0
+    for idx, new_lines in bullet_replacements.items():
+        if idx >= len(bullets):
+            logger.warning(f"[APPLY] Bullet idx {idx} >= len(bullets) {len(bullets)}, skipping")
+            continue
+        bp = bullets[idx]
+        logger.info(f"[APPLY] Bullet {idx}: {len(bp.text_lines)} text_lines, {len(new_lines)} new_lines")
+
+        for line_idx, text_line in enumerate(bp.text_lines):
+            if line_idx >= len(new_lines):
+                logger.warning(f"[APPLY] Bullet {idx} line {line_idx}: no corresponding new_line")
+                break
+
+            new_text = new_lines[line_idx].strip()
+            if not new_text:
+                logger.warning(f"[APPLY] Bullet {idx} line {line_idx}: empty new_text")
+                continue
+
+            # Get the text spans to replace (skip bullet chars and ZWS)
+            text_spans = [s for s in text_line.spans
+                          if not s.is_bullet_char and not s.is_zwsp_only and s.text.strip()]
+            if not text_spans:
+                logger.warning(f"[APPLY] Bullet {idx} line {line_idx}: NO text_spans found! Span details:")
+                for s in text_line.spans:
+                    logger.warning(f"  span: bullet={s.is_bullet_char}, zwsp={s.is_zwsp_only}, text='{s.text[:50]}', font={s.font_name}")
+                continue
+
+            logger.info(f"[APPLY] Bullet {idx} line {line_idx}: replacing {len(text_spans)} spans with '{new_text[:60]}...'")
+            add_replacement(text_spans[0].page_num, text_spans, new_text)
+            bullet_ops_count += 1
+
+    logger.info(f"[APPLY] Total bullet text replacements queued: {bullet_ops_count}")
+
+    # ── Process skill replacements ──
+    for idx, new_content in skill_replacements.items():
+        if idx >= len(skills):
+            continue
+        sk = skills[idx]
+        if not sk.content_spans:
+            continue
+
+        add_replacement(sk.content_spans[0].page_num, sk.content_spans, new_content)
+
+    # ── Process title skill replacements ──
+    if title_skills and title_replacements:
+        for idx, new_skills in title_replacements.items():
+            if idx >= len(title_skills):
+                continue
+            ts = title_skills[idx]
+            if not ts.full_spans:
+                continue
+
+            # Rebuild the full title text with new skills in parentheses
+            new_full = f"{ts.title_part} ({new_skills})"
+            logger.info(f"[APPLY] Title {idx}: '{ts.full_text[:60]}' -> '{new_full[:60]}'")
+            add_replacement(ts.full_spans[0].page_num, ts.full_spans, new_full)
+
+    # ── Apply all operations per page: redact → clean → insert ──
+    for page_num in sorted(page_ops.keys()):
+        ops = page_ops[page_num]
+        page = doc[page_num]
+
+        # Phase 1: Add all redaction annotations (white fill, no replacement text)
+        for bbox in ops["redacts"]:
+            rect = fitz.Rect(bbox)
+            rect.y0 -= 0.5
+            rect.y1 += 0.5
+            rect.x1 += 1  # small expansion to fully cover
+            page.add_redact_annot(rect, fill=(1, 1, 1), cross_out=False)
+
+        # Phase 2: Apply redactions (removes original text, paints white)
+        page.apply_redactions()
+
+        # Phase 3: Normalize content stream so insert_text coords work
+        page.clean_contents()
+
+        # Phase 4: Insert replacement text at original coordinates
+        for ins in ops["inserts"]:
+            page.insert_text(
+                fitz.Point(ins["point"][0], ins["point"][1]),
+                ins["text"],
+                fontname=ins["font"],
+                fontsize=ins["size"],
+                color=ins["color"],
+            )
+
+    doc.save(output_path, garbage=4, deflate=True)
+    doc.close()
+    return output_path
+
+
+def _int_to_rgb(color: int) -> Tuple[float, float, float]:
+    """Convert integer color to RGB tuple (0-1 range)."""
+    r = ((color >> 16) & 0xFF) / 255.0
+    g = ((color >> 8) & 0xFF) / 255.0
+    b = (color & 0xFF) / 255.0
+    return (r, g, b)
+
+
+def _map_to_usable_font(font_name: str) -> str:
+    """Map an original font name to a PyMuPDF-usable font."""
+    name_lower = font_name.lower()
+
+    if "times" in name_lower or "serif" in name_lower:
+        if "bold" in name_lower and "italic" in name_lower:
+            return "tibi"
+        elif "bold" in name_lower:
+            return "tibo"
+        elif "italic" in name_lower:
+            return "tiit"
+        return "tiro"
+
+    if "arial" in name_lower or "helvetica" in name_lower or "sans" in name_lower:
+        if "bold" in name_lower and "italic" in name_lower:
+            return "hebi"
+        elif "bold" in name_lower:
+            return "hebo"
+        elif "italic" in name_lower or "oblique" in name_lower:
+            return "heit"
+        return "helv"
+
+    if "courier" in name_lower or "mono" in name_lower:
+        if "bold" in name_lower:
+            return "cobo"
+        elif "italic" in name_lower or "oblique" in name_lower:
+            return "coit"
+        return "cour"
+
+    if "calibri" in name_lower or "cambria" in name_lower:
+        if "bold" in name_lower:
+            return "hebo"
+        return "helv"
+
+    if "garamond" in name_lower:
+        if "bold" in name_lower:
+            return "tibo"
+        return "tiro"
+
+    # Default
+    if "bold" in name_lower:
+        return "tibo"
+    if "italic" in name_lower:
+        return "tiit"
+    return "tiro"
+
+
+def _fit_text(text: str, font: str, size: float, max_width: float) -> Tuple[str, float]:
+    """
+    Fit text to available width. Returns (text, font_size).
+    Tries reducing font size first, truncates at word boundary as last resort.
+    """
+    try:
+        text_width = fitz.get_text_length(text, fontname=font, fontsize=size)
+        if text_width <= max_width:
+            return text, size
+
+        # Try reducing font size by up to 1.5pt
+        for reduction in [0.25, 0.5, 0.75, 1.0, 1.25, 1.5]:
+            smaller = size - reduction
+            if smaller < 6:
+                break
+            w = fitz.get_text_length(text, fontname=font, fontsize=smaller)
+            if w <= max_width:
+                return text, smaller
+
+        # Last resort: truncate at word boundary using smallest tried size
+        min_size = max(size - 1.5, 6)
+        words = text.split()
+        result = ""
+        for word in words:
+            test = result + (" " if result else "") + word
+            w = fitz.get_text_length(test, fontname=font, fontsize=min_size)
+            if w > max_width:
+                break
+            result = test
+
+        return (result if result else text), min_size
+
+    except Exception:
+        return text, size
+
+
+# ─── Public API ────────────────────────────────────────────────────────────
+
+def build_section_map(pdf_path: str) -> Dict[str, Any]:
+    """Build a map of the PDF structure for preview."""
+    spans = extract_spans_from_pdf(pdf_path)
+    lines = group_into_visual_lines(spans)
+    classified, _ = classify_lines(lines)
+    bullets, skills, title_skills = group_bullet_points(classified)
+
+    return {
+        "total_spans": len(spans),
+        "total_lines": len(lines),
+        "sections": [
+            {
+                "name": "Bullet Points",
+                "num_content_lines": len(bullets),
+                "content_text": "\n".join(
+                    f"● {bp.full_text}" for bp in bullets
+                ),
+                "char_count": sum(len(bp.full_text) for bp in bullets),
+            },
+            {
+                "name": "Skills",
+                "num_content_lines": len(skills),
+                "content_text": "\n".join(
+                    f"{sk.label_text} {sk.content_text}" for sk in skills
+                ),
+                "char_count": sum(len(sk.content_text) for sk in skills),
+            },
+            {
+                "name": "Title Tech Stacks",
+                "num_content_lines": len(title_skills),
+                "content_text": "\n".join(
+                    f"{ts.title_part} ({ts.skills_part})" for ts in title_skills
+                ),
+                "char_count": sum(len(ts.skills_part) for ts in title_skills),
+            },
+        ],
+    }
+
+
+async def optimize_pdf(
+    pdf_path: str,
+    output_path: str,
+    job_description: str,
+    resume_content: str,
+) -> Dict[str, Any]:
+    """
+    Main entry point: optimize a resume PDF while preserving exact formatting.
+    Only modifies bullet point text and skill values.
+    """
+    logger.info(f"Starting PDF format preservation for {pdf_path}")
+
+    # Step 1: Extract and classify
+    spans = extract_spans_from_pdf(pdf_path)
+    lines = group_into_visual_lines(spans)
+    classified, _ = classify_lines(lines)
+
+    bullet_count = sum(1 for c in classified if c.line_type == LineType.BULLET_TEXT)
+    skill_count = sum(1 for c in classified if c.line_type == LineType.SKILL_CONTENT)
+    structure_count = sum(1 for c in classified if c.line_type == LineType.STRUCTURE)
+    logger.info(f"Classified: {bullet_count} bullet text lines, {skill_count} skill lines, {structure_count} structure lines (untouched)")
+
+    # Step 2: Group into bullet points, skill lines, and title skill lines
+    bullets, skills, title_skills = group_bullet_points(classified)
+    logger.info(f"Found {len(bullets)} bullet points, {len(skills)} skill lines, {len(title_skills)} title skill lines")
+
+    # Step 3: Optimize with Claude
+    bullet_replacements, skill_replacements, title_replacements = await generate_optimized_content(
+        bullets, skills, job_description, title_skills,
+    )
+    logger.info(f"Optimized {len(bullet_replacements)} bullets, {len(skill_replacements)} skills, {len(title_replacements)} title skills")
+
+    # Step 4: Apply to PDF
+    apply_changes_to_pdf(
+        pdf_path, output_path,
+        bullets, skills,
+        bullet_replacements, skill_replacements,
+        title_skills, title_replacements,
+    )
+    logger.info(f"Saved optimized PDF to {output_path}")
+
+    sections_optimized = []
+    if bullet_replacements:
+        sections_optimized.append("Bullet Points")
+    if skill_replacements:
+        sections_optimized.append("Skills")
+    if title_replacements:
+        sections_optimized.append("Title Tech Stacks")
+
+    return {
+        "sections_found": ["Bullet Points", "Skills", "Title Tech Stacks"],
+        "sections_optimized": sections_optimized,
+        "output_path": output_path,
+    }
