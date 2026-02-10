@@ -89,34 +89,11 @@ async def email_auto_apply(
     if not resume:
         raise HTTPException(status_code=404, detail="No resume found")
 
-    # Step 1: Optionally optimize PDF
-    tailored_pdf_path = None
-    if request.optimize_resume and resume.file_path and os.path.exists(resume.file_path):
-        try:
-            output_dir = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
-                "uploads", "tailored"
-            )
-            os.makedirs(output_dir, exist_ok=True)
-            tailored_pdf_path = os.path.join(output_dir, f"auto_{uuid.uuid4().hex}.pdf")
-
-            await optimize_pdf(
-                pdf_path=resume.file_path,
-                output_path=tailored_pdf_path,
-                job_description=request.job_description,
-                resume_content=resume.content,
-            )
-        except Exception as e:
-            logger.warning(f"PDF optimization failed, using original: {e}")
-            tailored_pdf_path = None
-
-    # Step 2: Generate message
+    # Run PDF optimization, company info extraction, and message generation in parallel
     from app.llm.claude_client import ClaudeClient
     claude = ClaudeClient()
 
-    company_info = await claude.extract_company_info(request.job_description)
-    company_name = company_info.get("company_name", "Unknown")
-
+    # Build message prompt (doesn't need company_info — JD has everything)
     system_prompt = (
         "You are an expert job application assistant. Write a personalized, "
         "professional email from a job seeker to a recruiter."
@@ -129,21 +106,48 @@ RESUME:
 JOB DESCRIPTION:
 {request.job_description[:3000]}
 
-COMPANY: {company_name}
 POSITION: {request.position_title or 'the role'}
 {f"RECRUITER: {request.recruiter_name}" if request.recruiter_name else ""}
 
 Requirements:
 - Professional, concise email (200-400 words)
 - Highlight 2-3 most relevant qualifications
-- Reference the company specifically
+- Reference the company specifically by name from the job description
 - Include a clear call to action
 - Mention that resume is attached
 
 Return ONLY the email body text.
 """
 
-    message = await claude._send_request(system_prompt, user_prompt)
+    # Define PDF optimization task
+    async def _optimize_pdf_task():
+        if not (request.optimize_resume and resume.file_path and os.path.exists(resume.file_path)):
+            return None
+        try:
+            output_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+                "uploads", "tailored"
+            )
+            os.makedirs(output_dir, exist_ok=True)
+            path = os.path.join(output_dir, f"auto_{uuid.uuid4().hex}.pdf")
+            await optimize_pdf(
+                pdf_path=resume.file_path,
+                output_path=path,
+                job_description=request.job_description,
+                resume_content=resume.content,
+            )
+            return path
+        except Exception as e:
+            logger.warning(f"PDF optimization failed, using original: {e}")
+            return None
+
+    # Run all three in parallel: PDF optimization + company info + message
+    tailored_pdf_path, company_info, message = await asyncio.gather(
+        _optimize_pdf_task(),
+        claude.extract_company_info(request.job_description),
+        claude._send_request(system_prompt, user_prompt),
+    )
+    company_name = company_info.get("company_name", "Unknown")
 
     # Step 3: Send email
     pdf_path = tailored_pdf_path or resume.file_path

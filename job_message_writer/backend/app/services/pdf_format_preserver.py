@@ -513,15 +513,20 @@ async def generate_optimized_content(
         title_replacements: {title_index: "new skills part text"}
     """
     from app.llm.claude_client import ClaudeClient
-    claude = ClaudeClient()
+    import asyncio
 
-    # ── Optimize bullet points ──
-    bullet_replacements: Dict[int, List[str]] = {}
+    claude = ClaudeClient()
 
     # Filter out awards/achievements bullets (factual, not optimizable)
     SKIP_SECTIONS = {"AWARDS", "ACHIEVEMENTS", "AWARDS & ACHIEVEMENTS", "AWARDS & ACHIEVEMENTS:"}
 
-    if bullets:
+    # ── Define all optimization tasks as async functions ──
+
+    async def _optimize_bullets() -> Dict[int, List[str]]:
+        replacements: Dict[int, List[str]] = {}
+        if not bullets:
+            return replacements
+
         bullet_texts = []
         for i, bp in enumerate(bullets):
             if bp.section_name.upper().strip() in SKIP_SECTIONS:
@@ -531,7 +536,10 @@ async def generate_optimized_content(
                 lines_info.append(f"    Line {j+1} ({len(lt)} chars): {lt}")
             bullet_texts.append(f"  BULLET {i+1} ({bp.section_name}):\n" + "\n".join(lines_info))
 
-        system_prompt = (
+        if not bullet_texts:
+            return replacements
+
+        sys_prompt = (
             "You are an expert resume optimizer. You tailor resume bullet points to match "
             "specific job descriptions by incorporating relevant keywords, rephrasing to "
             "emphasize relevant experience, and using terminology from the job posting. "
@@ -539,7 +547,7 @@ async def generate_optimized_content(
             "to the specific job."
         )
 
-        user_prompt = f"""Rewrite these resume bullet points to be strongly tailored for the job description below.
+        usr_prompt = f"""Rewrite these resume bullet points to be strongly tailored for the job description below.
 
 RULES:
 1. Incorporate keywords, phrases, and terminology directly from the job description
@@ -573,36 +581,38 @@ IMPORTANT: Make each bullet clearly targeted to THIS specific job. A reader shou
         try:
             logger.info(f"[BULLET OPT] Sending {len(bullet_texts)} bullets to Claude for optimization")
             logger.info(f"[BULLET OPT] JD preview: {job_description[:200]}")
-            response = await claude._send_request(system_prompt, user_prompt, max_tokens=8192)
+            response = await claude._send_request(sys_prompt, usr_prompt, max_tokens=8192)
             logger.info(f"[BULLET OPT] Claude response (first 500): {response[:500]}")
             logger.info(f"[BULLET OPT] Claude response (last 500): {response[-500:]}")
             parsed = _parse_json_response(response)
             if parsed and "bullets" in parsed:
                 for item in parsed["bullets"]:
-                    idx = item.get("index", 0) - 1  # Convert 1-indexed to 0-indexed
+                    idx = item.get("index", 0) - 1
                     lines = item.get("lines", [])
                     if 0 <= idx < len(bullets) and lines:
-                        bullet_replacements[idx] = lines
-                logger.info(f"[BULLET OPT] Parsed {len(bullet_replacements)} bullet replacements")
+                        replacements[idx] = lines
+                logger.info(f"[BULLET OPT] Parsed {len(replacements)} bullet replacements")
             else:
                 logger.error(f"[BULLET OPT] Failed to parse response. Parsed: {parsed}")
         except Exception as e:
             logger.error(f"Failed to optimize bullets: {e}", exc_info=True)
+        return replacements
 
-    # ── Optimize skills ──
-    skill_replacements: Dict[int, str] = {}
+    async def _optimize_skills() -> Dict[int, str]:
+        replacements: Dict[int, str] = {}
+        if not skills:
+            return replacements
 
-    if skills:
         skill_texts = []
         for i, sk in enumerate(skills):
             skill_texts.append(f"  {i+1}. {sk.label_text} {sk.content_text}")
 
-        system_prompt = (
+        sys_prompt = (
             "You are an expert resume skills optimizer. You reorder, substitute, and emphasize "
             "skills to strongly match a specific job description."
         )
 
-        user_prompt = f"""Optimize these skill lines to best match the job description below.
+        usr_prompt = f"""Optimize these skill lines to best match the job description below.
 
 RULES:
 1. REORDER skills to put the most job-relevant ones FIRST
@@ -629,40 +639,39 @@ OUTPUT FORMAT — Return ONLY this JSON:
 }}
 """
         try:
-            response = await claude._send_request(system_prompt, user_prompt)
+            response = await claude._send_request(sys_prompt, usr_prompt)
             parsed = _parse_json_response(response)
             if parsed and "skills" in parsed:
                 for item in parsed["skills"]:
                     idx = item.get("index", 0) - 1
                     content = item.get("content", "")
                     if 0 <= idx < len(skills) and content:
-                        # Strip label prefix if Claude included it
-                        # e.g., "Languages: Python, R, SQL" → "Python, R, SQL"
                         label = skills[idx].label_text.strip()
                         if label and content.startswith(label):
                             content = content[len(label):].strip()
-                        # Also try without trailing colon/space variations
                         label_base = label.rstrip(": ").strip()
                         if label_base and content.startswith(label_base):
                             content = content[len(label_base):].lstrip(": ").strip()
-                        skill_replacements[idx] = content
+                        replacements[idx] = content
         except Exception as e:
             logger.error(f"Failed to optimize skills: {e}")
+        return replacements
 
-    # ── Optimize title tech stacks ──
-    title_replacements: Dict[int, str] = {}
+    async def _optimize_titles() -> Dict[int, str]:
+        replacements: Dict[int, str] = {}
+        if not title_skills:
+            return replacements
 
-    if title_skills:
         title_texts = []
         for i, ts in enumerate(title_skills):
             title_texts.append(f"  {i+1}. {ts.title_part} ({ts.skills_part})")
 
-        system_prompt = (
+        sys_prompt = (
             "You are a resume title optimizer. You replace the tech stack in job title "
             "parentheses to match a target job description's technology requirements."
         )
 
-        user_prompt = f"""Replace the tech stacks in these job title parentheses to match the job description.
+        usr_prompt = f"""Replace the tech stacks in these job title parentheses to match the job description.
 
 RULES:
 1. ONLY change the technologies inside the parentheses — do NOT change the job title itself
@@ -685,16 +694,25 @@ OUTPUT FORMAT — Return ONLY this JSON:
 }}
 """
         try:
-            response = await claude._send_request(system_prompt, user_prompt)
+            response = await claude._send_request(sys_prompt, usr_prompt)
             parsed = _parse_json_response(response)
             if parsed and "titles" in parsed:
                 for item in parsed["titles"]:
                     idx = item.get("index", 0) - 1
                     new_skills = item.get("skills", "")
                     if 0 <= idx < len(title_skills) and new_skills:
-                        title_replacements[idx] = new_skills
+                        replacements[idx] = new_skills
         except Exception as e:
             logger.error(f"Failed to optimize title skills: {e}")
+        return replacements
+
+    # Run ALL Claude calls in parallel — bullets, skills, and titles are independent
+    logger.info("[PARALLEL] Running bullet, skill, and title optimization concurrently")
+    bullet_replacements, skill_replacements, title_replacements = await asyncio.gather(
+        _optimize_bullets(),
+        _optimize_skills(),
+        _optimize_titles(),
+    )
 
     return bullet_replacements, skill_replacements, title_replacements
 

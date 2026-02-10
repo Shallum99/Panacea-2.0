@@ -2,6 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import Any, Dict, Optional
+import asyncio
 import logging
 import json
 
@@ -67,11 +68,7 @@ async def generate_message(
         
         # Use Claude client
         claude_client = ClaudeClient()
-        
-        # Extract company info
-        company_info = await claude_client.extract_company_info(request.job_description)
-        
-        # Generate message using resume content, profile type, and extracted info
+
         # Define message type characteristics
         message_type_info = {
             "linkedin_message": {
@@ -151,18 +148,15 @@ async def generate_message(
         3. JOB DESCRIPTION:
         {request.job_description}
 
-        4. COMPANY INFO:
-        {json.dumps(company_info, indent=2)}
-
-        5. MESSAGE TYPE DETAILS:
+        4. MESSAGE TYPE DETAILS:
         Format: {type_details['format']}
         Length: {type_details['length']}
         Purpose: {type_details['purpose']}
         Tone: {type_details['tone']}
         Structure: {type_details['structure']}
-        
-        {f"6. RECRUITER NAME: {request.recruiter_name}" if request.recruiter_name else "Hiring Team"}
-        
+
+        {f"5. RECRUITER NAME: {request.recruiter_name}" if request.recruiter_name else "Hiring Team"}
+
         Requirements:
         - If recruiter name is provided, address them directly or use a general greeting
         - Include applicant's name and contact information
@@ -170,7 +164,7 @@ async def generate_message(
         - Follow the structure: {type_details['structure']}
         - Use the tone: {type_details['tone']}
         - Highlight the most relevant skills from the resume that match the job
-        - Reference specific company information and emphasize experience relevant to this specific role
+        - Reference specific company details from the job description
         - Include a clear call to action
         - DO NOT use generic phrases like "I am writing to express my interest"
         - Emphasize the candidate's experience specifically as a {resume.profile_type}
@@ -178,8 +172,12 @@ async def generate_message(
 
         Return ONLY the message text without any additional explanation or context.
         """
-        
-        message = await claude_client._send_request(system_prompt, user_prompt)
+
+        # Run company info extraction and message generation in parallel
+        company_info, message = await asyncio.gather(
+            claude_client.extract_company_info(request.job_description),
+            claude_client._send_request(system_prompt, user_prompt),
+        )
         
         # Save the generated message in the database
         db_message = models.Message(

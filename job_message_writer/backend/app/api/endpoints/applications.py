@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import desc
 from typing import List, Optional
 from datetime import datetime, timezone
+import asyncio
 import logging
 import json
 
@@ -79,12 +80,8 @@ async def create_application(
         db.add(job_desc)
         db.flush()
 
-        # Extract company info + generate message via Claude
+        # Build prompt and generate message via Claude
         claude = ClaudeClient()
-        company_info = await claude.extract_company_info(request.job_description)
-        company_name = company_info.get("company_name", "Unknown")
-
-        # Build prompt (reuse logic from messages.py)
         resume_content = resume.content or ""
         try:
             resume_info = json.loads(resume.extracted_info) if resume.extracted_info else {}
@@ -158,23 +155,20 @@ Experience level: {resume.seniority} with {resume.years_experience}
 3. JOB DESCRIPTION:
 {request.job_description}
 
-4. COMPANY INFO:
-{json.dumps(company_info, indent=2)}
-
-5. MESSAGE TYPE DETAILS:
+4. MESSAGE TYPE DETAILS:
 Format: {type_details['format']}
 Length: {type_details['length']}
 Tone: {type_details['tone']}
 Structure: {type_details['structure']}
 
-{f"6. RECRUITER NAME: {request.recruiter_name}" if request.recruiter_name else "Hiring Team"}
+{f"5. RECRUITER NAME: {request.recruiter_name}" if request.recruiter_name else "Hiring Team"}
 
 Requirements:
 - If recruiter name is provided, address them directly
 - Include applicant's name and contact information
 - Keep the message appropriate for {type_details['format']} with {type_details['length']}
 - Highlight the most relevant skills that match the job
-- Reference specific company information
+- Reference specific company details from the job description
 - Include a clear call to action
 - DO NOT use generic phrases like "I am writing to express my interest"
 - Emphasize the candidate's experience as a {resume.profile_type}
@@ -183,7 +177,12 @@ Requirements:
 Return ONLY the message text without any additional explanation or context.
 """
 
-        generated_message = await claude._send_request(system_prompt, user_prompt)
+        # Run company info extraction and message generation in parallel
+        company_info, generated_message = await asyncio.gather(
+            claude.extract_company_info(request.job_description),
+            claude._send_request(system_prompt, user_prompt),
+        )
+        company_name = company_info.get("company_name", "Unknown")
 
         # Determine method
         method = models.ApplicationMethod.EMAIL.value if request.recipient_email else models.ApplicationMethod.MANUAL.value
