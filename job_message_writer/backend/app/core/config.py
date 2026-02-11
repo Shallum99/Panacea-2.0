@@ -1,10 +1,6 @@
 # File: backend/app/core/config.py
 import os
 from dotenv import load_dotenv
-# Near the top of the file, add:
-# Near the top of the file, add this import:
-
-# In the Settings class, modify the DATABASE_URL definition:
 
 load_dotenv()
 
@@ -33,8 +29,16 @@ class Settings:
     SUPABASE_ANON_KEY: str = os.getenv("SUPABASE_ANON_KEY", "")
     SUPABASE_SERVICE_KEY: str = os.getenv("SUPABASE_SERVICE_KEY", "")
     SUPABASE_JWT_AUDIENCE: str = os.getenv("SUPABASE_JWT_AUDIENCE", "authenticated")
+
+    # Google OAuth (for Gmail API — same credentials as Supabase Google provider)
+    GOOGLE_CLIENT_ID: str = os.getenv("GOOGLE_CLIENT_ID", "")
+    GOOGLE_CLIENT_SECRET: str = os.getenv("GOOGLE_CLIENT_SECRET", "")
     
-    # CORS settings
-    CORS_ORIGINS: list = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
+    # CORS settings — strip whitespace, trailing slashes, and filter empties
+    CORS_ORIGINS: list = [
+        o.strip().rstrip("/")
+        for o in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:5173").split(",")
+        if o.strip()
+    ]
 
 settings = Settings()
