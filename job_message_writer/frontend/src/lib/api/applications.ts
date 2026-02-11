@@ -77,8 +77,14 @@ export async function approveApplication(id: number): Promise<Application> {
   return data;
 }
 
-export async function sendApplication(id: number): Promise<Application> {
-  const { data } = await api.post(`/applications/${id}/send`);
+export async function sendApplication(
+  id: number,
+  tailoredDownloadId?: string
+): Promise<Application> {
+  const body = tailoredDownloadId
+    ? { tailored_download_id: tailoredDownloadId }
+    : {};
+  const { data } = await api.post(`/applications/${id}/send`, body);
   return data;
 }
 

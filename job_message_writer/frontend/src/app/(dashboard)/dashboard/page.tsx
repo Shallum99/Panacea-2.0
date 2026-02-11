@@ -20,16 +20,10 @@ const STEPS = [
     cta: "Upload",
   },
   {
-    label: "Generate Message",
-    desc: "Create a tailored application message",
+    label: "Generate & Tailor",
+    desc: "Create a message and optimize your resume for a job",
     href: "/generate",
-    cta: "Generate",
-  },
-  {
-    label: "Tailor Resume",
-    desc: "Optimize your resume for a specific job",
-    href: "/tailor",
-    cta: "Tailor",
+    cta: "Get started",
   },
 ];
 
@@ -37,18 +31,17 @@ function GettingStarted({ stats, loading }: { stats: Stats; loading: boolean }) 
   const completedSteps = [
     stats.resumes > 0,
     stats.applications > 0,
-    false, // tailor is always "available", never marked done
   ];
 
   // Find first incomplete step
-  const currentStep = completedSteps[0] ? (completedSteps[1] ? 2 : 1) : 0;
+  const currentStep = completedSteps[0] ? 1 : 0;
 
   if (loading) {
     return (
       <div className="border border-border rounded-lg p-6 animate-pulse">
         <div className="h-5 bg-muted rounded w-40 mb-4" />
         <div className="flex gap-4">
-          {[1, 2, 3].map((i) => (
+          {[1, 2].map((i) => (
             <div key={i} className="flex-1 h-20 bg-muted/30 rounded-lg" />
           ))}
         </div>
@@ -56,7 +49,7 @@ function GettingStarted({ stats, loading }: { stats: Stats; loading: boolean }) 
     );
   }
 
-  // All steps done (both resumes and applications exist) — don't show stepper
+  // All steps done — don't show stepper
   if (completedSteps[0] && completedSteps[1]) return null;
 
   return (
@@ -241,8 +234,8 @@ export default function DashboardPage() {
       {/* Quick Actions */}
       <div className="grid grid-cols-3 gap-3">
         {[
-          { label: "Generate Message", href: "/generate", desc: "Create a tailored application" },
-          { label: "Tailor Resume", href: "/tailor", desc: "Optimize for a job description" },
+          { label: "Generate & Tailor", href: "/generate", desc: "Create a message or optimize your resume" },
+          { label: "Applications", href: "/applications", desc: "View all your applications" },
           { label: "Upload Resume", href: "/resumes/upload", desc: "Add a new resume" },
         ].map((action) => (
           <Link

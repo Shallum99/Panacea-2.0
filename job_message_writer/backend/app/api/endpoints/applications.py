@@ -18,6 +18,7 @@ from app.schemas.application import (
     ApplicationCreate,
     ApplicationUpdate,
     ApplicationResponse,
+    SendRequest,
 )
 from app.core.supabase_auth import get_current_user
 from app.llm.claude_client import ClaudeClient
@@ -527,10 +528,11 @@ async def approve_application(
 @router.post("/{application_id}/send", response_model=ApplicationResponse)
 async def send_application(
     application_id: int,
+    body: SendRequest = SendRequest(),
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Send the application email via SendGrid."""
+    """Send the application email via Gmail."""
     app = (
         db.query(models.Application)
         .filter(
@@ -568,12 +570,26 @@ async def send_application(
     # Use stored subject or fall back to default
     subject = app.subject or (f"Application for {app.position_title}" if app.position_title else "Job Application")
 
-    # Get resume PDF if available
+    # Get resume PDF to attach
     from app.services.storage import is_local_path, download_file, RESUMES_BUCKET
     import os
     resume_pdf_bytes = None
     resume_filename = None
-    if app.resume_id:
+
+    # If tailored resume requested, use that instead
+    if body.tailored_download_id:
+        try:
+            from app.services.storage import TAILORED_BUCKET
+            storage_path = f"{current_user.id}/{body.tailored_download_id}.pdf"
+            resume_pdf_bytes = await download_file(TAILORED_BUCKET, storage_path)
+            resume = db.query(models.Resume).filter(models.Resume.id == app.resume_id).first() if app.resume_id else None
+            resume_filename = f"{resume.title or 'resume'}_tailored.pdf" if resume else "resume_tailored.pdf"
+        except Exception:
+            logger.warning("Failed to download tailored resume, falling back to original")
+            resume_pdf_bytes = None
+
+    # Fall back to original resume if no tailored or tailored download failed
+    if resume_pdf_bytes is None and app.resume_id:
         resume = db.query(models.Resume).filter(models.Resume.id == app.resume_id).first()
         if resume and resume.file_path:
             if is_local_path(resume.file_path):

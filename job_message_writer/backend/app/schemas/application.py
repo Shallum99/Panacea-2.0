@@ -21,6 +21,10 @@ class ApplicationUpdate(BaseModel):
     status: Optional[str] = None
 
 
+class SendRequest(BaseModel):
+    tailored_download_id: Optional[str] = None
+
+
 class ApplicationResponse(BaseModel):
     id: int
     status: str
