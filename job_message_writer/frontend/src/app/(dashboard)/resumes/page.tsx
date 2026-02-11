@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { toast } from "sonner";
 import { getResumes, setActiveResume, deleteResume, type Resume } from "@/lib/api/resumes";
@@ -8,6 +8,8 @@ import { getResumes, setActiveResume, deleteResume, type Resume } from "@/lib/ap
 export default function ResumesPage() {
   const [resumes, setResumes] = useState<Resume[]>([]);
   const [loading, setLoading] = useState(true);
+  const [deleteTarget, setDeleteTarget] = useState<Resume | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
     loadResumes();
@@ -36,16 +38,32 @@ export default function ResumesPage() {
     }
   }
 
-  async function handleDelete(id: number) {
-    if (!confirm("Delete this resume? This cannot be undone.")) return;
+  async function confirmDelete() {
+    if (!deleteTarget) return;
+    setDeleting(true);
     try {
-      await deleteResume(id);
-      setResumes((prev) => prev.filter((r) => r.id !== id));
+      await deleteResume(deleteTarget.id);
+      setResumes((prev) => prev.filter((r) => r.id !== deleteTarget.id));
       toast.success("Resume deleted");
+      setDeleteTarget(null);
     } catch {
       toast.error("Failed to delete resume");
+    } finally {
+      setDeleting(false);
     }
   }
+
+  // Close modal on Escape
+  const handleKeyDown = useCallback((e: KeyboardEvent) => {
+    if (e.key === "Escape") setDeleteTarget(null);
+  }, []);
+
+  useEffect(() => {
+    if (deleteTarget) {
+      document.addEventListener("keydown", handleKeyDown);
+      return () => document.removeEventListener("keydown", handleKeyDown);
+    }
+  }, [deleteTarget, handleKeyDown]);
 
   return (
     <div className="space-y-6">
@@ -153,7 +171,7 @@ export default function ResumesPage() {
                     </button>
                   )}
                   <button
-                    onClick={() => handleDelete(resume.id)}
+                    onClick={() => setDeleteTarget(resume)}
                     className="text-xs text-muted-foreground hover:text-destructive transition-colors"
                   >
                     Delete
@@ -162,6 +180,45 @@ export default function ResumesPage() {
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Delete confirmation modal */}
+      {deleteTarget && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center"
+          onClick={() => setDeleteTarget(null)}
+        >
+          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+          <div
+            className="relative bg-background border border-border rounded-xl p-6 w-full max-w-sm mx-4 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-base font-semibold">Delete resume</h3>
+            <p className="text-sm text-muted-foreground mt-2">
+              Are you sure you want to delete{" "}
+              <span className="text-foreground font-medium">
+                {deleteTarget.title}
+              </span>
+              ? This will permanently remove the resume and its PDF. This action
+              cannot be undone.
+            </p>
+            <div className="flex justify-end gap-2 mt-6">
+              <button
+                onClick={() => setDeleteTarget(null)}
+                className="px-4 py-2 text-sm rounded-lg border border-border hover:bg-muted transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmDelete}
+                disabled={deleting}
+                className="px-4 py-2 text-sm rounded-lg bg-destructive text-destructive-foreground hover:opacity-90 transition-opacity disabled:opacity-50"
+              >
+                {deleting ? "Deleting..." : "Delete"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
