@@ -11,23 +11,37 @@ export default function CallbackPage() {
   useEffect(() => {
     const supabase = createClient();
 
-    supabase.auth.onAuthStateChange(async (event, session) => {
-      if (event === "SIGNED_IN" && session) {
-        // Capture Google refresh token (only available right after OAuth)
-        const refreshToken = session.provider_refresh_token;
-        if (refreshToken) {
-          try {
-            await api.post("/users/save-gmail-token", {
-              refresh_token: refreshToken,
-            });
-          } catch (err) {
-            console.warn("Failed to save Gmail token:", err);
-          }
+    async function saveTokenAndRedirect(session: any) {
+      const refreshToken = session?.provider_refresh_token;
+      if (refreshToken) {
+        try {
+          await api.post("/users/save-gmail-token", {
+            refresh_token: refreshToken,
+          });
+        } catch (err) {
+          console.warn("Failed to save Gmail token:", err);
         }
+      }
+      router.push("/dashboard");
+    }
 
-        router.push("/dashboard");
+    // Check if session already exists (event may have fired before mount)
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session) {
+        saveTokenAndRedirect(session);
       }
     });
+
+    // Also listen for the event in case it hasn't fired yet
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      async (event, session) => {
+        if (event === "SIGNED_IN" && session) {
+          saveTokenAndRedirect(session);
+        }
+      }
+    );
+
+    return () => subscription.unsubscribe();
   }, [router]);
 
   return (
