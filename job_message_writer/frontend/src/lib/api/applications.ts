@@ -84,6 +84,36 @@ export async function deleteApplication(id: number): Promise<void> {
   await api.delete(`/applications/${id}`);
 }
 
+// --- JD helpers ---
+
+export interface JdExtractedFields {
+  recipient_email: string | null;
+  recruiter_name: string | null;
+  company_name: string | null;
+  position_title: string | null;
+  location: string | null;
+  salary_range: string | null;
+  department: string | null;
+}
+
+export async function extractJdFields(
+  content: string
+): Promise<JdExtractedFields> {
+  const { data } = await api.post("/job-descriptions/extract-fields", {
+    content,
+  });
+  return data;
+}
+
+export async function uploadJdPdf(file: File): Promise<{ text: string }> {
+  const formData = new FormData();
+  formData.append("file", file);
+  const { data } = await api.post("/job-descriptions/upload-pdf", formData, {
+    headers: { "Content-Type": "multipart/form-data" },
+  });
+  return data;
+}
+
 /**
  * Stream message generation via SSE.
  * Tokens arrive in real-time, then final application data on completion.

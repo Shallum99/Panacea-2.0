@@ -27,6 +27,123 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+def build_message_prompts(
+    resume_content: str,
+    resume: models.Resume,
+    job_description: str,
+    message_type: str,
+    recruiter_name: Optional[str],
+) -> tuple:
+    """Return (system_prompt, user_prompt, max_tokens) for message generation."""
+
+    message_type_config = {
+        "linkedin_message": {
+            "format": "LinkedIn DM",
+            "max_chars": "300 characters max",
+            "style": "2-3 sentences. Punchy. One specific match to their role/company.",
+            "max_tokens": 512,
+        },
+        "linkedin_connection": {
+            "format": "LinkedIn connection note",
+            "max_chars": "200 characters max",
+            "style": "1-2 sentences. Ultra-concise. One hook.",
+            "max_tokens": 256,
+        },
+        "linkedin_inmail": {
+            "format": "LinkedIn InMail",
+            "max_chars": "~1500 characters",
+            "style": "3-4 short paragraphs. Lead with relevance, not introduction.",
+            "max_tokens": 1536,
+        },
+        "email_short": {
+            "format": "cold email",
+            "max_chars": "~800 characters",
+            "style": "Contact header, 2 short paragraphs mapping experience to role, one-line closer.",
+            "max_tokens": 1024,
+        },
+        "email_detailed": {
+            "format": "cold email",
+            "max_chars": "~2000 characters",
+            "style": "Contact header line, 3-4 paragraphs: (1) strongest match to JD, (2) quantified impact, (3) company-specific closer. No fluff.",
+            "max_tokens": 2048,
+        },
+        "ycombinator": {
+            "format": "YC startup application / cold email",
+            "max_chars": "~500 characters",
+            "style": "Contact header, 2-3 dense paragraphs with metrics. Ship fast, move fast energy.",
+            "max_tokens": 512,
+        },
+    }
+
+    config = message_type_config.get(message_type, message_type_config["email_detailed"])
+
+    resume_name = resume.name or ""
+    resume_email = resume.email or ""
+    resume_phone = resume.phone or ""
+
+    system_prompt = """You write job application outreach messages. Your writing style:
+
+- You sound like a confident human, never like an AI
+- You NEVER use: "I am writing to express", "I was excited to see", "I would love the opportunity", "I believe my skills", "passionate about", "thrilled", "eager", "deep expertise", "well-positioned", "aligns perfectly"
+- You NEVER open with "Dear Hiring Manager" or "Dear [Company] Team" or "Dear Recruiting Team"
+- Every sentence earns its place with a specific fact, metric, or direct connection to the JD
+- You map resume accomplishments DIRECTLY to JD requirements — show the reader you read their posting
+- Short paragraphs (2-3 sentences max), no walls of text
+- Numbers and specifics over adjectives: "$2M ARR" not "significant revenue", "40% faster" not "improved performance"
+- Close with a company-specific line showing you understand their product/mission, then a brief CTA
+- Tone: direct, competent, slightly informal — like a peer reaching out, not a supplicant begging
+- Use em dashes, not semicolons. Write how humans actually write in emails."""
+
+    contact_header = ""
+    if message_type.startswith("email") or message_type == "ycombinator":
+        parts = [p for p in [resume_name, resume_email, resume_phone] if p]
+        if parts:
+            contact_header = f"- Start with a contact header line: {' | '.join(parts)}"
+
+    greeting = ""
+    if recruiter_name:
+        greeting = f"- Address: Hi {recruiter_name},"
+    else:
+        greeting = "- No greeting line — jump straight into the message"
+
+    user_prompt = f"""Write a {config['format']} for this person applying to the role below.
+
+FORMAT:
+- {config['max_chars']}
+- Style: {config['style']}
+{greeting}
+{contact_header}
+
+RESUME (the person writing this):
+{resume_content}
+
+Profile: {resume.profile_type} | {resume.seniority} | {resume.years_experience}
+Languages: {resume.primary_languages}
+Frameworks: {resume.frameworks}
+
+JOB DESCRIPTION (what they're applying to):
+{job_description}
+
+INSTRUCTIONS:
+1. Identify the 2-3 JD requirements that BEST match this resume
+2. For each match, cite a SPECIFIC accomplishment with a number/metric from the resume
+3. End with a line that references the company's specific product, mission, or challenge — not generic praise
+4. One-line CTA: suggest connecting or a conversation
+
+ANTI-PATTERNS (never do these):
+- "With X years of experience in Y, I bring..."
+- "I am confident that my background..."
+- "Your company's commitment to innovation..."
+- "I look forward to discussing how I can contribute..."
+- Any sentence that could apply to any company/role — if you could swap the company name and it still reads the same, rewrite it
+- Starting multiple sentences with "I"
+- Using "leverage" as a verb
+
+Return ONLY the message. No labels, no explanation, no subject line."""
+
+    return system_prompt, user_prompt, config["max_tokens"]
+
+
 @router.post("/", response_model=ApplicationResponse)
 async def create_application(
     request: ApplicationCreate,
@@ -89,105 +206,14 @@ async def create_application(
         except Exception:
             resume_info = {}
 
-        message_type_info = {
-            "linkedin_message": {
-                "format": "LinkedIn Message",
-                "length": "around 300 characters",
-                "tone": "professional yet conversational",
-                "structure": "brief introduction, interest in position, 1-2 key qualifications, call to action",
-            },
-            "linkedin_connection": {
-                "format": "LinkedIn Connection Request",
-                "length": "around 200 characters",
-                "tone": "brief and professional",
-                "structure": "very brief introduction, reason for connecting, 1 key qualification, polite closing",
-            },
-            "linkedin_inmail": {
-                "format": "LinkedIn InMail",
-                "length": "around 2000 characters",
-                "tone": "professional and confident",
-                "structure": "formal greeting, introduction, background summary, key qualifications, specific company interest, call to action",
-            },
-            "email_short": {
-                "format": "Short Email",
-                "length": "around 1000 characters",
-                "tone": "professional and direct",
-                "structure": "greeting, brief introduction, 2-3 key qualifications, interest in company, call to action",
-            },
-            "email_detailed": {
-                "format": "Detailed Email",
-                "length": "around 3000 characters",
-                "tone": "formal and detailed",
-                "structure": "formal greeting, full introduction, detailed background, achievements, qualifications aligned with job, company-specific interest, closing with call to action",
-            },
-            "ycombinator": {
-                "format": "Y Combinator Application",
-                "length": "around 500 characters",
-                "tone": "direct, innovative, and impactful",
-                "structure": "concise intro, highlight of innovative abilities, entrepreneurial mindset, growth metrics if applicable, direct closing",
-            },
-        }
-
-        msg_type = request.message_type
-        if msg_type not in message_type_info:
-            msg_type = "email_detailed"
-        type_details = message_type_info[msg_type]
-
-        recruiter_greeting = ""
-        if request.recruiter_name:
-            recruiter_greeting = f"Hi {request.recruiter_name},"
-
-        system_prompt = (
-            "You are an expert job application assistant. Craft personalized, "
-            "professional outreach messages from job seekers to recruiters or hiring managers."
+        msg_type = request.message_type or "email_detailed"
+        system_prompt, user_prompt, msg_max_tokens = build_message_prompts(
+            resume_content=resume_content,
+            resume=resume,
+            job_description=request.job_description,
+            message_type=msg_type,
+            recruiter_name=request.recruiter_name,
         )
-
-        user_prompt = f"""
-Create a personalized {type_details['format']} from a job seeker to a recruiter based on:
-
-1. RESUME CONTENT:
-{resume_content}
-
-2. PROFILE TYPE: {resume.profile_type}
-Primary languages: {resume.primary_languages}
-Frameworks: {resume.frameworks}
-Experience level: {resume.seniority} with {resume.years_experience}
-
-3. JOB DESCRIPTION:
-{request.job_description}
-
-4. MESSAGE TYPE DETAILS:
-Format: {type_details['format']}
-Length: {type_details['length']}
-Tone: {type_details['tone']}
-Structure: {type_details['structure']}
-
-{f"5. RECRUITER NAME: {request.recruiter_name}" if request.recruiter_name else "Hiring Team"}
-
-Requirements:
-- If recruiter name is provided, address them directly
-- Include applicant's name and contact information
-- Keep the message appropriate for {type_details['format']} with {type_details['length']}
-- Highlight the most relevant skills that match the job
-- Reference specific company details from the job description
-- Include a clear call to action
-- DO NOT use generic phrases like "I am writing to express my interest"
-- Emphasize the candidate's experience as a {resume.profile_type}
-{f"- Start the message with '{recruiter_greeting}'" if request.recruiter_name else ""}
-
-Return ONLY the message text without any additional explanation or context.
-"""
-
-        # Cap max_tokens based on message type
-        max_tokens_map = {
-            "linkedin_message": 512,
-            "linkedin_connection": 256,
-            "linkedin_inmail": 1536,
-            "email_short": 1024,
-            "email_detailed": 2048,
-            "ycombinator": 512,
-        }
-        msg_max_tokens = max_tokens_map.get(msg_type, 2048)
 
         # Run company info extraction and message generation in parallel
         company_info, generated_message = await asyncio.gather(
@@ -291,71 +317,14 @@ async def stream_application(
     claude = ClaudeClient()
     resume_content = resume.content or ""
 
-    message_type_info = {
-        "linkedin_message": {"format": "LinkedIn Message", "length": "around 300 characters", "tone": "professional yet conversational", "structure": "brief introduction, interest in position, 1-2 key qualifications, call to action"},
-        "linkedin_connection": {"format": "LinkedIn Connection Request", "length": "around 200 characters", "tone": "brief and professional", "structure": "very brief introduction, reason for connecting, 1 key qualification, polite closing"},
-        "linkedin_inmail": {"format": "LinkedIn InMail", "length": "around 2000 characters", "tone": "professional and confident", "structure": "formal greeting, introduction, background summary, key qualifications, specific company interest, call to action"},
-        "email_short": {"format": "Short Email", "length": "around 1000 characters", "tone": "professional and direct", "structure": "greeting, brief introduction, 2-3 key qualifications, interest in company, call to action"},
-        "email_detailed": {"format": "Detailed Email", "length": "around 3000 characters", "tone": "formal and detailed", "structure": "formal greeting, full introduction, detailed background, achievements, qualifications aligned with job, company-specific interest, closing with call to action"},
-        "ycombinator": {"format": "Y Combinator Application", "length": "around 500 characters", "tone": "direct, innovative, and impactful", "structure": "concise intro, highlight of innovative abilities, entrepreneurial mindset, growth metrics if applicable, direct closing"},
-    }
-
-    msg_type = request.message_type
-    if msg_type not in message_type_info:
-        msg_type = "email_detailed"
-    type_details = message_type_info[msg_type]
-
-    recruiter_greeting = ""
-    if request.recruiter_name:
-        recruiter_greeting = f"Hi {request.recruiter_name},"
-
-    system_prompt = (
-        "You are an expert job application assistant. Craft personalized, "
-        "professional outreach messages from job seekers to recruiters or hiring managers."
+    msg_type = request.message_type or "email_detailed"
+    system_prompt, user_prompt, msg_max_tokens = build_message_prompts(
+        resume_content=resume_content,
+        resume=resume,
+        job_description=request.job_description,
+        message_type=msg_type,
+        recruiter_name=request.recruiter_name,
     )
-
-    user_prompt = f"""
-Create a personalized {type_details['format']} from a job seeker to a recruiter based on:
-
-1. RESUME CONTENT:
-{resume_content}
-
-2. PROFILE TYPE: {resume.profile_type}
-Primary languages: {resume.primary_languages}
-Frameworks: {resume.frameworks}
-Experience level: {resume.seniority} with {resume.years_experience}
-
-3. JOB DESCRIPTION:
-{request.job_description}
-
-4. MESSAGE TYPE DETAILS:
-Format: {type_details['format']}
-Length: {type_details['length']}
-Tone: {type_details['tone']}
-Structure: {type_details['structure']}
-
-{f"5. RECRUITER NAME: {request.recruiter_name}" if request.recruiter_name else "Hiring Team"}
-
-Requirements:
-- If recruiter name is provided, address them directly
-- Include applicant's name and contact information
-- Keep the message appropriate for {type_details['format']} with {type_details['length']}
-- Highlight the most relevant skills that match the job
-- Reference specific company details from the job description
-- Include a clear call to action
-- DO NOT use generic phrases like "I am writing to express my interest"
-- Emphasize the candidate's experience as a {resume.profile_type}
-{f"- Start the message with '{recruiter_greeting}'" if request.recruiter_name else ""}
-
-Return ONLY the message text without any additional explanation or context.
-"""
-
-    max_tokens_map = {
-        "linkedin_message": 512, "linkedin_connection": 256,
-        "linkedin_inmail": 1536, "email_short": 1024,
-        "email_detailed": 2048, "ycombinator": 512,
-    }
-    msg_max_tokens = max_tokens_map.get(msg_type, 2048)
 
     # Capture variables needed inside the generator
     user_id = current_user.id

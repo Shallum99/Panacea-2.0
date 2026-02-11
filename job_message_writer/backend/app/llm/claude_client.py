@@ -167,6 +167,56 @@ class ClaudeClient:
                 "mission": "Unknown"
             }
 
+    async def extract_jd_fields(self, job_description: str) -> Dict[str, Any]:
+        """Extract recruiter name, email, position title, etc. from a job description."""
+        system_prompt = (
+            "You are a job description parser. Extract specific contact and role details "
+            "from the provided job description. Return ONLY valid JSON."
+        )
+
+        user_prompt = f"""Analyze this job description and extract the following fields.
+If a field is not found, use null (not "Unknown" or empty string).
+
+Fields to extract:
+- recipient_email: Any email address for applying or contacting (e.g. "send resume to jane@company.com")
+- recruiter_name: The hiring manager's or recruiter's full name if mentioned
+- company_name: The company name
+- position_title: The exact job title
+- location: Office location or "Remote" if mentioned
+- salary_range: Salary or compensation range if mentioned
+- department: Department or team name if mentioned
+
+Job Description:
+{job_description}
+
+Return a valid JSON object with the fields above. Use null for any field not found."""
+
+        default = {
+            "recipient_email": None, "recruiter_name": None,
+            "company_name": None, "position_title": None,
+            "location": None, "salary_range": None, "department": None,
+        }
+
+        try:
+            response_text = await self._send_request(
+                system_prompt, user_prompt, max_tokens=512, model=self.fast_model
+            )
+            try:
+                return json.loads(response_text)
+            except json.JSONDecodeError:
+                import re
+                match = re.search(r'({[\s\S]*})', response_text)
+                if match:
+                    try:
+                        return json.loads(match.group(1))
+                    except json.JSONDecodeError:
+                        pass
+                logger.warning("Failed to parse JD fields JSON from Claude response")
+                return default
+        except Exception as e:
+            logger.error(f"Error extracting JD fields: {e}")
+            return default
+
     async def generate_message(
         self, 
         resume: str, 

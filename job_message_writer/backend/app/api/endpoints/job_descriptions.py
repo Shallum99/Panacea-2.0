@@ -1,5 +1,5 @@
 # File: backend/app/api/endpoints/job_descriptions.py
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
 from typing import Any, Dict, List
 import logging
@@ -10,9 +10,40 @@ from app.db import models
 from app.schemas.job_description import JobDescriptionBase, JobDescriptionCreate, JobDescriptionResponse
 from app.llm.claude_client import ClaudeClient
 from app.core.supabase_auth import get_current_user
+from app.utils.pdf_extractor import extract_text_from_pdf
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+@router.post("/upload-pdf")
+async def upload_jd_pdf(
+    file: UploadFile = File(...),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Upload a JD as PDF, extract text, return it."""
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
+    file_content = await file.read()
+    text = await extract_text_from_pdf(file_content)
+
+    if not text or len(text.strip()) < 10:
+        raise HTTPException(status_code=400, detail="Could not extract text from PDF")
+
+    return {"text": text.strip()}
+
+
+@router.post("/extract-fields")
+async def extract_jd_fields(
+    job_desc: JobDescriptionBase,
+    current_user: models.User = Depends(get_current_user),
+):
+    """Extract recruiter name, email, position, company from a JD using Haiku."""
+    claude = ClaudeClient()
+    fields = await claude.extract_jd_fields(job_desc.content)
+    return fields
+
 
 @router.post("/analyze", response_model=Dict[str, Any])
 async def analyze_job_description(

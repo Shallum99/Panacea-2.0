@@ -1,14 +1,17 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { createClient } from "@/lib/supabase/client";
 import { getResumes, type Resume } from "@/lib/api/resumes";
 import {
   streamApplication,
+  extractJdFields,
+  uploadJdPdf,
   type Application,
   type CreateApplicationRequest,
+  type JdExtractedFields,
 } from "@/lib/api/applications";
 
 const MESSAGE_TYPES = [
@@ -34,6 +37,16 @@ export default function GeneratePage() {
   const [positionTitle, setPositionTitle] = useState("");
   const [jobUrl, setJobUrl] = useState("");
 
+  // JD analysis state
+  const [analyzingJd, setAnalyzingJd] = useState(false);
+  const [jdFields, setJdFields] = useState<JdExtractedFields | null>(null);
+  const [uploadingPdf, setUploadingPdf] = useState(false);
+  const analyzeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastAnalyzedRef = useRef("");
+
+  // Track which fields user has manually edited
+  const userEditedRef = useRef<Set<string>>(new Set());
+
   // Result state
   const [generating, setGenerating] = useState(false);
   const [result, setResult] = useState<Application | null>(null);
@@ -54,6 +67,63 @@ export default function GeneratePage() {
       toast.error("Failed to load resumes");
     } finally {
       setLoadingResumes(false);
+    }
+  }
+
+  // Debounced JD analysis
+  const analyzeJd = useCallback(
+    async (text: string) => {
+      if (text.trim().length < 100) return;
+      if (text === lastAnalyzedRef.current) return;
+      lastAnalyzedRef.current = text;
+
+      setAnalyzingJd(true);
+      try {
+        const fields = await extractJdFields(text);
+        setJdFields(fields);
+        // Only auto-fill fields the user hasn't manually edited
+        if (fields.position_title && !userEditedRef.current.has("positionTitle")) {
+          setPositionTitle(fields.position_title);
+        }
+        if (fields.recruiter_name && !userEditedRef.current.has("recruiterName")) {
+          setRecruiterName(fields.recruiter_name);
+        }
+        if (fields.recipient_email && !userEditedRef.current.has("recipientEmail")) {
+          setRecipientEmail(fields.recipient_email);
+        }
+      } catch {
+        // Silent fail — user can fill manually
+      } finally {
+        setAnalyzingJd(false);
+      }
+    },
+    []
+  );
+
+  // Trigger analysis when JD changes
+  useEffect(() => {
+    if (analyzeTimerRef.current) clearTimeout(analyzeTimerRef.current);
+    if (jobDescription.trim().length >= 100) {
+      analyzeTimerRef.current = setTimeout(() => analyzeJd(jobDescription), 1200);
+    }
+    return () => {
+      if (analyzeTimerRef.current) clearTimeout(analyzeTimerRef.current);
+    };
+  }, [jobDescription, analyzeJd]);
+
+  async function handleJdPdfUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadingPdf(true);
+    try {
+      const { text } = await uploadJdPdf(file);
+      setJobDescription(text);
+      toast.success("JD extracted from PDF");
+    } catch {
+      toast.error("Failed to extract text from PDF");
+    } finally {
+      setUploadingPdf(false);
+      e.target.value = "";
     }
   }
 
@@ -105,6 +175,14 @@ export default function GeneratePage() {
   function handleViewApplication() {
     if (result) router.push(`/applications/${result.id}`);
   }
+
+  const isAutoFilled = (field: string, value: string) => {
+    if (!jdFields || userEditedRef.current.has(field) || !value) return false;
+    const key = field === "positionTitle" ? "position_title"
+      : field === "recruiterName" ? "recruiter_name"
+      : "recipient_email";
+    return jdFields[key as keyof JdExtractedFields] === value;
+  };
 
   return (
     <div className="space-y-6">
@@ -175,10 +253,16 @@ export default function GeneratePage() {
             <div>
               <label className="block text-xs font-medium text-muted-foreground mb-1.5">
                 Position Title
+                {isAutoFilled("positionTitle", positionTitle) && (
+                  <span className="text-[10px] text-accent ml-1 font-normal">auto-detected</span>
+                )}
               </label>
               <input
                 value={positionTitle}
-                onChange={(e) => setPositionTitle(e.target.value)}
+                onChange={(e) => {
+                  userEditedRef.current.add("positionTitle");
+                  setPositionTitle(e.target.value);
+                }}
                 placeholder="e.g. Senior Engineer"
                 className="w-full h-9 px-3 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted-foreground/50"
               />
@@ -186,10 +270,16 @@ export default function GeneratePage() {
             <div>
               <label className="block text-xs font-medium text-muted-foreground mb-1.5">
                 Recruiter Name
+                {isAutoFilled("recruiterName", recruiterName) && (
+                  <span className="text-[10px] text-accent ml-1 font-normal">auto-detected</span>
+                )}
               </label>
               <input
                 value={recruiterName}
-                onChange={(e) => setRecruiterName(e.target.value)}
+                onChange={(e) => {
+                  userEditedRef.current.add("recruiterName");
+                  setRecruiterName(e.target.value);
+                }}
                 placeholder="Optional"
                 className="w-full h-9 px-3 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted-foreground/50"
               />
@@ -201,11 +291,17 @@ export default function GeneratePage() {
             <div>
               <label className="block text-xs font-medium text-muted-foreground mb-1.5">
                 Recipient Email
+                {isAutoFilled("recipientEmail", recipientEmail) && (
+                  <span className="text-[10px] text-accent ml-1 font-normal">auto-detected</span>
+                )}
               </label>
               <input
                 type="email"
                 value={recipientEmail}
-                onChange={(e) => setRecipientEmail(e.target.value)}
+                onChange={(e) => {
+                  userEditedRef.current.add("recipientEmail");
+                  setRecipientEmail(e.target.value);
+                }}
                 placeholder="recruiter@company.com"
                 className="w-full h-9 px-3 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted-foreground/50"
               />
@@ -225,14 +321,37 @@ export default function GeneratePage() {
 
           {/* Job description */}
           <div>
-            <label className="block text-xs font-medium text-muted-foreground mb-1.5">
-              Job Description
-            </label>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="text-xs font-medium text-muted-foreground">
+                Job Description
+              </label>
+              <div className="flex items-center gap-3">
+                {analyzingJd && (
+                  <span className="text-[10px] text-accent animate-pulse">
+                    Analyzing JD...
+                  </span>
+                )}
+                <label className={`text-xs cursor-pointer transition-colors ${
+                  uploadingPdf
+                    ? "text-muted-foreground"
+                    : "text-accent hover:text-accent/80"
+                }`}>
+                  {uploadingPdf ? "Extracting..." : "Upload PDF"}
+                  <input
+                    type="file"
+                    accept=".pdf"
+                    className="hidden"
+                    onChange={handleJdPdfUpload}
+                    disabled={uploadingPdf}
+                  />
+                </label>
+              </div>
+            </div>
             <textarea
               value={jobDescription}
               onChange={(e) => setJobDescription(e.target.value)}
               rows={12}
-              placeholder="Paste the full job description here..."
+              placeholder="Paste the full job description here or upload a PDF..."
               className="w-full px-3 py-2 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted-foreground/50 resize-y"
             />
           </div>
