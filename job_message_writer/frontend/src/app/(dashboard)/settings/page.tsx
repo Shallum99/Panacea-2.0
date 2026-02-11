@@ -3,13 +3,11 @@
 import { useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { useTheme } from "@/hooks/useTheme";
-import { useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import api from "@/lib/api";
 
 export default function SettingsPage() {
   const { theme, setTheme } = useTheme();
-  const searchParams = useSearchParams();
   const [email, setEmail] = useState("");
   const [loading, setLoading] = useState(true);
   const [gmailConnected, setGmailConnected] = useState(false);
@@ -36,9 +34,9 @@ export default function SettingsPage() {
         setGmailConnected(data.connected);
 
         // Show success toast if user just connected
-        if (searchParams.get("gmail") === "connected" && data.connected) {
+        const params = new URLSearchParams(window.location.search);
+        if (params.get("gmail") === "connected" && data.connected) {
           toast.success("Gmail connected successfully");
-          // Clean up URL
           window.history.replaceState({}, "", "/settings");
         }
       } catch {
@@ -47,7 +45,7 @@ export default function SettingsPage() {
       setGmailLoading(false);
     }
     checkGmail();
-  }, [searchParams]);
+  }, []);
 
   async function handleSignOut() {
     const supabase = createClient();
