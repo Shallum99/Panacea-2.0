@@ -1,47 +1,64 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { useRouter } from "next/navigation";
 import api from "@/lib/api";
 
 export default function CallbackPage() {
   const router = useRouter();
+  const handled = useRef(false);
 
   useEffect(() => {
     const supabase = createClient();
 
-    async function saveTokenAndRedirect(session: any) {
-      const refreshToken = session?.provider_refresh_token;
-      if (refreshToken) {
+    async function handleSession(session: any) {
+      if (handled.current) return;
+      handled.current = true;
+
+      // Save Gmail refresh token if present
+      const providerRefreshToken = session?.provider_refresh_token;
+      if (providerRefreshToken) {
         try {
           await api.post("/users/save-gmail-token", {
-            refresh_token: refreshToken,
+            refresh_token: providerRefreshToken,
           });
+          console.log("Gmail refresh token saved");
         } catch (err) {
           console.warn("Failed to save Gmail token:", err);
         }
       }
+
       router.push("/dashboard");
     }
 
-    // Check if session already exists (event may have fired before mount)
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      if (session) {
-        saveTokenAndRedirect(session);
+    // Listen for auth state change — this is the ONLY reliable way to get
+    // provider_refresh_token, since getSession() returns the cached session
+    // without it.
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange(async (event, session) => {
+      if (session && (event === "SIGNED_IN" || event === "INITIAL_SESSION")) {
+        handleSession(session);
       }
     });
 
-    // Also listen for the event in case it hasn't fired yet
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      async (event, session) => {
-        if (event === "SIGNED_IN" && session) {
-          saveTokenAndRedirect(session);
+    // Safety net: if no auth event fires within 5s, check session and redirect
+    const timeout = setTimeout(async () => {
+      if (!handled.current) {
+        const {
+          data: { session },
+        } = await supabase.auth.getSession();
+        if (session) {
+          handleSession(session);
         }
       }
-    );
+    }, 5000);
 
-    return () => subscription.unsubscribe();
+    return () => {
+      subscription.unsubscribe();
+      clearTimeout(timeout);
+    };
   }, [router]);
 
   return (
