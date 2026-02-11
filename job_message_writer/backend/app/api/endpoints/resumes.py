@@ -623,3 +623,36 @@ def read_resume_content(
     except Exception as e:
         logger.error(f"Error reading resume content: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/{resume_id}")
+async def delete_resume(
+    resume_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Delete a resume and its file from storage."""
+    resume = db.query(models.Resume).filter(
+        models.Resume.id == resume_id,
+        models.Resume.owner_id == current_user.id,
+    ).first()
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+
+    # Delete file from storage
+    if resume.file_path:
+        from app.services.storage import is_local_path, delete_file, RESUMES_BUCKET
+        if is_local_path(resume.file_path):
+            try:
+                os.remove(resume.file_path)
+            except OSError:
+                pass
+        else:
+            try:
+                await delete_file(RESUMES_BUCKET, resume.file_path)
+            except Exception as e:
+                logger.warning(f"Failed to delete file from storage: {e}")
+
+    db.delete(resume)
+    db.commit()
+    return {"detail": "Resume deleted"}

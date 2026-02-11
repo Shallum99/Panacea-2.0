@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { toast } from "sonner";
-import { getResumes, setActiveResume, type Resume } from "@/lib/api/resumes";
+import { getResumes, setActiveResume, deleteResume, type Resume } from "@/lib/api/resumes";
 
 export default function ResumesPage() {
   const [resumes, setResumes] = useState<Resume[]>([]);
@@ -33,6 +33,17 @@ export default function ResumesPage() {
       toast.success("Active resume updated");
     } catch {
       toast.error("Failed to set active resume");
+    }
+  }
+
+  async function handleDelete(id: number) {
+    if (!confirm("Delete this resume? This cannot be undone.")) return;
+    try {
+      await deleteResume(id);
+      setResumes((prev) => prev.filter((r) => r.id !== id));
+      toast.success("Resume deleted");
+    } catch {
+      toast.error("Failed to delete resume");
     }
   }
 
@@ -132,14 +143,22 @@ export default function ResumesPage() {
                     </div>
                   )}
                 </div>
-                {!resume.is_active && (
+                <div className="flex items-center gap-2 shrink-0">
+                  {!resume.is_active && (
+                    <button
+                      onClick={() => handleSetActive(resume.id)}
+                      className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+                    >
+                      Set Active
+                    </button>
+                  )}
                   <button
-                    onClick={() => handleSetActive(resume.id)}
-                    className="text-xs text-muted-foreground hover:text-foreground transition-colors shrink-0"
+                    onClick={() => handleDelete(resume.id)}
+                    className="text-xs text-muted-foreground hover:text-destructive transition-colors"
                   >
-                    Set Active
+                    Delete
                   </button>
-                )}
+                </div>
               </div>
             </div>
           ))}

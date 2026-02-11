@@ -73,3 +73,7 @@ export async function getResumeContent(id: number): Promise<ResumeWithContent> {
   const { data } = await api.get(`/resumes/${id}/content`);
   return data;
 }
+
+export async function deleteResume(id: number): Promise<void> {
+  await api.delete(`/resumes/${id}`);
+}
