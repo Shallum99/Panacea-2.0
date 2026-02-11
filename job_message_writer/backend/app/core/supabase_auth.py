@@ -10,6 +10,7 @@ import logging
 from functools import lru_cache
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -141,15 +142,37 @@ async def get_current_user(
         raise credentials_exception
 
     # Find or create user in local DB
+    logger.info(f"Auth lookup: sub={sub!r}, email={email!r}")
     user = db.query(models.User).filter(models.User.supabase_id == sub).first()
 
     if user is None and email:
-        # Also check by email for migration compatibility
-        user = db.query(models.User).filter(models.User.email == email).first()
-        if user and not user.supabase_id:
-            # Link existing user to Supabase
-            user.supabase_id = sub
-            db.commit()
+        # Case-insensitive email lookup — Google OAuth can vary casing
+        user = db.query(models.User).filter(
+            func.lower(models.User.email) == email.lower()
+        ).first()
+        if user:
+            logger.info(f"Found user {user.id} by email (supabase_id was {user.supabase_id!r})")
+            if user.supabase_id != sub:
+                # Transfer any data from an orphan user that has the new sub
+                orphan = db.query(models.User).filter(
+                    models.User.supabase_id == sub,
+                    models.User.id != user.id,
+                ).first()
+                if orphan:
+                    logger.info(f"Merging orphan user {orphan.id} into user {user.id}")
+                    # Transfer resumes, messages, jobs, applications to the real user
+                    for model_cls in [models.Resume, models.Message, models.JobDescription, models.Application]:
+                        db.query(model_cls).filter(
+                            model_cls.owner_id == orphan.id
+                        ).update({"owner_id": user.id})
+                    db.delete(orphan)
+                user.supabase_id = sub
+                db.commit()
+
+    # Sync email if it changed (case-insensitive compare)
+    if user and email and user.email.lower() != email.lower():
+        user.email = email
+        db.commit()
 
     if user is None:
         # Auto-create new user
@@ -161,6 +184,7 @@ async def get_current_user(
         db.add(user)
         db.commit()
         db.refresh(user)
-        logger.info(f"Auto-created user for Supabase ID: {sub}")
+        logger.info(f"Auto-created user {user.id} for Supabase ID: {sub}")
 
+    logger.info(f"Auth resolved: user.id={user.id}, resumes={db.query(models.Resume).filter(models.Resume.owner_id == user.id).count()}")
     return user

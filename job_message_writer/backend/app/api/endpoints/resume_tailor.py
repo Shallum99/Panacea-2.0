@@ -180,6 +180,7 @@ def _get_resume_or_active(db: Session, user: models.User, resume_id: int = None)
             models.Resume.owner_id == user.id
         ).first()
         if not resume:
+            logger.warning(f"Resume {resume_id} not found for user {user.id} (email={user.email})")
             raise HTTPException(status_code=404, detail="Resume not found")
         return resume
 
@@ -192,6 +193,8 @@ def _get_resume_or_active(db: Session, user: models.User, resume_id: int = None)
             models.Resume.owner_id == user.id
         ).order_by(models.Resume.created_at.desc()).first()
     if not resume:
+        total = db.query(models.Resume).count()
+        logger.warning(f"No resume for user {user.id} (email={user.email}). Total resumes in DB: {total}")
         raise HTTPException(status_code=404, detail="No resume found. Upload one first.")
     return resume
 
@@ -210,6 +213,7 @@ async def get_section_map(
         resume = _get_resume_or_active(db, current_user, request.resume_id)
 
         if not resume.file_path or not os.path.exists(resume.file_path):
+            logger.warning(f"PDF missing for resume {resume.id}: file_path={resume.file_path!r}, exists={os.path.exists(resume.file_path) if resume.file_path else 'N/A'}")
             raise HTTPException(
                 status_code=400,
                 detail="Original PDF not found. Re-upload the resume to enable format preservation."
@@ -239,6 +243,7 @@ async def optimize_resume_pdf(
         resume = _get_resume_or_active(db, current_user, request.resume_id)
 
         if not resume.file_path or not os.path.exists(resume.file_path):
+            logger.warning(f"PDF missing for resume {resume.id}: file_path={resume.file_path!r}, exists={os.path.exists(resume.file_path) if resume.file_path else 'N/A'}")
             raise HTTPException(
                 status_code=400,
                 detail="Original PDF not found. Re-upload the resume to enable format preservation."
