@@ -32,6 +32,7 @@ class User(Base):
     email = Column(String, unique=True, index=True)
     hashed_password = Column(String, nullable=True)  # No longer needed with Supabase auth
     is_active = Column(Boolean, default=True)
+    gmail_refresh_token = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     
     resumes = relationship("Resume", back_populates="owner")
