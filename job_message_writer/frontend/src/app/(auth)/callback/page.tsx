@@ -12,7 +12,7 @@ export default function CallbackPage() {
   useEffect(() => {
     const supabase = createClient();
 
-    // Detect if this is an OAuth redirect (URL has code= param from PKCE flow)
+    // Detect OAuth redirect (PKCE code in URL)
     const params = new URLSearchParams(window.location.search);
     const isOAuthRedirect = params.has("code");
 
@@ -32,7 +32,14 @@ export default function CallbackPage() {
         }
       }
 
-      router.push("/dashboard");
+      // Check if we should redirect somewhere specific (e.g. Settings after Gmail connect)
+      const redirect = localStorage.getItem("gmail_connect_redirect");
+      if (redirect) {
+        localStorage.removeItem("gmail_connect_redirect");
+        router.push(redirect);
+      } else {
+        router.push("/dashboard");
+      }
     }
 
     const {
@@ -41,9 +48,9 @@ export default function CallbackPage() {
       if (!session) return;
 
       if (isOAuthRedirect) {
-        // OAuth flow: ONLY accept SIGNED_IN — it has the fresh session
-        // with provider_refresh_token. INITIAL_SESSION fires first with
-        // the stale cached session and must be ignored.
+        // OAuth callback: only accept SIGNED_IN which has the fresh session
+        // with provider_refresh_token. INITIAL_SESSION fires first with the
+        // stale cached session and must be ignored.
         if (event === "SIGNED_IN") {
           handleSession(session);
         }

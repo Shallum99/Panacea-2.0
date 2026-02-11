@@ -3,11 +3,13 @@
 import { useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { useTheme } from "@/hooks/useTheme";
+import { useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import api from "@/lib/api";
 
 export default function SettingsPage() {
   const { theme, setTheme } = useTheme();
+  const searchParams = useSearchParams();
   const [email, setEmail] = useState("");
   const [loading, setLoading] = useState(true);
   const [gmailConnected, setGmailConnected] = useState(false);
@@ -16,7 +18,9 @@ export default function SettingsPage() {
   useEffect(() => {
     async function load() {
       const supabase = createClient();
-      const { data: { user } } = await supabase.auth.getUser();
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
       if (user) {
         setEmail(user.email || "");
       }
@@ -30,13 +34,20 @@ export default function SettingsPage() {
       try {
         const { data } = await api.get("/users/gmail-status");
         setGmailConnected(data.connected);
+
+        // Show success toast if user just connected
+        if (searchParams.get("gmail") === "connected" && data.connected) {
+          toast.success("Gmail connected successfully");
+          // Clean up URL
+          window.history.replaceState({}, "", "/settings");
+        }
       } catch {
-        // Not critical — just leave as disconnected
+        // Not critical
       }
       setGmailLoading(false);
     }
     checkGmail();
-  }, []);
+  }, [searchParams]);
 
   async function handleSignOut() {
     const supabase = createClient();
@@ -44,7 +55,10 @@ export default function SettingsPage() {
     window.location.href = "/login";
   }
 
-  async function handleReconnectGmail() {
+  async function handleConnectGmail() {
+    // Store redirect intent so callback knows to come back here
+    localStorage.setItem("gmail_connect_redirect", "/settings?gmail=connected");
+
     const supabase = createClient();
     const { error } = await supabase.auth.signInWithOAuth({
       provider: "google",
@@ -59,6 +73,7 @@ export default function SettingsPage() {
     });
     if (error) {
       toast.error(error.message);
+      localStorage.removeItem("gmail_connect_redirect");
     }
   }
 
@@ -127,7 +142,7 @@ export default function SettingsPage() {
             </div>
             {!gmailLoading && (
               <button
-                onClick={handleReconnectGmail}
+                onClick={handleConnectGmail}
                 className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
                   gmailConnected
                     ? "text-muted-foreground border border-border hover:bg-muted"
