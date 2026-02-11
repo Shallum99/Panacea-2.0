@@ -35,6 +35,13 @@ def init_db():
 # Initialize database
 init_db()
 
+# Ensure Supabase Storage buckets exist
+try:
+    from app.services.storage import ensure_buckets_exist
+    ensure_buckets_exist()
+except Exception as e:
+    logger.warning(f"Supabase Storage init skipped: {e}")
+
 # Create FastAPI app
 app = FastAPI(
     title=settings.PROJECT_NAME,

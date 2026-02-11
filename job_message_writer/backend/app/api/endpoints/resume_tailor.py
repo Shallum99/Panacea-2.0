@@ -1,12 +1,13 @@
 # File: backend/app/api/endpoints/resume_tailor.py
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from sqlalchemy.orm import Session
 from typing import Any, Dict
 import logging
 import json
 import os
 import uuid
+import tempfile
 
 from app.db.database import get_db
 from app.db import models
@@ -209,17 +210,25 @@ async def get_section_map(
     Preview the section map of a resume PDF — shows what sections were detected
     and their character counts before optimizing.
     """
+    from app.services.storage import is_local_path, download_to_tempfile, RESUMES_BUCKET
+
     try:
         resume = _get_resume_or_active(db, current_user, request.resume_id)
 
-        if not resume.file_path or not os.path.exists(resume.file_path):
-            logger.warning(f"PDF missing for resume {resume.id}: file_path={resume.file_path!r}, exists={os.path.exists(resume.file_path) if resume.file_path else 'N/A'}")
+        if not resume.file_path:
             raise HTTPException(
                 status_code=400,
                 detail="Original PDF not found. Re-upload the resume to enable format preservation."
             )
 
-        section_map = build_section_map(resume.file_path)
+        if is_local_path(resume.file_path):
+            if not os.path.exists(resume.file_path):
+                raise HTTPException(status_code=400, detail="Original PDF not found. Re-upload the resume.")
+            section_map = build_section_map(resume.file_path)
+        else:
+            with download_to_tempfile(RESUMES_BUCKET, resume.file_path) as tmp_path:
+                section_map = build_section_map(tmp_path)
+
         return section_map
 
     except HTTPException:
@@ -239,45 +248,62 @@ async def optimize_resume_pdf(
     Optimize a resume PDF while preserving EXACT formatting.
     Returns a download_id to retrieve the output PDF.
     """
+    from app.services.storage import (
+        is_local_path, download_to_tempfile, upload_file,
+        RESUMES_BUCKET, TAILORED_BUCKET,
+    )
+    import fitz
+
     try:
         resume = _get_resume_or_active(db, current_user, request.resume_id)
 
-        if not resume.file_path or not os.path.exists(resume.file_path):
-            logger.warning(f"PDF missing for resume {resume.id}: file_path={resume.file_path!r}, exists={os.path.exists(resume.file_path) if resume.file_path else 'N/A'}")
+        if not resume.file_path:
             raise HTTPException(
                 status_code=400,
                 detail="Original PDF not found. Re-upload the resume to enable format preservation."
             )
 
-        # Prepare output path
-        output_dir = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
-            "uploads", "tailored"
-        )
-        os.makedirs(output_dir, exist_ok=True)
         download_id = uuid.uuid4().hex
-        output_path = os.path.join(output_dir, f"{download_id}.pdf")
 
         # Calculate original ATS score
         original_score = await calculate_match_score(
             resume.content, request.job_description
         )
 
-        # Run format-preserving optimization
-        result = await optimize_pdf(
-            pdf_path=resume.file_path,
-            output_path=output_path,
-            job_description=request.job_description,
-            resume_content=resume.content,
-        )
+        # Helper to run optimization on a local input path
+        async def _run_optimize(input_path: str):
+            fd, out_path = tempfile.mkstemp(suffix=".pdf")
+            os.close(fd)
+            try:
+                result = await optimize_pdf(
+                    pdf_path=input_path,
+                    output_path=out_path,
+                    job_description=request.job_description,
+                    resume_content=resume.content,
+                )
+                # Read optimized text for ATS scoring
+                doc = fitz.open(out_path)
+                optimized_text = "".join(page.get_text() for page in doc)
+                doc.close()
+                # Upload tailored PDF to Supabase
+                with open(out_path, "rb") as f:
+                    output_bytes = f.read()
+                tailored_path = f"{current_user.id}/{download_id}.pdf"
+                await upload_file(TAILORED_BUCKET, tailored_path, output_bytes)
+                return result, optimized_text
+            finally:
+                try:
+                    os.unlink(out_path)
+                except OSError:
+                    pass
 
-        # Calculate optimized ATS score from the new PDF text
-        import fitz
-        doc = fitz.open(output_path)
-        optimized_text = ""
-        for page in doc:
-            optimized_text += page.get_text()
-        doc.close()
+        if is_local_path(resume.file_path):
+            if not os.path.exists(resume.file_path):
+                raise HTTPException(status_code=400, detail="Original PDF not found. Re-upload the resume.")
+            result, optimized_text = await _run_optimize(resume.file_path)
+        else:
+            with download_to_tempfile(RESUMES_BUCKET, resume.file_path) as tmp_path:
+                result, optimized_text = await _run_optimize(tmp_path)
 
         optimized_score = await calculate_match_score(
             optimized_text, request.job_description
@@ -303,18 +329,12 @@ async def download_tailored_pdf(
     download_id: str,
     current_user: models.User = Depends(get_current_user),
 ):
-    """Download a previously optimized PDF."""
-    output_dir = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
-        "uploads", "tailored"
-    )
-    file_path = os.path.join(output_dir, f"{download_id}.pdf")
+    """Download a previously optimized PDF via Supabase signed URL."""
+    from app.services.storage import get_signed_url, TAILORED_BUCKET
 
-    if not os.path.exists(file_path):
+    storage_path = f"{current_user.id}/{download_id}.pdf"
+    try:
+        signed_url = get_signed_url(TAILORED_BUCKET, storage_path, expires_in=300)
+        return RedirectResponse(url=signed_url)
+    except Exception:
         raise HTTPException(status_code=404, detail="Tailored PDF not found or expired")
-
-    return FileResponse(
-        file_path,
-        media_type="application/pdf",
-        filename=f"tailored_resume_{download_id[:8]}.pdf",
-    )

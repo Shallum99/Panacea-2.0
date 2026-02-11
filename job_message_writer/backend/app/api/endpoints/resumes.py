@@ -208,15 +208,14 @@ async def create_resume(
         file_content = await file.read()
         logger.info(f"Read {len(file_content)} bytes from uploaded file {file.filename}")
         
-        # Save PDF to disk for format-preservation later
-        upload_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "uploads", "resumes")
-        os.makedirs(upload_dir, exist_ok=True)
+        # Upload PDF to Supabase Storage for format-preservation later
         import uuid
+        from app.services.storage import upload_file, RESUMES_BUCKET
         safe_filename = f"{uuid.uuid4().hex}_{file.filename}"
-        saved_path = os.path.join(upload_dir, safe_filename)
-        with open(saved_path, "wb") as f:
-            f.write(file_content)
-        logger.info(f"Saved PDF to {saved_path}")
+        storage_path = f"{user.id}/{safe_filename}"
+        await upload_file(RESUMES_BUCKET, storage_path, file_content)
+        saved_path = storage_path  # Supabase storage key, not a local path
+        logger.info(f"Uploaded PDF to Supabase: {storage_path}")
 
         # Extract text from PDF
         content = await extract_text_from_pdf(file_content)

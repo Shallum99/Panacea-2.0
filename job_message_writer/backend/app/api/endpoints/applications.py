@@ -571,16 +571,23 @@ async def send_application(
     subject = f"Application for {app.position_title}" if app.position_title else "Job Application"
 
     # Get resume PDF if available
+    from app.services.storage import is_local_path, download_file, RESUMES_BUCKET
+    import os
     resume_pdf_bytes = None
     resume_filename = None
     if app.resume_id:
         resume = db.query(models.Resume).filter(models.Resume.id == app.resume_id).first()
         if resume and resume.file_path:
-            import os
-            if os.path.exists(resume.file_path):
-                with open(resume.file_path, "rb") as f:
-                    resume_pdf_bytes = f.read()
-                resume_filename = f"{resume.title or 'resume'}.pdf"
+            if is_local_path(resume.file_path):
+                if os.path.exists(resume.file_path):
+                    with open(resume.file_path, "rb") as f:
+                        resume_pdf_bytes = f.read()
+            else:
+                try:
+                    resume_pdf_bytes = await download_file(RESUMES_BUCKET, resume.file_path)
+                except Exception:
+                    logger.warning("Failed to download resume for email attachment")
+            resume_filename = f"{resume.title or 'resume'}.pdf"
 
     # Get sender info from resume
     from_name = None

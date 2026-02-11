@@ -121,22 +121,45 @@ Return ONLY the email body text.
 
     # Define PDF optimization task
     async def _optimize_pdf_task():
-        if not (request.optimize_resume and resume.file_path and os.path.exists(resume.file_path)):
+        from app.services.storage import (
+            is_local_path, download_to_tempfile, upload_file, download_file,
+            RESUMES_BUCKET, TAILORED_BUCKET,
+        )
+        import tempfile
+
+        if not (request.optimize_resume and resume.file_path):
             return None
         try:
-            output_dir = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
-                "uploads", "tailored"
-            )
-            os.makedirs(output_dir, exist_ok=True)
-            path = os.path.join(output_dir, f"auto_{uuid.uuid4().hex}.pdf")
-            await optimize_pdf(
-                pdf_path=resume.file_path,
-                output_path=path,
-                job_description=request.job_description,
-                resume_content=resume.content,
-            )
-            return path
+            download_id = f"auto_{uuid.uuid4().hex}"
+
+            async def _run(input_path):
+                fd, out_path = tempfile.mkstemp(suffix=".pdf")
+                os.close(fd)
+                try:
+                    await optimize_pdf(
+                        pdf_path=input_path,
+                        output_path=out_path,
+                        job_description=request.job_description,
+                        resume_content=resume.content,
+                    )
+                    with open(out_path, "rb") as f:
+                        output_bytes = f.read()
+                    storage_path = f"{current_user.id}/{download_id}.pdf"
+                    await upload_file(TAILORED_BUCKET, storage_path, output_bytes)
+                    return storage_path
+                finally:
+                    try:
+                        os.unlink(out_path)
+                    except OSError:
+                        pass
+
+            if is_local_path(resume.file_path):
+                if not os.path.exists(resume.file_path):
+                    return None
+                return await _run(resume.file_path)
+            else:
+                with download_to_tempfile(RESUMES_BUCKET, resume.file_path) as tmp_path:
+                    return await _run(tmp_path)
         except Exception as e:
             logger.warning(f"PDF optimization failed, using original: {e}")
             return None
@@ -149,12 +172,24 @@ Return ONLY the email body text.
     )
     company_name = company_info.get("company_name", "Unknown")
 
-    # Step 3: Send email
-    pdf_path = tailored_pdf_path or resume.file_path
+    # Step 3: Get resume bytes for email attachment
+    from app.services.storage import is_local_path, download_file, RESUMES_BUCKET, TAILORED_BUCKET
     resume_bytes = None
-    if pdf_path and os.path.exists(pdf_path):
-        with open(pdf_path, "rb") as f:
-            resume_bytes = f.read()
+    if tailored_pdf_path:
+        try:
+            resume_bytes = await download_file(TAILORED_BUCKET, tailored_pdf_path)
+        except Exception:
+            logger.warning("Failed to download tailored PDF, falling back to original")
+    if resume_bytes is None and resume.file_path:
+        if is_local_path(resume.file_path):
+            if os.path.exists(resume.file_path):
+                with open(resume.file_path, "rb") as f:
+                    resume_bytes = f.read()
+        else:
+            try:
+                resume_bytes = await download_file(RESUMES_BUCKET, resume.file_path)
+            except Exception:
+                logger.warning("Failed to download original resume for email")
 
     subject = f"Application for {request.position_title}" if request.position_title else f"Application — {company_name}"
 
@@ -245,7 +280,21 @@ async def url_auto_apply(
     }
 
     task_id = uuid.uuid4().hex
-    resume_path = resume.file_path if resume.file_path and os.path.exists(resume.file_path) else None
+    # Playwright needs a local file — download from Supabase if needed
+    resume_path = None
+    if resume.file_path:
+        if is_local_path(resume.file_path):
+            resume_path = resume.file_path if os.path.exists(resume.file_path) else None
+        else:
+            try:
+                import tempfile
+                data = await download_file(RESUMES_BUCKET, resume.file_path)
+                fd, resume_path = tempfile.mkstemp(suffix=".pdf")
+                os.write(fd, data)
+                os.close(fd)
+            except Exception as e:
+                logger.warning(f"Failed to download resume for auto-apply: {e}")
+                resume_path = None
 
     # Run in background
     asyncio.create_task(
