@@ -10,6 +10,7 @@ export interface Application {
   recipient_name: string | null;
   job_url: string | null;
   message_type: string | null;
+  subject: string | null;
   generated_message: string | null;
   edited_message: string | null;
   final_message: string | null;
@@ -37,6 +38,7 @@ export interface CreateApplicationRequest {
 
 export interface UpdateApplicationRequest {
   edited_message?: string;
+  subject?: string;
   recipient_email?: string;
   recipient_name?: string;
   status?: string;

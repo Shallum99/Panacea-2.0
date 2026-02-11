@@ -133,6 +133,7 @@ class Application(Base):
 
     # Generated content
     message_type = Column(String, nullable=True)
+    subject = Column(String, nullable=True)
     generated_message = Column(Text, nullable=True)
     edited_message = Column(Text, nullable=True)
     final_message = Column(Text, nullable=True)

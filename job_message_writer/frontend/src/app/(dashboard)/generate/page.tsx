@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef } from "react";
-import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { createClient } from "@/lib/supabase/client";
 import { getResumes, type Resume } from "@/lib/api/resumes";
@@ -9,6 +8,8 @@ import {
   streamApplication,
   extractJdFields,
   uploadJdPdf,
+  updateApplication,
+  sendApplication,
   type Application,
   type CreateApplicationRequest,
   type JdExtractedFields,
@@ -24,7 +25,6 @@ const MESSAGE_TYPES = [
 ];
 
 export default function GeneratePage() {
-  const router = useRouter();
   const [resumes, setResumes] = useState<Resume[]>([]);
   const [loadingResumes, setLoadingResumes] = useState(true);
 
@@ -43,14 +43,16 @@ export default function GeneratePage() {
   const [uploadingPdf, setUploadingPdf] = useState(false);
   const analyzeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastAnalyzedRef = useRef("");
-
-  // Track which fields user has manually edited
   const userEditedRef = useRef<Set<string>>(new Set());
 
   // Result state
   const [generating, setGenerating] = useState(false);
   const [result, setResult] = useState<Application | null>(null);
+  const [streamedText, setStreamedText] = useState("");
   const [editedMessage, setEditedMessage] = useState("");
+  const [editedSubject, setEditedSubject] = useState("");
+  const [editedRecipient, setEditedRecipient] = useState("");
+  const [sending, setSending] = useState(false);
 
   useEffect(() => {
     loadResumes();
@@ -71,36 +73,31 @@ export default function GeneratePage() {
   }
 
   // Debounced JD analysis
-  const analyzeJd = useCallback(
-    async (text: string) => {
-      if (text.trim().length < 100) return;
-      if (text === lastAnalyzedRef.current) return;
-      lastAnalyzedRef.current = text;
+  const analyzeJd = useCallback(async (text: string) => {
+    if (text.trim().length < 100) return;
+    if (text === lastAnalyzedRef.current) return;
+    lastAnalyzedRef.current = text;
 
-      setAnalyzingJd(true);
-      try {
-        const fields = await extractJdFields(text);
-        setJdFields(fields);
-        // Only auto-fill fields the user hasn't manually edited
-        if (fields.position_title && !userEditedRef.current.has("positionTitle")) {
-          setPositionTitle(fields.position_title);
-        }
-        if (fields.recruiter_name && !userEditedRef.current.has("recruiterName")) {
-          setRecruiterName(fields.recruiter_name);
-        }
-        if (fields.recipient_email && !userEditedRef.current.has("recipientEmail")) {
-          setRecipientEmail(fields.recipient_email);
-        }
-      } catch {
-        // Silent fail — user can fill manually
-      } finally {
-        setAnalyzingJd(false);
+    setAnalyzingJd(true);
+    try {
+      const fields = await extractJdFields(text);
+      setJdFields(fields);
+      if (fields.position_title && !userEditedRef.current.has("positionTitle")) {
+        setPositionTitle(fields.position_title);
       }
-    },
-    []
-  );
+      if (fields.recruiter_name && !userEditedRef.current.has("recruiterName")) {
+        setRecruiterName(fields.recruiter_name);
+      }
+      if (fields.recipient_email && !userEditedRef.current.has("recipientEmail")) {
+        setRecipientEmail(fields.recipient_email);
+      }
+    } catch {
+      // Silent fail
+    } finally {
+      setAnalyzingJd(false);
+    }
+  }, []);
 
-  // Trigger analysis when JD changes
   useEffect(() => {
     if (analyzeTimerRef.current) clearTimeout(analyzeTimerRef.current);
     if (jobDescription.trim().length >= 100) {
@@ -134,7 +131,9 @@ export default function GeneratePage() {
     }
     setGenerating(true);
     setResult(null);
+    setStreamedText("");
     setEditedMessage("");
+    setEditedSubject("");
 
     try {
       const payload: CreateApplicationRequest = {
@@ -149,9 +148,12 @@ export default function GeneratePage() {
 
       await streamApplication(
         payload,
-        (text) => setEditedMessage((prev) => prev + text),
+        (text) => setStreamedText((prev) => prev + text),
         (app) => {
           setResult(app);
+          setEditedMessage(app.final_message || app.generated_message || "");
+          setEditedSubject(app.subject || "");
+          setEditedRecipient(app.recipient_email || recipientEmail || "");
           setGenerating(false);
           toast.success("Message generated");
         },
@@ -172,8 +174,38 @@ export default function GeneratePage() {
     }
   }
 
-  function handleViewApplication() {
-    if (result) router.push(`/applications/${result.id}`);
+  async function handleSend() {
+    if (!result) return;
+    if (!editedRecipient.trim()) {
+      toast.error("Enter a recipient email to send");
+      return;
+    }
+    setSending(true);
+    try {
+      // Save edits first
+      await updateApplication(result.id, {
+        edited_message: editedMessage,
+        subject: editedSubject,
+        recipient_email: editedRecipient,
+      });
+      // Send
+      const sent = await sendApplication(result.id);
+      setResult(sent);
+      toast.success("Email sent!");
+    } catch (err: unknown) {
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      toast.error(detail || "Failed to send email");
+    } finally {
+      setSending(false);
+    }
+  }
+
+  function handleNewMessage() {
+    setResult(null);
+    setStreamedText("");
+    setEditedMessage("");
+    setEditedSubject("");
+    setEditedRecipient("");
   }
 
   const isAutoFilled = (field: string, value: string) => {
@@ -183,6 +215,8 @@ export default function GeneratePage() {
       : "recipient_email";
     return jdFields[key as keyof JdExtractedFields] === value;
   };
+
+  const isSent = result?.status === "sent";
 
   return (
     <div className="space-y-6">
@@ -332,9 +366,7 @@ export default function GeneratePage() {
                   </span>
                 )}
                 <label className={`text-xs cursor-pointer transition-colors ${
-                  uploadingPdf
-                    ? "text-muted-foreground"
-                    : "text-accent hover:text-accent/80"
+                  uploadingPdf ? "text-muted-foreground" : "text-accent hover:text-accent/80"
                 }`}>
                   {uploadingPdf ? "Extracting..." : "Upload PDF"}
                   <input
@@ -369,16 +401,14 @@ export default function GeneratePage() {
         {/* Right column — result */}
         <div>
           {generating ? (
-            editedMessage ? (
+            streamedText ? (
               <div className="border border-accent/30 rounded-lg overflow-hidden">
                 <div className="px-4 py-3 border-b border-border flex items-center gap-2">
                   <div className="h-2 w-2 bg-accent rounded-full animate-pulse" />
-                  <p className="text-sm font-medium text-muted-foreground">
-                    Generating...
-                  </p>
+                  <p className="text-sm font-medium text-muted-foreground">Generating...</p>
                 </div>
-                <div className="px-4 py-3 text-sm font-mono leading-relaxed whitespace-pre-wrap min-h-[300px] max-h-[500px] overflow-y-auto">
-                  {editedMessage}
+                <div className="px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap min-h-[300px] max-h-[500px] overflow-y-auto">
+                  {streamedText}
                   <span className="inline-block w-2 h-4 bg-accent/70 animate-pulse ml-0.5 align-text-bottom" />
                 </div>
               </div>
@@ -394,6 +424,7 @@ export default function GeneratePage() {
             )
           ) : result ? (
             <div className="border border-border rounded-lg overflow-hidden">
+              {/* Header */}
               <div className="px-4 py-3 border-b border-border flex items-center justify-between">
                 <div>
                   <p className="text-sm font-medium">
@@ -403,31 +434,72 @@ export default function GeneratePage() {
                     {result.position_title || result.message_type}
                   </p>
                 </div>
-                <span className="text-[10px] font-medium px-2 py-0.5 bg-accent/10 text-accent rounded">
-                  {result.status.replace("_", " ")}
+                <span className={`text-[10px] font-medium px-2 py-0.5 rounded ${
+                  isSent
+                    ? "bg-green-500/10 text-green-500"
+                    : "bg-accent/10 text-accent"
+                }`}>
+                  {isSent ? "sent" : result.status.replace("_", " ")}
                 </span>
               </div>
+
+              {/* Subject line */}
+              <div className="px-4 py-2 border-b border-border">
+                <label className="text-[10px] text-muted-foreground uppercase tracking-wider">Subject</label>
+                <input
+                  value={editedSubject}
+                  onChange={(e) => setEditedSubject(e.target.value)}
+                  disabled={isSent}
+                  className="w-full text-sm bg-transparent border-none focus:outline-none mt-0.5 disabled:opacity-60"
+                  placeholder="Email subject line..."
+                />
+              </div>
+
+              {/* Recipient */}
+              <div className="px-4 py-2 border-b border-border">
+                <label className="text-[10px] text-muted-foreground uppercase tracking-wider">To</label>
+                <input
+                  type="email"
+                  value={editedRecipient}
+                  onChange={(e) => setEditedRecipient(e.target.value)}
+                  disabled={isSent}
+                  className="w-full text-sm bg-transparent border-none focus:outline-none mt-0.5 disabled:opacity-60"
+                  placeholder="recruiter@company.com"
+                />
+              </div>
+
+              {/* Message body */}
               <textarea
                 value={editedMessage}
                 onChange={(e) => setEditedMessage(e.target.value)}
-                rows={16}
-                className="w-full px-4 py-3 text-sm bg-background border-none focus:outline-none resize-y font-mono leading-relaxed"
+                disabled={isSent}
+                rows={14}
+                className="w-full px-4 py-3 text-sm bg-background border-none focus:outline-none resize-y leading-relaxed disabled:opacity-60"
               />
+
+              {/* Actions */}
               <div className="px-4 py-3 border-t border-border flex items-center gap-2">
+                {isSent ? (
+                  <div className="flex items-center gap-2 text-sm text-green-500">
+                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                    </svg>
+                    Email sent
+                  </div>
+                ) : (
+                  <button
+                    onClick={handleSend}
+                    disabled={sending || !editedRecipient.trim()}
+                    className="px-4 py-2 text-sm font-medium bg-accent text-accent-foreground rounded-md hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {sending ? "Sending..." : "Send Email"}
+                  </button>
+                )}
                 <button
-                  onClick={handleViewApplication}
-                  className="px-4 py-2 text-sm font-medium bg-accent text-accent-foreground rounded-md hover:opacity-90 transition-opacity"
-                >
-                  Review & Send
-                </button>
-                <button
-                  onClick={() => {
-                    setResult(null);
-                    setEditedMessage("");
-                  }}
+                  onClick={handleNewMessage}
                   className="px-4 py-2 text-sm text-muted-foreground hover:text-foreground transition-colors"
                 >
-                  Discard
+                  {isSent ? "New Message" : "Discard"}
                 </button>
               </div>
             </div>

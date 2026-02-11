@@ -43,8 +43,11 @@ def migrate_db():
             conn.execute(text(
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_refresh_token VARCHAR"
             ))
+            conn.execute(text(
+                "ALTER TABLE applications ADD COLUMN IF NOT EXISTS subject VARCHAR"
+            ))
             conn.commit()
-            logger.info("DB migration: gmail_refresh_token column ensured")
+            logger.info("DB migration: gmail_refresh_token + subject columns ensured")
     except Exception as e:
         logger.warning(f"DB migration skipped: {e}")
 

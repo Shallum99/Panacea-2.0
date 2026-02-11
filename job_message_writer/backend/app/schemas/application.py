@@ -15,6 +15,7 @@ class ApplicationCreate(BaseModel):
 
 class ApplicationUpdate(BaseModel):
     edited_message: Optional[str] = None
+    subject: Optional[str] = None
     recipient_email: Optional[str] = None
     recipient_name: Optional[str] = None
     status: Optional[str] = None
@@ -30,6 +31,7 @@ class ApplicationResponse(BaseModel):
     recipient_name: Optional[str] = None
     job_url: Optional[str] = None
     message_type: Optional[str] = None
+    subject: Optional[str] = None
     generated_message: Optional[str] = None
     edited_message: Optional[str] = None
     final_message: Optional[str] = None

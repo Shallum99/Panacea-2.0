@@ -81,65 +81,69 @@ def build_message_prompts(
     resume_email = resume.email or ""
     resume_phone = resume.phone or ""
 
-    system_prompt = """You write job application outreach messages. Your writing style:
+    system_prompt = """You ghostwrite cold emails and messages for job seekers. You write exactly like a real human typing in Gmail — not like a language model.
 
-- You sound like a confident human, never like an AI
-- You NEVER use: "I am writing to express", "I was excited to see", "I would love the opportunity", "I believe my skills", "passionate about", "thrilled", "eager", "deep expertise", "well-positioned", "aligns perfectly"
-- You NEVER open with "Dear Hiring Manager" or "Dear [Company] Team" or "Dear Recruiting Team"
-- Every sentence earns its place with a specific fact, metric, or direct connection to the JD
-- You map resume accomplishments DIRECTLY to JD requirements — show the reader you read their posting
-- Short paragraphs (2-3 sentences max), no walls of text
-- Numbers and specifics over adjectives: "$2M ARR" not "significant revenue", "40% faster" not "improved performance"
-- Close with a company-specific line showing you understand their product/mission, then a brief CTA
-- Tone: direct, competent, slightly informal — like a peer reaching out, not a supplicant begging
-- Use em dashes, not semicolons. Write how humans actually write in emails."""
+VOICE:
+- Vary your sentence structure. Mix short punchy sentences with longer ones. Real people don't write in uniform paragraph blocks.
+- NEVER start 3+ sentences with "I" or "At [Company]" — vary your openings. Use "The", "That", "Built", "Shipped", the company name, a question, whatever.
+- Don't list technologies in parentheses like "(React, Node, AWS, Docker)" — weave them naturally into what you built.
+- Don't explain what a technology is. The reader knows.
+- Use contractions. "I've" not "I have". "Didn't" not "did not".
+- Em dashes over semicolons. Fragments are fine. This is an email, not an essay.
+
+CONTENT:
+- Pick 2-3 things from the resume that genuinely match what the JD asks for. Quality over quantity.
+- For each, say WHAT you built and the RESULT (number/metric). One sentence, not a paragraph.
+- Reference something specific about the company's actual product, problem, or industry — not generic "your mission resonates with me" garbage.
+- End with a real sign-off: "Best," or "Cheers," followed by the person's first name. Like a real email.
+
+WHAT MAKES IT SOUND LIKE AI (avoid all of these):
+- Template structure where every paragraph follows the same "At [Company], I [verb] [thing] that [metric]" pattern
+- Forced casual phrases like "Down to chat" or "Happy to hop on a call"
+- Buzzwords: "passionate", "thrilled", "eager", "deep expertise", "well-positioned", "aligns perfectly", "leverage", "spearheaded"
+- Opening with "I" as the very first word
+- The phrase "I am writing to" or "I came across" or "I was excited to see"
+- Praising the company generically ("Your commitment to innovation")
+- Any sentence where you could replace the company name with any other company and it still works"""
 
     contact_header = ""
     if message_type.startswith("email") or message_type == "ycombinator":
         parts = [p for p in [resume_name, resume_email, resume_phone] if p]
         if parts:
-            contact_header = f"- Start with a contact header line: {' | '.join(parts)}"
+            contact_header = f"\n- First line of the body should be a contact header: {' | '.join(parts)}"
 
     greeting = ""
     if recruiter_name:
-        greeting = f"- Address: Hi {recruiter_name},"
+        greeting = f"\n- Open with: Hi {recruiter_name},"
     else:
-        greeting = "- No greeting line — jump straight into the message"
+        greeting = "\n- No greeting — start directly with the body"
 
-    user_prompt = f"""Write a {config['format']} for this person applying to the role below.
+    user_prompt = f"""Write a {config['format']} for this job application.
 
-FORMAT:
+Output format — return EXACTLY this structure:
+Subject: [a short, specific email subject line — not "Application for [Role]", make it stand out]
+
+[message body here]
+
+CONSTRAINTS:
 - {config['max_chars']}
-- Style: {config['style']}
-{greeting}
-{contact_header}
+- Style: {config['style']}{greeting}{contact_header}
 
-RESUME (the person writing this):
+RESUME:
 {resume_content}
 
-Profile: {resume.profile_type} | {resume.seniority} | {resume.years_experience}
-Languages: {resume.primary_languages}
-Frameworks: {resume.frameworks}
-
-JOB DESCRIPTION (what they're applying to):
+JOB DESCRIPTION:
 {job_description}
 
-INSTRUCTIONS:
-1. Identify the 2-3 JD requirements that BEST match this resume
-2. For each match, cite a SPECIFIC accomplishment with a number/metric from the resume
-3. End with a line that references the company's specific product, mission, or challenge — not generic praise
-4. One-line CTA: suggest connecting or a conversation
+RULES:
+1. Read the JD. Find 2-3 requirements this person actually matches. Ignore the rest.
+2. For each match, one sentence: what they built + the result. Don't pad it.
+3. Last paragraph: reference something SPECIFIC about this company's product/challenge/industry. Then a one-line ask to connect.
+4. Sign off with "Best," or "Cheers," and the person's first name.
+5. The subject line should reference the specific role or company — not generic "Job Application".
+6. Keep it SHORT. Recruiters skim. Every sentence must earn its place.
 
-ANTI-PATTERNS (never do these):
-- "With X years of experience in Y, I bring..."
-- "I am confident that my background..."
-- "Your company's commitment to innovation..."
-- "I look forward to discussing how I can contribute..."
-- Any sentence that could apply to any company/role — if you could swap the company name and it still reads the same, rewrite it
-- Starting multiple sentences with "I"
-- Using "leverage" as a verb
-
-Return ONLY the message. No labels, no explanation, no subject line."""
+Output the subject line and message body ONLY. Nothing else."""
 
     return system_prompt, user_prompt, config["max_tokens"]
 
@@ -229,6 +233,16 @@ async def create_application(
         job_desc.company_info = json.dumps(company_info)
         db.flush()
 
+        # Parse subject from message if present
+        subject = None
+        body = generated_message
+        if generated_message.startswith("Subject:"):
+            parts = generated_message.split("\n\n", 1)
+            subject = parts[0].replace("Subject:", "").strip()
+            body = parts[1] if len(parts) > 1 else generated_message
+        if not subject:
+            subject = f"Application for {request.position_title}" if request.position_title else "Job Application"
+
         # Create application
         application = models.Application(
             owner_id=current_user.id,
@@ -241,8 +255,9 @@ async def create_application(
             recipient_email=request.recipient_email,
             job_url=request.job_url,
             message_type=request.message_type,
-            generated_message=generated_message,
-            final_message=generated_message,
+            subject=subject,
+            generated_message=body,
+            final_message=body,
         )
         db.add(application)
         db.commit()
@@ -364,6 +379,16 @@ async def stream_application(
                 job_desc_record.company_info = json.dumps(company_info)
                 save_db.flush()
 
+            # Parse subject from message if present (format: "Subject: ...\n\n...")
+            subject = None
+            body = full_message
+            if full_message.startswith("Subject:"):
+                parts = full_message.split("\n\n", 1)
+                subject = parts[0].replace("Subject:", "").strip()
+                body = parts[1] if len(parts) > 1 else full_message
+            if not subject:
+                subject = f"Application for {request.position_title}" if request.position_title else "Job Application"
+
             application = models.Application(
                 owner_id=user_id,
                 resume_id=resume_id,
@@ -375,8 +400,9 @@ async def stream_application(
                 recipient_email=request.recipient_email,
                 job_url=request.job_url,
                 message_type=request.message_type,
-                generated_message=full_message,
-                final_message=full_message,
+                subject=subject,
+                generated_message=body,
+                final_message=body,
             )
             save_db.add(application)
             save_db.commit()
@@ -390,6 +416,7 @@ async def stream_application(
                 "position_title": application.position_title,
                 "recipient_email": application.recipient_email,
                 "message_type": application.message_type,
+                "subject": application.subject,
                 "generated_message": application.generated_message,
                 "final_message": application.final_message,
                 "resume_id": application.resume_id,
@@ -465,6 +492,8 @@ async def update_application(
     if update.edited_message is not None:
         app.edited_message = update.edited_message
         app.final_message = update.edited_message
+    if update.subject is not None:
+        app.subject = update.subject
     if update.recipient_email is not None:
         app.recipient_email = update.recipient_email
     if update.recipient_name is not None:
@@ -542,8 +571,8 @@ async def send_application(
     app.status = models.ApplicationStatus.SENDING.value
     db.commit()
 
-    # Build subject line
-    subject = f"Application for {app.position_title}" if app.position_title else "Job Application"
+    # Use stored subject or fall back to default
+    subject = app.subject or (f"Application for {app.position_title}" if app.position_title else "Job Application")
 
     # Get resume PDF if available
     from app.services.storage import is_local_path, download_file, RESUMES_BUCKET
