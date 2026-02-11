@@ -12,6 +12,10 @@ export default function CallbackPage() {
   useEffect(() => {
     const supabase = createClient();
 
+    // Detect if this is an OAuth redirect (URL has code= param from PKCE flow)
+    const params = new URLSearchParams(window.location.search);
+    const isOAuthRedirect = params.has("code");
+
     async function handleSession(session: any) {
       if (handled.current) return;
       handled.current = true;
@@ -23,7 +27,6 @@ export default function CallbackPage() {
           await api.post("/users/save-gmail-token", {
             refresh_token: providerRefreshToken,
           });
-          console.log("Gmail refresh token saved");
         } catch (err) {
           console.warn("Failed to save Gmail token:", err);
         }
@@ -32,18 +35,27 @@ export default function CallbackPage() {
       router.push("/dashboard");
     }
 
-    // Listen for auth state change — this is the ONLY reliable way to get
-    // provider_refresh_token, since getSession() returns the cached session
-    // without it.
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange(async (event, session) => {
-      if (session && (event === "SIGNED_IN" || event === "INITIAL_SESSION")) {
-        handleSession(session);
+      if (!session) return;
+
+      if (isOAuthRedirect) {
+        // OAuth flow: ONLY accept SIGNED_IN — it has the fresh session
+        // with provider_refresh_token. INITIAL_SESSION fires first with
+        // the stale cached session and must be ignored.
+        if (event === "SIGNED_IN") {
+          handleSession(session);
+        }
+      } else {
+        // Direct navigation: accept any session
+        if (event === "SIGNED_IN" || event === "INITIAL_SESSION") {
+          handleSession(session);
+        }
       }
     });
 
-    // Safety net: if no auth event fires within 5s, check session and redirect
+    // Safety net: redirect after 5s regardless
     const timeout = setTimeout(async () => {
       if (!handled.current) {
         const {
@@ -51,6 +63,8 @@ export default function CallbackPage() {
         } = await supabase.auth.getSession();
         if (session) {
           handleSession(session);
+        } else {
+          router.push("/login");
         }
       }
     }, 5000);
