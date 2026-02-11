@@ -12,6 +12,7 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [gmailConnected, setGmailConnected] = useState(false);
   const [gmailLoading, setGmailLoading] = useState(true);
+  const [exchanging, setExchanging] = useState(false);
 
   useEffect(() => {
     async function load() {
@@ -27,24 +28,45 @@ export default function SettingsPage() {
     load();
   }, []);
 
+  // On mount: check for Google OAuth code in URL (redirect from Google)
   useEffect(() => {
-    async function checkGmail() {
-      try {
-        const { data } = await api.get("/users/gmail-status");
-        setGmailConnected(data.connected);
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get("code");
+    const state = params.get("state");
 
-        // Show success toast if user just connected
-        const params = new URLSearchParams(window.location.search);
-        if (params.get("gmail") === "connected" && data.connected) {
-          toast.success("Gmail connected successfully");
-          window.history.replaceState({}, "", "/settings");
-        }
-      } catch {
-        // Not critical
-      }
-      setGmailLoading(false);
+    if (code && state) {
+      // Clean URL immediately
+      window.history.replaceState({}, "", "/settings");
+
+      setExchanging(true);
+      api
+        .post("/users/exchange-gmail-code", {
+          code,
+          state,
+          redirect_uri: `${window.location.origin}/settings`,
+        })
+        .then(({ data }) => {
+          if (data.connected) {
+            setGmailConnected(true);
+            toast.success("Gmail connected successfully");
+          }
+        })
+        .catch((err) => {
+          const detail = err.response?.data?.detail || "Failed to connect Gmail";
+          toast.error(detail);
+        })
+        .finally(() => {
+          setExchanging(false);
+          setGmailLoading(false);
+        });
+    } else {
+      // No code — just check status
+      api
+        .get("/users/gmail-status")
+        .then(({ data }) => setGmailConnected(data.connected))
+        .catch(() => {})
+        .finally(() => setGmailLoading(false));
     }
-    checkGmail();
   }, []);
 
   async function handleSignOut() {
@@ -54,24 +76,15 @@ export default function SettingsPage() {
   }
 
   async function handleConnectGmail() {
-    // Store redirect intent so callback knows to come back here
-    localStorage.setItem("gmail_connect_redirect", "/settings?gmail=connected");
-
-    const supabase = createClient();
-    const { error } = await supabase.auth.signInWithOAuth({
-      provider: "google",
-      options: {
-        redirectTo: `${window.location.origin}/callback`,
-        scopes: "https://www.googleapis.com/auth/gmail.send",
-        queryParams: {
-          access_type: "offline",
-          prompt: "consent",
-        },
-      },
-    });
-    if (error) {
-      toast.error(error.message);
-      localStorage.removeItem("gmail_connect_redirect");
+    try {
+      const { data } = await api.post("/users/gmail-auth-url", {
+        redirect_uri: `${window.location.origin}/settings`,
+      });
+      // Navigate to Google consent screen
+      window.location.href = data.url;
+    } catch (err: any) {
+      const detail = err.response?.data?.detail || "Failed to start Gmail connection";
+      toast.error(detail);
     }
   }
 
@@ -129,8 +142,12 @@ export default function SettingsPage() {
             <div>
               <p className="text-sm font-medium">Gmail</p>
               <p className="text-xs text-muted-foreground mt-0.5">
-                {gmailLoading ? (
-                  <span className="inline-block w-48 h-4 bg-muted animate-pulse rounded" />
+                {gmailLoading || exchanging ? (
+                  <span>
+                    {exchanging ? "Connecting Gmail..." : (
+                      <span className="inline-block w-48 h-4 bg-muted animate-pulse rounded" />
+                    )}
+                  </span>
                 ) : gmailConnected ? (
                   "Connected — emails will send from your Gmail"
                 ) : (
@@ -138,7 +155,7 @@ export default function SettingsPage() {
                 )}
               </p>
             </div>
-            {!gmailLoading && (
+            {!gmailLoading && !exchanging && (
               <button
                 onClick={handleConnectGmail}
                 className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
