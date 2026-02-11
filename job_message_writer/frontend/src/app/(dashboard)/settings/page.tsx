@@ -4,11 +4,14 @@ import { useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { useTheme } from "@/hooks/useTheme";
 import { toast } from "sonner";
+import api from "@/lib/api";
 
 export default function SettingsPage() {
   const { theme, setTheme } = useTheme();
   const [email, setEmail] = useState("");
   const [loading, setLoading] = useState(true);
+  const [gmailConnected, setGmailConnected] = useState(false);
+  const [gmailLoading, setGmailLoading] = useState(true);
 
   useEffect(() => {
     async function load() {
@@ -22,10 +25,41 @@ export default function SettingsPage() {
     load();
   }, []);
 
+  useEffect(() => {
+    async function checkGmail() {
+      try {
+        const { data } = await api.get("/users/gmail-status");
+        setGmailConnected(data.connected);
+      } catch {
+        // Not critical — just leave as disconnected
+      }
+      setGmailLoading(false);
+    }
+    checkGmail();
+  }, []);
+
   async function handleSignOut() {
     const supabase = createClient();
     await supabase.auth.signOut();
     window.location.href = "/login";
+  }
+
+  async function handleReconnectGmail() {
+    const supabase = createClient();
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: "google",
+      options: {
+        redirectTo: `${window.location.origin}/callback`,
+        scopes: "https://www.googleapis.com/auth/gmail.send",
+        queryParams: {
+          access_type: "offline",
+          prompt: "consent",
+        },
+      },
+    });
+    if (error) {
+      toast.error(error.message);
+    }
   }
 
   return (
@@ -68,6 +102,41 @@ export default function SettingsPage() {
             >
               Sign Out
             </button>
+          </div>
+        </div>
+      </section>
+
+      {/* Email Sending */}
+      <section className="space-y-4">
+        <h2 className="text-sm font-medium text-muted-foreground uppercase tracking-wider">
+          Email Sending
+        </h2>
+        <div className="border border-border rounded-lg">
+          <div className="flex items-center justify-between px-4 py-3">
+            <div>
+              <p className="text-sm font-medium">Gmail</p>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                {gmailLoading ? (
+                  <span className="inline-block w-48 h-4 bg-muted animate-pulse rounded" />
+                ) : gmailConnected ? (
+                  "Connected — emails will send from your Gmail"
+                ) : (
+                  "Not connected — connect to send emails from your account"
+                )}
+              </p>
+            </div>
+            {!gmailLoading && (
+              <button
+                onClick={handleReconnectGmail}
+                className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
+                  gmailConnected
+                    ? "text-muted-foreground border border-border hover:bg-muted"
+                    : "text-foreground bg-primary/10 border border-primary/30 hover:bg-primary/20"
+                }`}
+              >
+                {gmailConnected ? "Reconnect" : "Connect Gmail"}
+              </button>
+            )}
           </div>
         </div>
       </section>
@@ -124,9 +193,9 @@ export default function SettingsPage() {
         </h2>
         <div className="border border-border rounded-lg divide-y divide-border">
           {[
-            { keys: "⌘ K", desc: "Open command palette" },
-            { keys: "⌘ N", desc: "New application" },
-            { keys: "⌘ G", desc: "Go to Generate" },
+            { keys: "\u2318 K", desc: "Open command palette" },
+            { keys: "\u2318 N", desc: "New application" },
+            { keys: "\u2318 G", desc: "Go to Generate" },
           ].map((shortcut) => (
             <div
               key={shortcut.keys}

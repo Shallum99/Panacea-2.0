@@ -28,6 +28,7 @@ from app.services.auto_apply.browser_worker import (
 )
 from app.services.email_sender import send_application_email
 from app.services.pdf_format_preserver import optimize_pdf
+from app.services.storage import is_local_path, download_file, upload_file, download_to_tempfile, RESUMES_BUCKET, TAILORED_BUCKET
 from app.utils.ats_scorer import calculate_match_score
 
 router = APIRouter()
@@ -121,10 +122,6 @@ Return ONLY the email body text.
 
     # Define PDF optimization task
     async def _optimize_pdf_task():
-        from app.services.storage import (
-            is_local_path, download_to_tempfile, upload_file, download_file,
-            RESUMES_BUCKET, TAILORED_BUCKET,
-        )
         import tempfile
 
         if not (request.optimize_resume and resume.file_path):
@@ -173,7 +170,6 @@ Return ONLY the email body text.
     company_name = company_info.get("company_name", "Unknown")
 
     # Step 3: Get resume bytes for email attachment
-    from app.services.storage import is_local_path, download_file, RESUMES_BUCKET, TAILORED_BUCKET
     resume_bytes = None
     if tailored_pdf_path:
         try:
@@ -198,8 +194,10 @@ Return ONLY the email body text.
         subject=subject,
         body=message,
         from_name=resume.name or current_user.email.split("@")[0],
+        from_email=current_user.email,
         resume_pdf_bytes=resume_bytes,
         resume_filename=f"{resume.title or 'resume'}.pdf",
+        gmail_refresh_token=current_user.gmail_refresh_token,
     )
 
     # Create application record

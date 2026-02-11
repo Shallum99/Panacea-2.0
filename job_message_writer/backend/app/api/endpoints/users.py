@@ -2,14 +2,20 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import Any, List
+from pydantic import BaseModel
 import logging
 
 from app.db.database import get_db
 from app.db import models
 from app.schemas.user import UserCreate, UserResponse
+from app.core.supabase_auth import get_current_user
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+class SaveGmailTokenRequest(BaseModel):
+    refresh_token: str
 
 @router.post("/", response_model=UserResponse)
 def create_user(
@@ -90,3 +96,24 @@ def get_current_user(
         logger.error(f"Error getting current user: {str(e)}")
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/save-gmail-token")
+async def save_gmail_token(
+    request: SaveGmailTokenRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Store the user's Google refresh token for Gmail sending."""
+    current_user.gmail_refresh_token = request.refresh_token
+    db.commit()
+    logger.info(f"Saved Gmail refresh token for user {current_user.id}")
+    return {"status": "ok"}
+
+
+@router.get("/gmail-status")
+async def gmail_status(
+    current_user: models.User = Depends(get_current_user),
+):
+    """Check if the user has a Gmail refresh token stored."""
+    return {"connected": bool(current_user.gmail_refresh_token)}

@@ -603,8 +603,10 @@ async def send_application(
             subject=subject,
             body=app.final_message or app.generated_message,
             from_name=from_name,
+            from_email=current_user.email,
             resume_pdf_bytes=resume_pdf_bytes,
             resume_filename=resume_filename,
+            gmail_refresh_token=current_user.gmail_refresh_token,
         )
 
         if message_id:
