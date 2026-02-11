@@ -35,6 +35,21 @@ def init_db():
 # Initialize database
 init_db()
 
+# Add missing columns to existing tables (safe to re-run)
+def migrate_db():
+    try:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            conn.execute(text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_refresh_token VARCHAR"
+            ))
+            conn.commit()
+            logger.info("DB migration: gmail_refresh_token column ensured")
+    except Exception as e:
+        logger.warning(f"DB migration skipped: {e}")
+
+migrate_db()
+
 # Ensure Supabase Storage buckets exist
 try:
     from app.services.storage import ensure_buckets_exist
