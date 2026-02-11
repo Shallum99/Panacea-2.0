@@ -74,6 +74,12 @@ async def email_auto_apply(
     2. Generate a tailored message
     3. Send email with resume attached
     """
+    if not current_user.gmail_refresh_token:
+        raise HTTPException(
+            status_code=400,
+            detail="Gmail not connected. Go to Settings and click 'Connect Gmail' to send emails from your account.",
+        )
+
     # Resolve resume
     resume = None
     if request.resume_id:

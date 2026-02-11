@@ -564,6 +564,12 @@ async def send_application(
             detail=f"Cannot send application in status '{app.status}'",
         )
 
+    if not current_user.gmail_refresh_token:
+        raise HTTPException(
+            status_code=400,
+            detail="Gmail not connected. Go to Settings and click 'Connect Gmail' to send emails from your account.",
+        )
+
     app.status = models.ApplicationStatus.SENDING.value
     db.commit()
 
