@@ -13,12 +13,20 @@ export interface SectionMapResponse {
   sections: SectionInfo[];
 }
 
+export interface TextChange {
+  section: string;
+  type: string;
+  original: string;
+  optimized: string;
+}
+
 export interface PDFOptimizeResponse {
   download_id: string;
   sections_found: string[];
   sections_optimized: string[];
   original_ats_score: number;
   optimized_ats_score: number;
+  changes: TextChange[];
 }
 
 export interface ATSScoreResponse {

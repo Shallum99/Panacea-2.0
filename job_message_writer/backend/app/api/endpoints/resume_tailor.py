@@ -315,6 +315,7 @@ async def optimize_resume_pdf(
             sections_optimized=result["sections_optimized"],
             original_ats_score=original_score,
             optimized_ats_score=optimized_score,
+            changes=result.get("changes", []),
         )
 
     except HTTPException:

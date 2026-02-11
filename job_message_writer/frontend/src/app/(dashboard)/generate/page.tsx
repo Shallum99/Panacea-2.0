@@ -18,7 +18,94 @@ import {
   optimizePDF,
   getDownloadUrl,
   type PDFOptimizeResponse,
+  type TextChange,
 } from "@/lib/api/resumeTailor";
+
+// ── Word-level diff ──
+function computeWordDiff(original: string, optimized: string): { text: string; type: "same" | "added" | "removed" }[] {
+  const origWords = original.split(/(\s+)/);
+  const optWords = optimized.split(/(\s+)/);
+
+  // Simple LCS-based diff
+  const m = origWords.length;
+  const n = optWords.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (origWords[i - 1] === optWords[j - 1]) {
+        dp[i][j] = dp[i - 1][j - 1] + 1;
+      } else {
+        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+      }
+    }
+  }
+
+  // Backtrack
+  const result: { text: string; type: "same" | "added" | "removed" }[] = [];
+  let i = m, j = n;
+  const stack: { text: string; type: "same" | "added" | "removed" }[] = [];
+
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && origWords[i - 1] === optWords[j - 1]) {
+      stack.push({ text: origWords[i - 1], type: "same" });
+      i--; j--;
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      stack.push({ text: optWords[j - 1], type: "added" });
+      j--;
+    } else {
+      stack.push({ text: origWords[i - 1], type: "removed" });
+      i--;
+    }
+  }
+
+  stack.reverse();
+
+  // Merge consecutive same-type tokens
+  for (const token of stack) {
+    if (result.length > 0 && result[result.length - 1].type === token.type) {
+      result[result.length - 1].text += token.text;
+    } else {
+      result.push({ ...token });
+    }
+  }
+
+  return result;
+}
+
+function DiffView({ change }: { change: TextChange }) {
+  const diff = computeWordDiff(change.original, change.optimized);
+  return (
+    <div className="text-sm leading-relaxed">
+      {diff.map((part, i) => (
+        <span
+          key={i}
+          className={
+            part.type === "added"
+              ? "bg-green-500/20 text-green-400"
+              : part.type === "removed"
+              ? "bg-red-500/20 text-red-400 line-through"
+              : ""
+          }
+        >{part.text}</span>
+      ))}
+    </div>
+  );
+}
+
+function OptimizedView({ change }: { change: TextChange }) {
+  const diff = computeWordDiff(change.original, change.optimized);
+  return (
+    <div className="text-sm leading-relaxed">
+      {diff.filter(p => p.type !== "removed").map((part, i) => (
+        <span
+          key={i}
+          className={part.type === "added" ? "bg-green-500/15 text-green-400 font-medium" : ""}
+        >{part.text}</span>
+      ))}
+    </div>
+  );
+}
 
 const MESSAGE_TYPES = [
   { value: "email_detailed", label: "Detailed Email" },
@@ -66,6 +153,7 @@ export default function GeneratePage() {
 
   // Tab state for right panel
   const [activeTab, setActiveTab] = useState<"message" | "resume">("message");
+  const [diffMode, setDiffMode] = useState<"preview" | "diff">("preview");
 
   useEffect(() => {
     loadResumes();
@@ -670,50 +758,90 @@ export default function GeneratePage() {
                 <div className="border border-border rounded-b-lg overflow-hidden">
                   {/* ATS Score comparison */}
                   <div className="grid grid-cols-2 border-b border-border">
-                    <div className="p-6 text-center border-r border-border">
-                      <p className="text-3xl font-bold">{Math.round(tailorResult.original_ats_score)}</p>
-                      <p className="text-xs text-muted-foreground mt-1">Original ATS Score</p>
+                    <div className="p-4 text-center border-r border-border">
+                      <p className="text-2xl font-bold">{Math.round(tailorResult.original_ats_score)}</p>
+                      <p className="text-[10px] text-muted-foreground">Original ATS</p>
                     </div>
-                    <div className="p-6 text-center bg-accent/5">
-                      <p className="text-3xl font-bold text-accent">{Math.round(tailorResult.optimized_ats_score)}</p>
-                      <p className="text-xs text-muted-foreground mt-1">Optimized ATS Score</p>
-                      {tailorResult.optimized_ats_score > tailorResult.original_ats_score && (
-                        <p className="text-[10px] text-accent mt-0.5">
-                          +{Math.round(tailorResult.optimized_ats_score - tailorResult.original_ats_score)} points
-                        </p>
-                      )}
+                    <div className="p-4 text-center bg-accent/5">
+                      <p className="text-2xl font-bold text-accent">{Math.round(tailorResult.optimized_ats_score)}</p>
+                      <p className="text-[10px] text-muted-foreground">
+                        Optimized
+                        {tailorResult.optimized_ats_score > tailorResult.original_ats_score && (
+                          <span className="text-accent ml-1">
+                            (+{Math.round(tailorResult.optimized_ats_score - tailorResult.original_ats_score)})
+                          </span>
+                        )}
+                      </p>
                     </div>
                   </div>
 
-                  {/* Sections optimized */}
-                  <div className="px-4 py-4 border-b border-border">
-                    <p className="text-xs font-medium text-muted-foreground mb-2">Sections</p>
-                    <div className="flex flex-wrap gap-1.5">
-                      {tailorResult.sections_found.map((name) => {
-                        const wasOptimized = tailorResult.sections_optimized.includes(name);
-                        return (
-                          <span
-                            key={name}
-                            className={`text-[10px] px-2 py-0.5 rounded ${
-                              wasOptimized
-                                ? "bg-accent/10 text-accent"
-                                : "bg-muted text-muted-foreground"
-                            }`}
-                          >
-                            {name} {wasOptimized ? "(optimized)" : "(unchanged)"}
-                          </span>
-                        );
-                      })}
+                  {/* View toggle: Preview / Diff */}
+                  <div className="px-4 py-2 border-b border-border flex items-center justify-between">
+                    <div className="flex gap-1">
+                      <button
+                        onClick={() => setDiffMode("preview")}
+                        className={`px-3 py-1 text-xs rounded-md transition-colors ${
+                          diffMode === "preview"
+                            ? "bg-accent/10 text-accent"
+                            : "text-muted-foreground hover:text-foreground"
+                        }`}
+                      >
+                        Preview
+                      </button>
+                      <button
+                        onClick={() => setDiffMode("diff")}
+                        className={`px-3 py-1 text-xs rounded-md transition-colors ${
+                          diffMode === "diff"
+                            ? "bg-accent/10 text-accent"
+                            : "text-muted-foreground hover:text-foreground"
+                        }`}
+                      >
+                        Diff
+                      </button>
                     </div>
+                    <span className="text-[10px] text-muted-foreground">
+                      {tailorResult.changes.length} changes
+                    </span>
+                  </div>
+
+                  {/* Changes list */}
+                  <div className="max-h-[500px] overflow-y-auto divide-y divide-border">
+                    {tailorResult.changes.length === 0 ? (
+                      <div className="p-6 text-center text-sm text-muted-foreground">
+                        No text changes detected
+                      </div>
+                    ) : (
+                      tailorResult.changes.map((change, i) => (
+                        <div key={i} className="px-4 py-3">
+                          <div className="flex items-center gap-2 mb-2">
+                            <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
+                              {change.section}
+                            </span>
+                            <span className={`text-[10px] px-1.5 py-0.5 rounded ${
+                              change.type === "bullet" ? "bg-blue-500/10 text-blue-400" :
+                              change.type === "skill" ? "bg-purple-500/10 text-purple-400" :
+                              "bg-amber-500/10 text-amber-400"
+                            }`}>
+                              {change.type === "bullet" ? "bullet" : change.type === "skill" ? "skills" : "title"}
+                            </span>
+                          </div>
+                          {diffMode === "diff" ? (
+                            <DiffView change={change} />
+                          ) : (
+                            <OptimizedView change={change} />
+                          )}
+                        </div>
+                      ))
+                    )}
                   </div>
 
                   {/* Actions */}
-                  <div className="px-4 py-3 flex items-center gap-3">
+                  <div className="px-4 py-3 border-t border-border flex items-center gap-3">
                     <button
                       onClick={handleDownloadTailored}
                       className="px-4 py-2 text-sm font-medium bg-accent text-accent-foreground rounded-md hover:opacity-90 transition-opacity"
                     >
-                      Download Tailored PDF
+                      Download PDF
                     </button>
                     <button
                       onClick={() => {

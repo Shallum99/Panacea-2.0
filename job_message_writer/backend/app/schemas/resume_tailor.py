@@ -53,12 +53,20 @@ class PDFOptimizeRequest(BaseModel):
     resume_id: Optional[int] = None
 
 
+class TextChange(BaseModel):
+    section: str
+    type: str
+    original: str
+    optimized: str
+
+
 class PDFOptimizeResponse(BaseModel):
     download_id: str
     sections_found: List[str]
     sections_optimized: List[str]
     original_ats_score: float
     optimized_ats_score: float
+    changes: List[TextChange] = []
 
 
 class PDFSectionMapResponse(BaseModel):

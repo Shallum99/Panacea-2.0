@@ -1101,8 +1101,39 @@ async def optimize_pdf(
     if title_replacements:
         sections_optimized.append("Title Tech Stacks")
 
+    # Build text diff pairs: [{section, original, optimized}, ...]
+    changes = []
+    for idx, new_lines in bullet_replacements.items():
+        if 0 <= idx < len(bullets):
+            bp = bullets[idx]
+            changes.append({
+                "section": bp.section_name,
+                "type": "bullet",
+                "original": " ".join(bp.line_texts),
+                "optimized": " ".join(new_lines),
+            })
+    for idx, new_content in skill_replacements.items():
+        if 0 <= idx < len(skills):
+            sk = skills[idx]
+            changes.append({
+                "section": sk.section_name,
+                "type": "skill",
+                "original": f"{sk.label_text}{sk.content_text}",
+                "optimized": f"{sk.label_text}{new_content}",
+            })
+    for idx, new_skills_part in title_replacements.items():
+        if 0 <= idx < len(title_skills):
+            ts = title_skills[idx]
+            changes.append({
+                "section": "Title",
+                "type": "title_skill",
+                "original": ts.full_text,
+                "optimized": f"{ts.title_part} ({new_skills_part})",
+            })
+
     return {
         "sections_found": ["Bullet Points", "Skills", "Title Tech Stacks"],
         "sections_optimized": sections_optimized,
         "output_path": output_path,
+        "changes": changes,
     }
