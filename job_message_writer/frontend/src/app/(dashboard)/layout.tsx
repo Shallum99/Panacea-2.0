@@ -12,6 +12,7 @@ const nav = [
   { href: "/dashboard", label: "Dashboard", icon: "H" },
   { href: "/resumes", label: "Resumes", icon: "R" },
   { href: "/generate", label: "Generate", icon: "G" },
+  { href: "/applications", label: "Applications", icon: "A" },
   { href: "/tailor", label: "Tailor", icon: "T" },
 ];
 
@@ -131,7 +132,7 @@ export default function DashboardLayout({
 
       {/* Main content */}
       <main className="flex-1 overflow-y-auto">
-        <div className="max-w-5xl mx-auto p-8">{children}</div>
+        <div className="p-6 lg:p-8 max-w-screen-2xl mx-auto">{children}</div>
       </main>
     </div>
   );

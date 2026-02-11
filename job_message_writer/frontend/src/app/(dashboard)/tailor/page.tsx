@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import { getResumes, type Resume } from "@/lib/api/resumes";
 import {
@@ -15,6 +16,14 @@ import { createClient } from "@/lib/supabase/client";
 type Step = "input" | "preview" | "optimizing" | "done";
 
 export default function TailorPage() {
+  return (
+    <Suspense>
+      <TailorContent />
+    </Suspense>
+  );
+}
+
+function TailorContent() {
   const [resumes, setResumes] = useState<Resume[]>([]);
   const [loadingResumes, setLoadingResumes] = useState(true);
   const [selectedResumeId, setSelectedResumeId] = useState<number | undefined>();
@@ -24,10 +33,13 @@ export default function TailorPage() {
   const [sectionMap, setSectionMap] = useState<SectionMapResponse | null>(null);
   const [result, setResult] = useState<PDFOptimizeResponse | null>(null);
   const [loadingPreview, setLoadingPreview] = useState(false);
+  const searchParams = useSearchParams();
 
   useEffect(() => {
     loadResumes();
-  }, []);
+    const jdParam = searchParams.get("jd");
+    if (jdParam) setJobDescription(jdParam);
+  }, [searchParams]);
 
   async function loadResumes() {
     try {

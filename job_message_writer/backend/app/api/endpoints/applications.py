@@ -106,12 +106,6 @@ WHAT MAKES IT SOUND LIKE AI (avoid all of these):
 - Praising the company generically ("Your commitment to innovation")
 - Any sentence where you could replace the company name with any other company and it still works"""
 
-    contact_header = ""
-    if message_type.startswith("email") or message_type == "ycombinator":
-        parts = [p for p in [resume_name, resume_email, resume_phone] if p]
-        if parts:
-            contact_header = f"\n- First line of the body should be a contact header: {' | '.join(parts)}"
-
     greeting = ""
     if recruiter_name:
         greeting = f"\n- Open with: Hi {recruiter_name},"
@@ -127,7 +121,7 @@ Subject: [a short, specific email subject line — not "Application for [Role]",
 
 CONSTRAINTS:
 - {config['max_chars']}
-- Style: {config['style']}{greeting}{contact_header}
+- Style: {config['style']}{greeting}
 
 RESUME:
 {resume_content}

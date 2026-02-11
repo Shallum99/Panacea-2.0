@@ -37,8 +37,8 @@ export default function ResumeUploadPage() {
     setUploading(true);
     try {
       await uploadResume(file, title.trim(), makeActive);
-      toast.success("Resume uploaded and analyzed");
-      router.push("/resumes");
+      toast.success("Resume uploaded! Now generate your first message.");
+      router.push("/generate");
     } catch (err: unknown) {
       const message =
         err instanceof Error ? err.message : "Failed to upload resume";

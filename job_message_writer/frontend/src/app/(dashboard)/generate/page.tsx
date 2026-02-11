@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef } from "react";
+import Link from "next/link";
 import { toast } from "sonner";
 import { createClient } from "@/lib/supabase/client";
 import { getResumes, type Resume } from "@/lib/api/resumes";
@@ -227,7 +228,7 @@ export default function GeneratePage() {
         </p>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <div className="grid grid-cols-1 xl:grid-cols-[1fr_1fr] gap-8">
         {/* Left column — inputs */}
         <div className="space-y-4">
           {/* Resume selector */}
@@ -382,7 +383,7 @@ export default function GeneratePage() {
             <textarea
               value={jobDescription}
               onChange={(e) => setJobDescription(e.target.value)}
-              rows={12}
+              rows={16}
               placeholder="Paste the full job description here or upload a PDF..."
               className="w-full px-3 py-2 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted-foreground/50 resize-y"
             />
@@ -473,7 +474,7 @@ export default function GeneratePage() {
                 value={editedMessage}
                 onChange={(e) => setEditedMessage(e.target.value)}
                 disabled={isSent}
-                rows={14}
+                rows={18}
                 className="w-full px-4 py-3 text-sm bg-background border-none focus:outline-none resize-y leading-relaxed disabled:opacity-60"
               />
 
@@ -501,10 +502,18 @@ export default function GeneratePage() {
                 >
                   {isSent ? "New Message" : "Discard"}
                 </button>
+                {isSent && jobDescription && (
+                  <Link
+                    href={`/tailor?jd=${encodeURIComponent(jobDescription.slice(0, 2000))}`}
+                    className="ml-auto px-4 py-2 text-sm font-medium border border-border rounded-md text-muted-foreground hover:text-foreground hover:border-muted-foreground transition-colors"
+                  >
+                    Tailor Resume for this JD
+                  </Link>
+                )}
               </div>
             </div>
           ) : (
-            <div className="border border-dashed border-border rounded-lg p-12 flex items-center justify-center h-full min-h-[300px]">
+            <div className="border border-dashed border-border rounded-lg p-12 flex items-center justify-center h-full">
               <p className="text-sm text-muted-foreground text-center">
                 Paste a job description and click Generate
                 <br />

@@ -12,6 +12,121 @@ interface Stats {
   replies: number;
 }
 
+const STEPS = [
+  {
+    label: "Upload Resume",
+    desc: "Upload your resume PDF to get started",
+    href: "/resumes/upload",
+    cta: "Upload",
+  },
+  {
+    label: "Generate Message",
+    desc: "Create a tailored application message",
+    href: "/generate",
+    cta: "Generate",
+  },
+  {
+    label: "Tailor Resume",
+    desc: "Optimize your resume for a specific job",
+    href: "/tailor",
+    cta: "Tailor",
+  },
+];
+
+function GettingStarted({ stats, loading }: { stats: Stats; loading: boolean }) {
+  const completedSteps = [
+    stats.resumes > 0,
+    stats.applications > 0,
+    false, // tailor is always "available", never marked done
+  ];
+
+  // Find first incomplete step
+  const currentStep = completedSteps[0] ? (completedSteps[1] ? 2 : 1) : 0;
+
+  if (loading) {
+    return (
+      <div className="border border-border rounded-lg p-6 animate-pulse">
+        <div className="h-5 bg-muted rounded w-40 mb-4" />
+        <div className="flex gap-4">
+          {[1, 2, 3].map((i) => (
+            <div key={i} className="flex-1 h-20 bg-muted/30 rounded-lg" />
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // All steps done (both resumes and applications exist) — don't show stepper
+  if (completedSteps[0] && completedSteps[1]) return null;
+
+  return (
+    <div className="border border-border rounded-lg p-6">
+      <h2 className="text-sm font-medium mb-4">Getting Started</h2>
+      <div className="flex items-start gap-3">
+        {STEPS.map((step, i) => {
+          const isDone = completedSteps[i];
+          const isCurrent = i === currentStep;
+          const isLocked = i > 0 && !completedSteps[i - 1];
+
+          return (
+            <div key={i} className="flex-1 flex items-start gap-3">
+              {/* Connector line */}
+              {i > 0 && (
+                <div className={`w-8 h-px mt-4 shrink-0 -ml-3 -mr-1 ${
+                  completedSteps[i - 1] ? "bg-accent" : "bg-border"
+                }`} />
+              )}
+              <div className={`flex-1 rounded-lg border p-4 transition-colors ${
+                isDone
+                  ? "border-accent/30 bg-accent/5"
+                  : isCurrent
+                  ? "border-accent/50 bg-accent/5"
+                  : "border-border"
+              }`}>
+                <div className="flex items-center gap-2 mb-1.5">
+                  <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0 ${
+                    isDone
+                      ? "bg-accent text-accent-foreground"
+                      : isCurrent
+                      ? "border-2 border-accent text-accent"
+                      : "border border-border text-muted-foreground"
+                  }`}>
+                    {isDone ? (
+                      <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                      </svg>
+                    ) : (
+                      i + 1
+                    )}
+                  </div>
+                  <span className={`text-sm font-medium ${
+                    isDone ? "text-accent" : isCurrent ? "text-foreground" : "text-muted-foreground"
+                  }`}>
+                    {step.label}
+                  </span>
+                </div>
+                <p className="text-xs text-muted-foreground mb-3">{step.desc}</p>
+                {isDone ? (
+                  <span className="text-[10px] text-accent font-medium">Done</span>
+                ) : isLocked ? (
+                  <span className="text-[10px] text-muted-foreground">Complete previous step</span>
+                ) : (
+                  <Link
+                    href={step.href}
+                    className="inline-block text-xs font-medium text-accent hover:text-accent/80 transition-colors"
+                  >
+                    {step.cta} &rarr;
+                  </Link>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function StatCard({
   label,
   value,
@@ -112,8 +227,11 @@ export default function DashboardPage() {
         </p>
       </div>
 
+      {/* Getting Started Stepper */}
+      <GettingStarted stats={stats} loading={loading} />
+
       {/* Stats */}
-      <div className="grid grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
         <StatCard label="Resumes" value={stats.resumes} loading={loading} />
         <StatCard label="Applications" value={stats.applications} loading={loading} />
         <StatCard label="Sent" value={stats.sent} loading={loading} />
@@ -125,7 +243,7 @@ export default function DashboardPage() {
         {[
           { label: "Generate Message", href: "/generate", desc: "Create a tailored application" },
           { label: "Tailor Resume", href: "/tailor", desc: "Optimize for a job description" },
-          { label: "Upload Resume", href: "/resumes", desc: "Manage your resumes" },
+          { label: "Upload Resume", href: "/resumes/upload", desc: "Add a new resume" },
         ].map((action) => (
           <Link
             key={action.href}
