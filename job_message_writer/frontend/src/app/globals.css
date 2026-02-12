@@ -6,9 +6,9 @@
   --muted: #111111;
   --muted-foreground: #888888;
   --border: #222222;
-  --accent: #0070f3;
-  --accent-secondary: #0070f3;
-  --accent-foreground: #ffffff;
+  --accent: #ededed;
+  --accent-secondary: #ededed;
+  --accent-foreground: #000000;
   --destructive: #ee0000;
   --success: #50e3c2;
   --card: #0a0a0a;
@@ -22,11 +22,11 @@
   --muted: #fafafa;
   --muted-foreground: #666666;
   --border: #eaeaea;
-  --accent: #0070f3;
-  --accent-secondary: #0070f3;
+  --accent: #171717;
+  --accent-secondary: #171717;
   --accent-foreground: #ffffff;
   --destructive: #ee0000;
-  --success: #0070f3;
+  --success: #171717;
   --card: #ffffff;
   --card-hover: #fafafa;
   --sidebar: #fafafa;
@@ -167,5 +167,5 @@ body {
 /* ── Glow ── */
 
 .glow-accent {
-  box-shadow: 0 0 20px -6px rgba(0, 112, 243, 0.2);
+  box-shadow: 0 0 20px -6px rgba(255, 255, 255, 0.08);
 }

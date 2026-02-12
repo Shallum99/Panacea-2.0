@@ -1,8 +1,7 @@
 "use client";
 
 import { useRef, useEffect } from "react";
-import { Sparkles, ArrowUp, Loader2 } from "lucide-react";
-import { motion, AnimatePresence } from "framer-motion";
+import { ArrowUp, Loader2 } from "lucide-react";
 import type { DisplayMessage } from "@/hooks/useAgenticChat";
 import type { ChatContext } from "@/lib/api/chat";
 import InlineRichResult from "./inline-results";
@@ -34,10 +33,10 @@ const TOOL_LABELS: Record<string, string> = {
 };
 
 const SUGGESTIONS = [
-  "Generate a cover letter",
-  "Tailor my resume for this role",
+  "Generate a cover letter for this role",
+  "Tailor my resume to match this JD",
   "Check my ATS compatibility score",
-  "Help me prepare for the interview",
+  "Search for similar open positions",
 ];
 
 function hasContext(ctx: ChatContext): boolean {
@@ -57,7 +56,6 @@ export default function ChatArea({
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Auto-resize textarea
   useEffect(() => {
     const el = textareaRef.current;
     if (el) {
@@ -77,125 +75,104 @@ export default function ChatArea({
   const contextReady = hasContext(context);
 
   return (
-    <div className="flex flex-col h-full">
-      {/* Messages area */}
-      <div
-        className="flex-1 overflow-y-auto px-4 py-6"
-        onScroll={onScroll}
-      >
+    <div className="flex flex-col flex-1 min-h-0">
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto" onScroll={onScroll}>
         {showWelcome ? (
-          <div className="flex flex-col items-center justify-center h-full max-w-md mx-auto text-center">
-            <div className="w-12 h-12 rounded-2xl bg-accent/10 flex items-center justify-center mb-4">
-              <Sparkles size={22} className="text-accent" />
-            </div>
-            <h2 className="text-lg font-semibold mb-1">Panacea</h2>
-            {contextReady ? (
-              <>
-                <p className="text-[13px] text-muted-foreground mb-6">
-                  Your context is set. What would you like to do?
-                </p>
-                <div className="grid grid-cols-2 gap-2 w-full">
+          <div className="flex flex-col items-center justify-center h-full px-4">
+            <div className="max-w-lg w-full text-center">
+              <h1 className="text-2xl font-semibold text-[#ededed] mb-2">
+                What do you want to apply for?
+              </h1>
+              <p className="text-[13px] text-[#666] mb-8">
+                {contextReady
+                  ? "Your context is set. Choose an action or type a message."
+                  : "Set your application context to get started."}
+              </p>
+              {contextReady ? (
+                <div className="grid grid-cols-2 gap-2 max-w-md mx-auto">
                   {SUGGESTIONS.map((s) => (
                     <button
                       key={s}
                       onClick={() => sendMessage(s)}
-                      className="px-3 py-2.5 rounded-xl text-[12px] text-left text-muted-foreground border border-border hover:border-accent/30 hover:text-foreground hover:bg-foreground/[0.02] transition-all duration-200"
+                      className="px-3 py-2.5 rounded-lg text-[12px] text-left text-[#888] border border-[#222] hover:border-[#444] hover:text-[#ededed] bg-transparent transition-colors"
                     >
                       {s}
                     </button>
                   ))}
                 </div>
-              </>
-            ) : (
-              <>
-                <p className="text-[13px] text-muted-foreground mb-4">
-                  Set your application context to get started
-                </p>
+              ) : (
                 <button
                   onClick={onOpenContext}
-                  className="btn-gradient px-4 py-2 text-[13px]"
+                  className="px-4 py-2 text-[13px] font-medium text-black bg-[#ededed] rounded-lg hover:bg-white transition-colors"
                 >
                   Set Context
                 </button>
-              </>
-            )}
+              )}
+            </div>
           </div>
         ) : (
-          <div className="max-w-2xl mx-auto space-y-4">
-            <AnimatePresence initial={false}>
-              {messages.map((msg) => (
-                <motion.div
-                  key={msg.id}
-                  initial={{ opacity: 0, y: 8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ duration: 0.25 }}
-                >
-                  {msg.role === "user" ? (
-                    <UserBubble content={msg.content} />
-                  ) : msg.role === "tool" ? (
-                    msg.richType === "tool_loading" ? (
-                      <ToolLoadingIndicator toolName={msg.toolName || ""} />
-                    ) : (
-                      <InlineRichResult
-                        richType={msg.richType || "generic"}
-                        data={msg.richData}
-                        onSendMessage={sendMessage}
-                      />
-                    )
+          <div className="max-w-2xl mx-auto px-4 py-6 space-y-5">
+            {messages.map((msg) => (
+              <div key={msg.id}>
+                {msg.role === "user" ? (
+                  <UserBubble content={msg.content} />
+                ) : msg.role === "tool" ? (
+                  msg.richType === "tool_loading" ? (
+                    <ToolLoadingIndicator toolName={msg.toolName || ""} />
                   ) : (
-                    <AssistantBubble content={msg.content} />
-                  )}
-                </motion.div>
-              ))}
-            </AnimatePresence>
+                    <InlineRichResult
+                      richType={msg.richType || "generic"}
+                      data={msg.richData}
+                      onSendMessage={sendMessage}
+                    />
+                  )
+                ) : (
+                  <AssistantBubble content={msg.content} />
+                )}
+              </div>
+            ))}
             {sending && messages[messages.length - 1]?.role !== "tool" && (
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                className="flex items-start gap-3"
-              >
-                <div className="w-7 h-7 rounded-lg bg-accent/10 flex items-center justify-center shrink-0 mt-0.5">
-                  <Sparkles size={13} className="text-accent" />
-                </div>
+              <div className="flex items-center gap-2 py-1">
                 <TypingDots />
-              </motion.div>
+              </div>
             )}
             <div ref={messagesEndRef} />
           </div>
         )}
       </div>
 
-      {/* Input bar */}
+      {/* Input */}
       <div className="shrink-0 px-4 pb-4 pt-2">
         <div className="max-w-2xl mx-auto">
-          <div className="relative flex items-end gap-2 border border-border rounded-2xl bg-card/50 px-4 py-3 focus-within:border-accent/30 transition-colors">
+          <div className="relative flex items-end gap-2 border border-[#333] rounded-xl bg-[#0a0a0a] px-4 py-3 focus-within:border-[#555] transition-colors">
             <textarea
               ref={textareaRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="Ask anything..."
+              placeholder="Send a message..."
               rows={1}
               disabled={sending}
-              className="flex-1 bg-transparent text-[13px] placeholder:text-muted-foreground/40 outline-none resize-none min-h-[20px] max-h-[160px] leading-relaxed"
+              className="flex-1 bg-transparent text-[13px] text-[#ededed] placeholder:text-[#555] outline-none resize-none min-h-[20px] max-h-[160px] leading-relaxed"
             />
             <button
               onClick={() => sendMessage()}
               disabled={!input.trim() || sending}
-              className={`shrink-0 w-8 h-8 rounded-xl flex items-center justify-center transition-all duration-150 ${
+              className={`shrink-0 w-7 h-7 rounded-lg flex items-center justify-center transition-all ${
                 input.trim() && !sending
-                  ? "bg-accent text-accent-foreground hover:opacity-90"
-                  : "bg-foreground/[0.05] text-muted-foreground/30"
+                  ? "bg-[#ededed] text-black hover:bg-white"
+                  : "bg-[#222] text-[#555]"
               }`}
             >
               {sending ? (
-                <Loader2 size={14} className="animate-spin" />
+                <Loader2 size={13} className="animate-spin" />
               ) : (
-                <ArrowUp size={14} />
+                <ArrowUp size={13} />
               )}
             </button>
           </div>
-          <p className="text-[10px] text-muted-foreground/40 text-center mt-2">
+          <p className="text-[10px] text-[#444] text-center mt-2">
             Panacea can make mistakes. Verify important information.
           </p>
         </div>
@@ -207,7 +184,7 @@ export default function ChatArea({
 function UserBubble({ content }: { content: string }) {
   return (
     <div className="flex justify-end">
-      <div className="max-w-[70%] px-4 py-2.5 rounded-2xl rounded-br-md bg-accent/[0.12] text-[13px] leading-relaxed">
+      <div className="max-w-[75%] px-4 py-2.5 rounded-2xl rounded-br-sm bg-[#1a1a1a] text-[13px] text-[#ededed] leading-relaxed">
         {content}
       </div>
     </div>
@@ -216,13 +193,8 @@ function UserBubble({ content }: { content: string }) {
 
 function AssistantBubble({ content }: { content: string }) {
   return (
-    <div className="flex items-start gap-3">
-      <div className="w-7 h-7 rounded-lg bg-accent/10 flex items-center justify-center shrink-0 mt-0.5">
-        <Sparkles size={13} className="text-accent" />
-      </div>
-      <div className="flex-1 text-[13px] leading-relaxed whitespace-pre-wrap min-w-0">
-        {content}
-      </div>
+    <div className="text-[13px] text-[#ededed] leading-relaxed whitespace-pre-wrap">
+      {content}
     </div>
   );
 }
@@ -230,8 +202,8 @@ function AssistantBubble({ content }: { content: string }) {
 function ToolLoadingIndicator({ toolName }: { toolName: string }) {
   const label = TOOL_LABELS[toolName] || "Working";
   return (
-    <div className="flex items-center gap-2.5 text-[12px] text-muted-foreground py-1 pl-10">
-      <Loader2 size={12} className="animate-spin text-accent/60" />
+    <div className="flex items-center gap-2 text-[12px] text-[#666] py-1">
+      <Loader2 size={12} className="animate-spin" />
       <span>{label}...</span>
     </div>
   );
@@ -239,11 +211,11 @@ function ToolLoadingIndicator({ toolName }: { toolName: string }) {
 
 function TypingDots() {
   return (
-    <div className="flex items-center gap-1 py-2">
+    <div className="flex items-center gap-1 py-1">
       {[0, 1, 2].map((i) => (
         <span
           key={i}
-          className="w-1.5 h-1.5 rounded-full bg-muted-foreground/40 animate-pulse"
+          className="w-1.5 h-1.5 rounded-full bg-[#444] animate-pulse"
           style={{ animationDelay: `${i * 200}ms` }}
         />
       ))}

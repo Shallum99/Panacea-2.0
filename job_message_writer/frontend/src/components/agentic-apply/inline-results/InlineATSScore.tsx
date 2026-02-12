@@ -1,7 +1,5 @@
 "use client";
 
-import { Star } from "lucide-react";
-
 interface ScoreData {
   score?: number;
   strengths?: string[];
@@ -16,47 +14,24 @@ interface Props {
 
 export default function InlineATSScore({ data }: Props) {
   const score = data.score || 0;
-  const color =
-    score >= 75
-      ? "text-success"
-      : score >= 50
-        ? "text-accent"
-        : "text-destructive";
-  const bgColor =
-    score >= 75
-      ? "bg-success/10"
-      : score >= 50
-        ? "bg-accent/10"
-        : "bg-destructive/10";
 
   return (
-    <div className="border-l-2 border-accent/40 rounded-xl bg-card/60 overflow-hidden ml-10">
-      {/* Header with score */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-border/50">
-        <div className="flex items-center gap-2">
-          <Star size={13} className="text-accent" />
-          <span className="text-[12px] font-medium">
-            ATS Score {data.resume_title && `\u2014 ${data.resume_title}`}
-          </span>
-        </div>
-        <div
-          className={`px-3 py-1 rounded-full ${bgColor} ${color} text-sm font-bold`}
-        >
+    <div className="rounded-lg border border-[#222] bg-[#0a0a0a] overflow-hidden">
+      {/* Header */}
+      <div className="flex items-center justify-between px-4 py-3 border-b border-[#1a1a1a]">
+        <span className="text-[12px] font-medium text-[#ededed]">
+          ATS Score{data.resume_title ? ` \u2014 ${data.resume_title}` : ""}
+        </span>
+        <span className="text-sm font-bold text-[#ededed] tabular-nums">
           {score}
-        </div>
+        </span>
       </div>
 
-      {/* Score bar */}
-      <div className="px-4 py-3 border-b border-border/50">
-        <div className="h-2 rounded-full bg-foreground/[0.05] overflow-hidden">
+      {/* Bar */}
+      <div className="px-4 py-3 border-b border-[#1a1a1a]">
+        <div className="h-1.5 rounded-full bg-[#1a1a1a] overflow-hidden">
           <div
-            className={`h-full rounded-full transition-all duration-700 ${
-              score >= 75
-                ? "bg-success"
-                : score >= 50
-                  ? "bg-accent"
-                  : "bg-destructive"
-            }`}
+            className="h-full rounded-full bg-[#ededed] transition-all duration-700"
             style={{ width: `${Math.min(score, 100)}%` }}
           />
         </div>
@@ -66,13 +41,13 @@ export default function InlineATSScore({ data }: Props) {
         {/* Strengths */}
         {data.strengths && data.strengths.length > 0 && (
           <div>
-            <p className="text-[11px] font-medium text-success mb-1">
+            <p className="text-[11px] font-medium text-[#ededed] mb-1">
               Strengths
             </p>
             {data.strengths.map((s, i) => (
               <p
                 key={i}
-                className="text-[12px] text-muted-foreground leading-relaxed"
+                className="text-[12px] text-[#888] leading-relaxed"
               >
                 + {s}
               </p>
@@ -83,13 +58,13 @@ export default function InlineATSScore({ data }: Props) {
         {/* Improvements */}
         {data.improvements && data.improvements.length > 0 && (
           <div>
-            <p className="text-[11px] font-medium text-destructive mb-1">
+            <p className="text-[11px] font-medium text-[#ededed] mb-1">
               Areas to Improve
             </p>
             {data.improvements.map((s, i) => (
               <p
                 key={i}
-                className="text-[12px] text-muted-foreground leading-relaxed"
+                className="text-[12px] text-[#888] leading-relaxed"
               >
                 - {s}
               </p>
@@ -100,14 +75,14 @@ export default function InlineATSScore({ data }: Props) {
         {/* Missing keywords */}
         {data.missing_keywords && data.missing_keywords.length > 0 && (
           <div>
-            <p className="text-[11px] font-medium text-muted-foreground mb-1.5">
+            <p className="text-[11px] font-medium text-[#ededed] mb-1.5">
               Missing Keywords
             </p>
             <div className="flex flex-wrap gap-1">
               {data.missing_keywords.map((kw, i) => (
                 <span
                   key={i}
-                  className="px-2 py-0.5 rounded-full bg-destructive/10 text-destructive text-[10px]"
+                  className="px-2 py-0.5 rounded bg-[#1a1a1a] text-[#888] text-[10px]"
                 >
                   {kw}
                 </span>

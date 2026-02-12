@@ -16,36 +16,32 @@ interface Props {
 export default function InlineEmailForm({ data }: Props) {
   if (data.error) {
     return (
-      <div className="border-l-2 border-destructive/40 rounded-xl bg-destructive/[0.03] px-4 py-3 ml-10">
-        <p className="text-[12px] text-destructive">{data.error}</p>
+      <div className="rounded-lg border border-[#222] bg-[#0a0a0a] px-4 py-3">
+        <p className="text-[12px] text-[#ee0000]">{data.error}</p>
       </div>
     );
   }
 
   return (
-    <div className="border-l-2 border-success/40 rounded-xl bg-success/[0.03] overflow-hidden ml-10">
+    <div className="rounded-lg border border-[#222] bg-[#0a0a0a] overflow-hidden">
       <div className="px-4 py-3">
         <div className="flex items-center gap-2 mb-2">
-          <div className="w-6 h-6 rounded-full bg-success/10 flex items-center justify-center">
-            <Check size={12} className="text-success" />
+          <div className="w-5 h-5 rounded-full bg-[#1a1a1a] flex items-center justify-center">
+            <Check size={11} className="text-[#50e3c2]" />
           </div>
-          <span className="text-[13px] font-medium text-success">
+          <span className="text-[13px] font-medium text-[#ededed]">
             Email Sent
           </span>
         </div>
-        <div className="space-y-1 pl-8">
+        <div className="space-y-1 pl-7">
           <div className="flex items-center gap-2 text-[12px]">
-            <Mail size={11} className="text-muted-foreground/50" />
-            <span className="text-muted-foreground">
-              To: {data.recipient}
-            </span>
+            <Mail size={11} className="text-[#555]" />
+            <span className="text-[#888]">To: {data.recipient}</span>
           </div>
           {data.subject && (
             <div className="flex items-center gap-2 text-[12px]">
-              <Send size={11} className="text-muted-foreground/50" />
-              <span className="text-muted-foreground">
-                Subject: {data.subject}
-              </span>
+              <Send size={11} className="text-[#555]" />
+              <span className="text-[#888]">Subject: {data.subject}</span>
             </div>
           )}
         </div>

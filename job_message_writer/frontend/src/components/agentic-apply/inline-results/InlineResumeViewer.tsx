@@ -61,23 +61,23 @@ export default function InlineResumeViewer({ data }: Props) {
       : null;
 
   return (
-    <div className="border-l-2 border-success/40 rounded-xl bg-card/60 overflow-hidden ml-10">
+    <div className="rounded-lg border border-[#222] bg-[#0a0a0a] overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-2.5 border-b border-border/50">
+      <div className="flex items-center justify-between px-4 py-2.5 border-b border-[#1a1a1a]">
         <div className="flex items-center gap-2">
-          <FileText size={13} className="text-success" />
-          <span className="text-[12px] font-medium">
+          <FileText size={13} className="text-[#888]" />
+          <span className="text-[12px] font-medium text-[#ededed]">
             Tailored: {data.resume_title}
           </span>
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-0.5">
           {pdfUrl && (
             <>
               <a
                 href={pdfUrl}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-foreground/[0.05] transition-colors"
+                className="p-1.5 rounded text-[#555] hover:text-[#ededed] transition-colors"
                 title="View Full Screen"
               >
                 <Maximize2 size={12} />
@@ -85,7 +85,7 @@ export default function InlineResumeViewer({ data }: Props) {
               <a
                 href={pdfUrl}
                 download={`tailored-${data.resume_title}.pdf`}
-                className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-foreground/[0.05] transition-colors"
+                className="p-1.5 rounded text-[#555] hover:text-[#ededed] transition-colors"
                 title="Download"
               >
                 <Download size={12} />
@@ -97,48 +97,46 @@ export default function InlineResumeViewer({ data }: Props) {
 
       {/* Score */}
       {data.ats_score_before != null && data.ats_score_after != null && (
-        <div className="flex items-center gap-3 px-4 py-2.5 border-b border-border/50">
-          <span className="text-[12px] text-muted-foreground">
+        <div className="flex items-center gap-3 px-4 py-2.5 border-b border-[#1a1a1a]">
+          <span className="text-[12px] text-[#666]">
             ATS: {data.ats_score_before}%
           </span>
-          <span className="text-accent text-[12px]">&rarr;</span>
-          <span className="text-[12px] font-medium text-success">
+          <span className="text-[#555] text-[12px]">&rarr;</span>
+          <span className="text-[12px] font-medium text-[#ededed]">
             {data.ats_score_after}%
           </span>
           {scoreDelta != null && scoreDelta > 0 && (
-            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-success/10 text-success">
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-[#1a1a1a] text-[#50e3c2]">
               +{scoreDelta}%
             </span>
           )}
         </div>
       )}
 
-      {/* PDF Preview */}
+      {/* PDF */}
       {pdfUrl ? (
         <div className="p-3">
           <iframe
             src={pdfUrl}
-            className="w-full rounded-lg border border-border"
+            className="w-full rounded-lg border border-[#1a1a1a]"
             style={{ height: 480 }}
             title="Tailored Resume PDF"
           />
         </div>
       ) : (
-        <div className="flex items-center justify-center py-16 text-[12px] text-muted-foreground/50">
+        <div className="flex items-center justify-center py-16 text-[12px] text-[#555]">
           Loading PDF...
         </div>
       )}
 
-      {/* Sections optimized */}
+      {/* Sections */}
       {data.sections_optimized && data.sections_optimized.length > 0 && (
-        <div className="px-4 py-2.5 border-t border-border/50 flex flex-wrap gap-1.5">
-          <span className="text-[10px] text-muted-foreground/50 mr-1">
-            Optimized:
-          </span>
+        <div className="px-4 py-2.5 border-t border-[#1a1a1a] flex flex-wrap gap-1.5">
+          <span className="text-[10px] text-[#555] mr-1">Optimized:</span>
           {data.sections_optimized.map((s) => (
             <span
               key={s}
-              className="px-2 py-0.5 rounded-full bg-success/10 text-success text-[10px]"
+              className="px-2 py-0.5 rounded bg-[#1a1a1a] text-[#888] text-[10px]"
             >
               {s}
             </span>

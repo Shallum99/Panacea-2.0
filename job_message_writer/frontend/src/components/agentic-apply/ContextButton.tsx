@@ -19,15 +19,15 @@ export default function ContextButton({ context, onClick }: Props) {
     <button
       onClick={onClick}
       title="Application Context"
-      className={`relative w-9 h-9 flex items-center justify-center rounded-full border transition-all duration-200 ${
+      className={`relative w-8 h-8 flex items-center justify-center rounded-lg border transition-colors ${
         active
-          ? "border-accent/30 text-accent hover:bg-accent/10"
-          : "border-border text-muted-foreground hover:text-foreground hover:border-foreground/20"
+          ? "border-[#333] text-[#ededed] hover:bg-[#111]"
+          : "border-[#222] text-[#666] hover:text-[#ededed] hover:border-[#444]"
       }`}
     >
-      <SlidersHorizontal size={15} />
+      <SlidersHorizontal size={14} />
       {active && (
-        <span className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-success border-2 border-card" />
+        <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-[#50e3c2] border-2 border-black" />
       )}
     </button>
   );

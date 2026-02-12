@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { ExternalLink, ChevronDown, ChevronUp, Briefcase } from "lucide-react";
+import { ExternalLink, ChevronDown, ChevronUp } from "lucide-react";
 
 interface JobDetailData {
   title?: string;
@@ -20,14 +20,13 @@ export default function InlineJobDetail({ data }: Props) {
   const [expanded, setExpanded] = useState(false);
 
   return (
-    <div className="border-l-2 border-accent/40 rounded-xl bg-card/60 overflow-hidden ml-10">
+    <div className="rounded-lg border border-[#222] bg-[#0a0a0a] overflow-hidden">
       {/* Header */}
-      <div className="px-4 py-3 border-b border-border/50">
-        <div className="flex items-center gap-2">
-          <Briefcase size={13} className="text-accent" />
-          <span className="text-[13px] font-medium">{data.title}</span>
-        </div>
-        <p className="text-[11px] text-muted-foreground mt-0.5 pl-5">
+      <div className="px-4 py-3 border-b border-[#1a1a1a]">
+        <span className="text-[13px] font-medium text-[#ededed]">
+          {data.title}
+        </span>
+        <p className="text-[11px] text-[#666] mt-0.5">
           {data.company}
           {data.location ? ` \u2014 ${data.location}` : ""}
         </p>
@@ -37,7 +36,7 @@ export default function InlineJobDetail({ data }: Props) {
       {data.content && (
         <div className="px-4 py-3">
           <div
-            className={`text-[12px] text-muted-foreground leading-relaxed whitespace-pre-wrap ${
+            className={`text-[12px] text-[#888] leading-relaxed whitespace-pre-wrap ${
               !expanded ? "max-h-[120px] overflow-hidden" : ""
             }`}
           >
@@ -47,7 +46,7 @@ export default function InlineJobDetail({ data }: Props) {
             (data.full_content_length && data.full_content_length > 400)) && (
             <button
               onClick={() => setExpanded(!expanded)}
-              className="flex items-center gap-1 text-[11px] text-accent mt-2 hover:underline"
+              className="flex items-center gap-1 text-[11px] text-[#888] mt-2 hover:text-[#ededed] transition-colors"
             >
               {expanded ? (
                 <>
@@ -65,12 +64,12 @@ export default function InlineJobDetail({ data }: Props) {
 
       {/* Footer */}
       {data.url && (
-        <div className="px-4 py-2.5 border-t border-border/50">
+        <div className="px-4 py-2.5 border-t border-[#1a1a1a]">
           <a
             href={data.url}
             target="_blank"
             rel="noopener noreferrer"
-            className="flex items-center gap-1 text-[11px] text-accent hover:underline"
+            className="flex items-center gap-1 text-[11px] text-[#888] hover:text-[#ededed] transition-colors"
           >
             <ExternalLink size={10} /> View original listing
           </a>
