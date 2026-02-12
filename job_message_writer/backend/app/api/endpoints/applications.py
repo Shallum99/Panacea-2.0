@@ -35,6 +35,8 @@ def build_message_prompts(
     job_description: str,
     message_type: str,
     recruiter_name: Optional[str],
+    user: Optional[models.User] = None,
+    writing_samples: Optional[list] = None,
 ) -> tuple:
     """Return (system_prompt, user_prompt, max_tokens) for message generation."""
 
@@ -114,6 +116,64 @@ WHAT MAKES IT SOUND LIKE AI (avoid all of these):
     else:
         greeting = "\n- No greeting — start directly with the body"
 
+    # Build profile context block
+    profile_context = ""
+    if user:
+        parts = []
+        if user.full_name:
+            parts.append(f"Name: {user.full_name}")
+        if user.phone:
+            parts.append(f"Phone: {user.phone}")
+        if user.linkedin_url:
+            parts.append(f"LinkedIn: {user.linkedin_url}")
+        if user.portfolio_url:
+            parts.append(f"Portfolio: {user.portfolio_url}")
+        if user.professional_summary:
+            parts.append(f"Professional Summary: {user.professional_summary}")
+        if user.master_skills:
+            parts.append(f"Key Skills: {user.master_skills}")
+        if parts:
+            profile_context = "\n\nAPPLICANT PROFILE:\n" + "\n".join(parts)
+
+    # Build tone directive
+    tone_directive = ""
+    if user:
+        tone_parts = []
+        formality = getattr(user, "tone_formality", None) or "balanced"
+        confidence = getattr(user, "tone_confidence", None) or "confident"
+        verbosity = getattr(user, "tone_verbosity", None) or "concise"
+
+        if formality == "formal":
+            tone_parts.append("Use a professional, formal tone. Avoid contractions and slang.")
+        elif formality == "casual":
+            tone_parts.append("Keep it casual and conversational. Contractions and informal language are fine.")
+
+        if confidence == "humble":
+            tone_parts.append("Be understated and humble — let achievements speak without bragging.")
+        elif confidence == "confident":
+            tone_parts.append("Be direct and confident — own the accomplishments without hedging.")
+
+        if verbosity == "detailed":
+            tone_parts.append("Include more context and detail than you normally would.")
+        elif verbosity == "concise":
+            tone_parts.append("Be concise — every sentence must earn its place. Shorter is better.")
+
+        if tone_parts:
+            tone_directive = "\n\nTONE PREFERENCES:\n" + "\n".join(f"- {t}" for t in tone_parts)
+
+    # Build writing samples context
+    writing_context = ""
+    if writing_samples:
+        samples_text = []
+        for ws in writing_samples[:3]:
+            label = ws.title or ws.sample_type or "Sample"
+            samples_text.append(f"--- {label} ---\n{ws.content[:500]}")
+        if samples_text:
+            writing_context = (
+                "\n\nWRITING SAMPLES (match this voice and style):\n"
+                + "\n\n".join(samples_text)
+            )
+
     user_prompt = f"""Write a {config['format']} for this job application.
 
 Output format — return EXACTLY this structure:
@@ -127,6 +187,7 @@ CONSTRAINTS:
 
 RESUME:
 {resume_content}
+{profile_context}{tone_directive}{writing_context}
 
 JOB DESCRIPTION:
 {job_description}
@@ -207,12 +268,21 @@ async def create_application(
             resume_info = {}
 
         msg_type = request.message_type or "email_detailed"
+        writing_samples = (
+            db.query(models.WritingSample)
+            .filter(models.WritingSample.user_id == current_user.id)
+            .order_by(models.WritingSample.created_at.desc())
+            .limit(3)
+            .all()
+        )
         system_prompt, user_prompt, msg_max_tokens = build_message_prompts(
             resume_content=resume_content,
             resume=resume,
             job_description=request.job_description,
             message_type=msg_type,
             recruiter_name=request.recruiter_name,
+            user=current_user,
+            writing_samples=writing_samples,
         )
 
         # Run company info extraction and message generation in parallel
@@ -330,12 +400,21 @@ async def stream_application(
     resume_content = resume.content or ""
 
     msg_type = request.message_type or "email_detailed"
+    writing_samples = (
+        db.query(models.WritingSample)
+        .filter(models.WritingSample.user_id == current_user.id)
+        .order_by(models.WritingSample.created_at.desc())
+        .limit(3)
+        .all()
+    )
     system_prompt, user_prompt, msg_max_tokens = build_message_prompts(
         resume_content=resume_content,
         resume=resume,
         job_description=request.job_description,
         message_type=msg_type,
         recruiter_name=request.recruiter_name,
+        user=current_user,
+        writing_samples=writing_samples,
     )
 
     # Capture variables needed inside the generator
