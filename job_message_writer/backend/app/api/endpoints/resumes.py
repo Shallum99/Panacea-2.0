@@ -82,6 +82,8 @@ async def extract_resume_data(content: str) -> Dict[str, Any]:
         - name: The full name of the person
         - email: Email address
         - phone: Phone number
+        - linkedin_url: LinkedIn profile URL (null if not found)
+        - portfolio_url: Portfolio, GitHub, or personal website URL (null if not found)
         - skills: All technical and soft skills (as an array)
         - years_experience: Total years of experience
         - education: Highest education qualification
@@ -281,7 +283,31 @@ async def create_resume(
         db.add(db_resume)
         db.commit()
         db.refresh(db_resume)
-        
+
+        # Auto-fill user profile from resume extraction (only fill empty fields)
+        try:
+            changed = False
+            if not user.full_name and extracted_data.get("name") not in (None, "Unknown", ""):
+                user.full_name = extracted_data["name"]
+                changed = True
+            if not user.phone and extracted_data.get("phone") not in (None, "Unknown", ""):
+                user.phone = extracted_data["phone"]
+                changed = True
+            if not user.linkedin_url and extracted_data.get("linkedin_url"):
+                user.linkedin_url = extracted_data["linkedin_url"]
+                changed = True
+            if not user.portfolio_url and extracted_data.get("portfolio_url"):
+                user.portfolio_url = extracted_data["portfolio_url"]
+                changed = True
+            if not user.master_skills and extracted_data.get("skills"):
+                user.master_skills = ",".join(extracted_data["skills"])
+                changed = True
+            if changed:
+                db.commit()
+                logger.info(f"Auto-filled profile fields for user {user.id}")
+        except Exception as e:
+            logger.warning(f"Profile auto-fill failed (non-critical): {e}")
+
         # Return response
         return {
             "id": db_resume.id,
