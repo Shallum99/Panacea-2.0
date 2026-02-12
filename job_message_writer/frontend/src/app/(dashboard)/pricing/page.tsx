@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, Suspense } from "react";
 import { useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import api from "@/lib/api";
@@ -30,6 +30,14 @@ const PLAN_FEATURES: Record<string, string[]> = {
 };
 
 export default function PricingPage() {
+  return (
+    <Suspense>
+      <PricingContent />
+    </Suspense>
+  );
+}
+
+function PricingContent() {
   const searchParams = useSearchParams();
   const [plans, setPlans] = useState<Plan[]>([]);
   const [stripeConfigured, setStripeConfigured] = useState(false);
