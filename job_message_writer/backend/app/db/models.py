@@ -33,8 +33,11 @@ class User(Base):
     hashed_password = Column(String, nullable=True)  # No longer needed with Supabase auth
     is_active = Column(Boolean, default=True)
     gmail_refresh_token = Column(String, nullable=True)
+    tier = Column(String, default="free", server_default="free", nullable=False)
+    custom_message_limit = Column(Integer, nullable=True)
+    custom_tailor_limit = Column(Integer, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    
+
     resumes = relationship("Resume", back_populates="owner")
     job_descriptions = relationship("JobDescription", back_populates="owner")
     messages = relationship("Message", back_populates="owner")
@@ -154,3 +157,14 @@ class Application(Base):
     owner = relationship("User", back_populates="applications")
     resume = relationship("Resume", back_populates="applications")
     job_description = relationship("JobDescription")
+
+
+class UsageLog(Base):
+    __tablename__ = "usage_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    action_type = Column(String, nullable=False)  # "message_generation" or "resume_tailor"
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User")

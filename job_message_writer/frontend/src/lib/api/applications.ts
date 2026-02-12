@@ -146,6 +146,12 @@ export async function streamApplication(
   });
 
   if (!response.ok) {
+    if (response.status === 429) {
+      const body = await response.json().catch(() => null);
+      const detail = body?.detail;
+      const message = typeof detail === "object" ? detail.message : detail || "Rate limit exceeded";
+      throw new Error(message);
+    }
     const err = await response.text();
     throw new Error(err || `HTTP ${response.status}`);
   }

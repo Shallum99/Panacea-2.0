@@ -28,6 +28,7 @@ from app.services.pdf_format_preserver import (
     optimize_pdf, build_section_map
 )
 from app.core.supabase_auth import get_current_user
+from app.core.rate_limit import require_quota, log_usage
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -241,7 +242,7 @@ async def get_section_map(
 @router.post("/optimize-pdf", response_model=PDFOptimizeResponse)
 async def optimize_resume_pdf(
     request: PDFOptimizeRequest,
-    current_user: models.User = Depends(get_current_user),
+    current_user: models.User = Depends(require_quota("resume_tailor")),
     db: Session = Depends(get_db),
 ) -> Any:
     """
@@ -386,6 +387,8 @@ async def optimize_resume_pdf(
         optimized_score = await calculate_match_score(
             optimized_text, request.job_description
         )
+
+        log_usage(db, current_user.id, "resume_tailor")
 
         return PDFOptimizeResponse(
             download_id=download_id,

@@ -207,6 +207,26 @@ async def save_gmail_token(
     return {"status": "ok"}
 
 
+@router.get("/usage")
+async def get_my_usage(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Get the current user's tier, limits, and usage counts."""
+    from app.core.rate_limit import _get_usage_count, _get_limit
+
+    msg_used = _get_usage_count(db, current_user.id, "message_generation")
+    tailor_used = _get_usage_count(db, current_user.id, "resume_tailor")
+    msg_limit = _get_limit(current_user, "message_generation")
+    tailor_limit = _get_limit(current_user, "resume_tailor")
+
+    return {
+        "tier": current_user.tier,
+        "message_generation": {"used": msg_used, "limit": msg_limit},
+        "resume_tailor": {"used": tailor_used, "limit": tailor_limit},
+    }
+
+
 @router.get("/gmail-status")
 async def gmail_status(
     current_user: models.User = Depends(get_current_user),

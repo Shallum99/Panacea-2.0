@@ -181,8 +181,9 @@ export default function GeneratePage() {
       }
       toast.success("Resume optimized");
     } catch (err: unknown) {
-      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      toast.error(detail || "Failed to optimize resume");
+      const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
+      const message = typeof detail === "object" && detail !== null ? (detail as { message?: string }).message : detail || "Failed to optimize resume";
+      toast.error(String(message));
     } finally { setTailoring(false); }
   }
 

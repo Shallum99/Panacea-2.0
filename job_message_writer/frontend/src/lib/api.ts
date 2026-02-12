@@ -26,7 +26,7 @@ api.interceptors.request.use(async (config) => {
   return config;
 });
 
-// Handle 401s
+// Handle 401s and 429s
 api.interceptors.response.use(
   (response) => response,
   async (error) => {

@@ -46,8 +46,30 @@ def migrate_db():
             conn.execute(text(
                 "ALTER TABLE applications ADD COLUMN IF NOT EXISTS subject VARCHAR"
             ))
+            # Rate limiting: tier + custom limits on users
+            conn.execute(text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS tier VARCHAR NOT NULL DEFAULT 'free'"
+            ))
+            conn.execute(text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS custom_message_limit INTEGER"
+            ))
+            conn.execute(text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS custom_tailor_limit INTEGER"
+            ))
+            # Usage log table
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS usage_log (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    action_type VARCHAR NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_usage_log_user_id ON usage_log (user_id)"
+            ))
             conn.commit()
-            logger.info("DB migration: gmail_refresh_token + subject columns ensured")
+            logger.info("DB migration: all columns + usage_log table ensured")
     except Exception as e:
         logger.warning(f"DB migration skipped: {e}")
 

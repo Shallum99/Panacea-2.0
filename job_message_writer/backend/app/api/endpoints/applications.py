@@ -21,6 +21,7 @@ from app.schemas.application import (
     SendRequest,
 )
 from app.core.supabase_auth import get_current_user
+from app.core.rate_limit import require_quota, log_usage
 from app.llm.claude_client import ClaudeClient
 from app.services.email_sender import send_application_email
 
@@ -146,7 +147,7 @@ Output the subject line and message body ONLY. Nothing else."""
 @router.post("/", response_model=ApplicationResponse)
 async def create_application(
     request: ApplicationCreate,
-    current_user: models.User = Depends(get_current_user),
+    current_user: models.User = Depends(require_quota("message_generation")),
     db: Session = Depends(get_db),
 ):
     """
@@ -258,6 +259,7 @@ async def create_application(
         db.commit()
         db.refresh(application)
 
+        log_usage(db, current_user.id, "message_generation")
         return application
 
     except HTTPException:
@@ -271,7 +273,7 @@ async def create_application(
 @router.post("/stream")
 async def stream_application(
     request: ApplicationCreate,
-    current_user: models.User = Depends(get_current_user),
+    current_user: models.User = Depends(require_quota("message_generation")),
     db: Session = Depends(get_db),
 ):
     """
@@ -400,6 +402,7 @@ async def stream_application(
                 final_message=body,
             )
             save_db.add(application)
+            save_db.add(models.UsageLog(user_id=user_id, action_type="message_generation"))
             save_db.commit()
             save_db.refresh(application)
 
