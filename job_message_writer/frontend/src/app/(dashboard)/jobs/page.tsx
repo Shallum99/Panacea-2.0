@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { toast } from "sonner";
+import { Link as LinkIcon, Search, Bookmark, Briefcase } from "lucide-react";
 import api from "@/lib/api";
 import {
   searchJobs,
@@ -116,7 +117,7 @@ export default function JobsPage() {
   }
 
   return (
-    <div className="space-y-8 max-w-4xl">
+    <div className="space-y-8 max-w-4xl animate-fade-in">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Jobs</h1>
@@ -134,27 +135,28 @@ export default function JobsPage() {
 
       {/* 1. Import from URL */}
       <section className="space-y-3">
-        <h2 className="text-sm font-medium text-muted-foreground uppercase tracking-wider">
+        <h2 className="text-sm font-medium text-muted-foreground uppercase tracking-wider flex items-center gap-2">
+          <LinkIcon className="w-3.5 h-3.5" />
           Import from URL
         </h2>
-        <div className="border border-border rounded-lg p-4">
-          <div className="flex gap-2">
+        <div className="card-elevated p-5">
+          <div className="flex gap-3">
             <input
               value={urlInput}
               onChange={(e) => setUrlInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleFetchUrl()}
               placeholder="Paste a job listing URL (Greenhouse, Lever, or any site)"
-              className="flex-1 px-3 py-2 text-sm border border-border rounded-lg bg-background focus:outline-none focus:ring-1 focus:ring-accent"
+              className="flex-1 px-4 py-2.5 text-sm border border-border rounded-lg bg-background focus:outline-none focus:ring-2 focus:ring-accent/50 transition-shadow"
             />
             <button
               onClick={handleFetchUrl}
               disabled={fetchingUrl || !urlInput.trim()}
-              className="px-4 py-2 text-sm font-medium bg-accent text-accent-foreground rounded-lg hover:opacity-90 disabled:opacity-40 whitespace-nowrap"
+              className="btn-gradient px-5 py-2.5 text-sm font-medium rounded-lg whitespace-nowrap"
             >
               {fetchingUrl ? "Fetching..." : "Fetch & Apply"}
             </button>
           </div>
-          <p className="text-[10px] text-muted-foreground mt-2">
+          <p className="text-[10px] text-muted-foreground mt-2.5">
             Works with Greenhouse, Lever, and most job listing pages. Auto-extracts the job description.
           </p>
         </div>
@@ -162,7 +164,8 @@ export default function JobsPage() {
 
       {/* 2. Search Job Boards */}
       <section className="space-y-3">
-        <h2 className="text-sm font-medium text-muted-foreground uppercase tracking-wider">
+        <h2 className="text-sm font-medium text-muted-foreground uppercase tracking-wider flex items-center gap-2">
+          <Search className="w-3.5 h-3.5" />
           Search Job Boards
         </h2>
         <div className="border border-border rounded-lg p-4 space-y-3">
@@ -228,7 +231,7 @@ export default function JobsPage() {
               {searchResults.map((job) => (
                 <div
                   key={`${job.source}-${job.id}`}
-                  className="border border-border rounded-lg p-3 hover:border-muted-foreground/30 transition-colors"
+                  className="card-interactive p-3"
                 >
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0 flex-1">
@@ -273,10 +276,11 @@ export default function JobsPage() {
 
       {/* 3. Saved Jobs */}
       <section className="space-y-3">
-        <h2 className="text-sm font-medium text-muted-foreground uppercase tracking-wider">
+        <h2 className="text-sm font-medium text-muted-foreground uppercase tracking-wider flex items-center gap-2">
+          <Bookmark className="w-3.5 h-3.5" />
           Saved Jobs ({savedJobs.length})
         </h2>
-        <div className="border border-border rounded-lg divide-y divide-border">
+        <div className="card-elevated divide-y divide-border overflow-hidden">
           {loadingSaved ? (
             <div className="space-y-0">
               {[1, 2, 3].map((i) => (
@@ -284,9 +288,15 @@ export default function JobsPage() {
               ))}
             </div>
           ) : savedJobs.length === 0 ? (
-            <div className="px-4 py-8 text-center">
-              <p className="text-sm text-muted-foreground">
-                No saved jobs yet. Import from a URL or search above, or jobs are saved automatically when you generate a message.
+            <div className="px-4 py-12 text-center">
+              <div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-muted/50 mb-4">
+                <Briefcase className="w-6 h-6 text-muted-foreground" />
+              </div>
+              <p className="text-base font-medium text-foreground">
+                No saved jobs yet
+              </p>
+              <p className="text-sm text-muted-foreground mt-1 max-w-xs mx-auto">
+                Import a job from a URL, search job boards above, or jobs are saved automatically when you generate a message.
               </p>
             </div>
           ) : (

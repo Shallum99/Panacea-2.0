@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { toast } from "sonner";
+import { FileText } from "lucide-react";
 import { getResumes, setActiveResume, deleteResume, type Resume } from "@/lib/api/resumes";
 
 export default function ResumesPage() {
@@ -66,7 +67,7 @@ export default function ResumesPage() {
   }, [deleteTarget, handleKeyDown]);
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 animate-fade-in">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Resumes</h1>
@@ -95,26 +96,32 @@ export default function ResumesPage() {
           ))}
         </div>
       ) : resumes.length === 0 ? (
-        <div className="border border-border rounded-lg p-12 text-center">
-          <p className="text-sm text-muted-foreground">
-            No resumes uploaded yet.
+        <div className="card-elevated p-16 text-center">
+          <div className="inline-flex items-center justify-center w-14 h-14 rounded-full bg-muted/50 mb-5">
+            <FileText className="w-7 h-7 text-muted-foreground" />
+          </div>
+          <p className="text-lg font-semibold text-foreground">
+            No resumes uploaded yet
+          </p>
+          <p className="text-sm text-muted-foreground mt-2 max-w-sm mx-auto">
+            Upload your resume to unlock tailored cover letters, optimized applications, and AI-powered message generation.
           </p>
           <Link
             href="/resumes/upload"
-            className="inline-block mt-3 text-sm text-accent hover:underline"
+            className="btn-gradient inline-block mt-5 px-6 py-2.5 text-sm font-medium rounded-lg"
           >
-            Upload your first resume
+            Upload Your First Resume
           </Link>
         </div>
       ) : (
-        <div className="space-y-2">
+        <div className="space-y-2 stagger-children">
           {resumes.map((resume) => (
             <div
               key={resume.id}
-              className={`border rounded-lg p-4 transition-colors ${
+              className={`card-elevated p-4 ${
                 resume.is_active
-                  ? "border-accent/50 bg-accent/5"
-                  : "border-border hover:border-muted-foreground"
+                  ? "border-accent/50 bg-accent/5 glow-accent"
+                  : ""
               }`}
             >
               <div className="flex items-start justify-between">

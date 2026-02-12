@@ -1,22 +1,47 @@
 "use client";
 
+import { useState, useEffect } from "react";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
-import { useRouter } from "next/navigation";
 import CommandPalette from "@/components/CommandPalette";
 import { useKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts";
 import { useTheme } from "@/hooks/useTheme";
+import {
+  LayoutDashboard,
+  Search,
+  UserCircle,
+  FileText,
+  Sparkles,
+  Send,
+  CreditCard,
+  Settings,
+  LogOut,
+  ChevronLeft,
+  ChevronRight,
+  Sun,
+  Moon,
+  Command,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 
-const nav = [
-  { href: "/dashboard", label: "Dashboard", icon: "H" },
-  { href: "/jobs", label: "Jobs", icon: "J" },
-  { href: "/profile", label: "Profile", icon: "P" },
-  { href: "/resumes", label: "Resumes", icon: "R" },
-  { href: "/generate", label: "Generate", icon: "G" },
-  { href: "/applications", label: "Applications", icon: "A" },
-  { href: "/pricing", label: "Pricing", icon: "$" },
+interface NavItem {
+  href: string;
+  label: string;
+  icon: LucideIcon;
+}
+
+const nav: NavItem[] = [
+  { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
+  { href: "/jobs", label: "Jobs", icon: Search },
+  { href: "/profile", label: "Profile", icon: UserCircle },
+  { href: "/resumes", label: "Resumes", icon: FileText },
+  { href: "/generate", label: "Generate", icon: Sparkles },
+  { href: "/applications", label: "Applications", icon: Send },
+  { href: "/pricing", label: "Pricing", icon: CreditCard },
 ];
+
+const STORAGE_KEY = "sidebar-collapsed";
 
 export default function DashboardLayout({
   children,
@@ -27,107 +52,200 @@ export default function DashboardLayout({
   const router = useRouter();
   const supabase = createClient();
   const { theme, toggle } = useTheme();
+  const [collapsed, setCollapsed] = useState(false);
+  const [mounted, setMounted] = useState(false);
 
   useKeyboardShortcuts();
+
+  // Hydrate collapsed state from localStorage
+  useEffect(() => {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored === "true") {
+      setCollapsed(true);
+    }
+    setMounted(true);
+  }, []);
+
+  function toggleCollapsed() {
+    const next = !collapsed;
+    setCollapsed(next);
+    localStorage.setItem(STORAGE_KEY, String(next));
+  }
 
   async function handleSignOut() {
     await supabase.auth.signOut();
     router.push("/login");
   }
 
+  function openCommandPalette() {
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "k", metaKey: true })
+    );
+  }
+
+  function isActive(href: string) {
+    return pathname === href || pathname.startsWith(href + "/");
+  }
+
+  // Prevent flash of wrong sidebar width before hydration
+  const sidebarWidth = !mounted ? "w-56" : collapsed ? "w-16" : "w-56";
+
   return (
     <div className="flex h-screen">
       <CommandPalette />
 
       {/* Sidebar */}
-      <aside className="w-56 border-r border-border flex flex-col shrink-0">
-        <div className="p-4 border-b border-border flex items-center justify-between">
-          <Link href="/dashboard" className="text-lg font-bold tracking-tight">
-            Panacea
-          </Link>
-          <button
-            onClick={toggle}
-            className="w-7 h-7 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
-            title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+      <aside
+        className={`${sidebarWidth} border-r border-border flex flex-col shrink-0 transition-all duration-200 overflow-hidden`}
+      >
+        {/* Brand + Theme toggle */}
+        <div className="p-4 border-b border-border flex items-center justify-between min-h-[57px]">
+          <Link
+            href="/dashboard"
+            className="text-lg font-bold tracking-tight text-gradient whitespace-nowrap"
           >
-            {theme === "dark" ? (
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <circle cx="12" cy="12" r="5" />
-                <line x1="12" y1="1" x2="12" y2="3" />
-                <line x1="12" y1="21" x2="12" y2="23" />
-                <line x1="4.22" y1="4.22" x2="5.64" y2="5.64" />
-                <line x1="18.36" y1="18.36" x2="19.78" y2="19.78" />
-                <line x1="1" y1="12" x2="3" y2="12" />
-                <line x1="21" y1="12" x2="23" y2="12" />
-                <line x1="4.22" y1="19.78" x2="5.64" y2="18.36" />
-                <line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
-              </svg>
-            ) : (
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
-              </svg>
-            )}
-          </button>
+            {collapsed ? "P" : "Panacea"}
+          </Link>
+          {!collapsed && (
+            <button
+              onClick={toggle}
+              className="w-7 h-7 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+              title={
+                theme === "dark"
+                  ? "Switch to light mode"
+                  : "Switch to dark mode"
+              }
+            >
+              {theme === "dark" ? <Sun size={14} /> : <Moon size={14} />}
+            </button>
+          )}
         </div>
 
+        {/* Main navigation */}
         <nav className="flex-1 p-2 space-y-0.5">
           {nav.map((item) => {
-            const isActive = pathname === item.href || pathname.startsWith(item.href + "/");
+            const active = isActive(item.href);
+            const Icon = item.icon;
             return (
               <Link
                 key={item.href}
                 href={item.href}
-                className={`flex items-center gap-3 px-3 py-2 text-sm rounded-md transition-colors ${
-                  isActive
-                    ? "bg-muted text-foreground"
-                    : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                title={collapsed ? item.label : undefined}
+                className={`flex items-center gap-3 py-2 text-sm rounded-md transition-colors relative ${
+                  collapsed ? "justify-center px-0" : "px-3"
+                } ${
+                  active
+                    ? "bg-accent/10 text-foreground border-l-[3px] border-accent"
+                    : "text-muted-foreground hover:text-foreground hover:bg-muted/50 border-l-[3px] border-transparent"
                 }`}
               >
-                <span className="w-5 h-5 flex items-center justify-center text-xs font-mono opacity-50">
-                  {item.icon}
-                </span>
-                {item.label}
+                <Icon
+                  size={18}
+                  className={`shrink-0 transition-opacity ${
+                    active ? "opacity-100" : "opacity-70"
+                  }`}
+                />
+                {!collapsed && (
+                  <span className="whitespace-nowrap">{item.label}</span>
+                )}
               </Link>
             );
           })}
         </nav>
 
-        {/* Bottom: Cmd+K hint + Settings + Sign Out */}
-        <div className="p-2 border-t border-border space-y-0.5">
+        {/* Separator */}
+        <div className="mx-3 border-t border-border" />
+
+        {/* Bottom section */}
+        <div className="p-2 space-y-0.5">
+          {/* Command palette trigger */}
           <button
-            onClick={() => {
-              document.dispatchEvent(
-                new KeyboardEvent("keydown", { key: "k", metaKey: true })
-              );
-            }}
-            className="w-full flex items-center justify-between px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-md transition-colors"
-          >
-            <span>Search</span>
-            <kbd className="text-[10px] font-mono bg-muted/50 px-1.5 py-0.5 rounded">
-              {typeof navigator !== "undefined" && /Mac/.test(navigator.userAgent) ? "⌘" : "Ctrl+"}K
-            </kbd>
-          </button>
-          <Link
-            href="/settings"
-            className={`flex items-center gap-3 px-3 py-2 text-sm rounded-md transition-colors ${
-              pathname === "/settings"
-                ? "bg-muted text-foreground"
-                : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
+            onClick={openCommandPalette}
+            title={collapsed ? "Search (Cmd+K)" : undefined}
+            className={`w-full flex items-center py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-md transition-colors ${
+              collapsed ? "justify-center px-0" : "justify-between px-3"
             }`}
           >
-            <span className="w-5 h-5 flex items-center justify-center text-xs font-mono opacity-50">
-              S
-            </span>
-            Settings
-          </Link>
+            {collapsed ? (
+              <Command
+                size={18}
+                className="opacity-70 shrink-0"
+              />
+            ) : (
+              <>
+                <span className="flex items-center gap-3">
+                  <Command size={18} className="opacity-70 shrink-0" />
+                  <span className="whitespace-nowrap">Search</span>
+                </span>
+                <kbd className="text-[10px] font-mono bg-muted/50 px-1.5 py-0.5 rounded">
+                  {typeof navigator !== "undefined" &&
+                  /Mac/.test(navigator.userAgent)
+                    ? "\u2318"
+                    : "Ctrl+"}
+                  K
+                </kbd>
+              </>
+            )}
+          </button>
+
+          {/* Settings */}
+          {(() => {
+            const active = isActive("/settings");
+            return (
+              <Link
+                href="/settings"
+                title={collapsed ? "Settings" : undefined}
+                className={`flex items-center gap-3 py-2 text-sm rounded-md transition-colors ${
+                  collapsed ? "justify-center px-0" : "px-3"
+                } ${
+                  active
+                    ? "bg-accent/10 text-foreground border-l-[3px] border-accent"
+                    : "text-muted-foreground hover:text-foreground hover:bg-muted/50 border-l-[3px] border-transparent"
+                }`}
+              >
+                <Settings
+                  size={18}
+                  className={`shrink-0 transition-opacity ${
+                    active ? "opacity-100" : "opacity-70"
+                  }`}
+                />
+                {!collapsed && (
+                  <span className="whitespace-nowrap">Settings</span>
+                )}
+              </Link>
+            );
+          })()}
+
+          {/* Sign out */}
           <button
             onClick={handleSignOut}
-            className="w-full flex items-center gap-3 px-3 py-2 text-sm text-muted-foreground hover:text-destructive hover:bg-muted/50 rounded-md transition-colors"
+            title={collapsed ? "Sign Out" : undefined}
+            className={`w-full flex items-center gap-3 py-2 text-sm text-muted-foreground hover:text-destructive hover:bg-muted/50 rounded-md transition-colors ${
+              collapsed ? "justify-center px-0" : "px-3"
+            } border-l-[3px] border-transparent`}
           >
-            <span className="w-5 h-5 flex items-center justify-center text-xs font-mono opacity-50">
-              Q
-            </span>
-            Sign Out
+            <LogOut size={18} className="opacity-70 shrink-0" />
+            {!collapsed && (
+              <span className="whitespace-nowrap">Sign Out</span>
+            )}
+          </button>
+
+          {/* Collapse toggle */}
+          <button
+            onClick={toggleCollapsed}
+            className={`w-full flex items-center py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-md transition-colors ${
+              collapsed ? "justify-center px-0" : "justify-between px-3"
+            }`}
+            title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          >
+            {collapsed ? (
+              <ChevronRight size={18} className="opacity-70 shrink-0" />
+            ) : (
+              <>
+                <span className="whitespace-nowrap">Collapse</span>
+                <ChevronLeft size={18} className="opacity-70 shrink-0" />
+              </>
+            )}
           </button>
         </div>
       </aside>
