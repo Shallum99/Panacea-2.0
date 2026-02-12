@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef } from "react";
+import { useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import { createClient } from "@/lib/supabase/client";
 import { getResumes, getResumePdfUrl, type Resume } from "@/lib/api/resumes";
@@ -31,6 +32,7 @@ const MESSAGE_TYPES = [
 ];
 
 export default function GeneratePage() {
+  const searchParams = useSearchParams();
   const [resumes, setResumes] = useState<Resume[]>([]);
   const [loadingResumes, setLoadingResumes] = useState(true);
 
@@ -41,6 +43,8 @@ export default function GeneratePage() {
   const [recipientEmail, setRecipientEmail] = useState("");
   const [positionTitle, setPositionTitle] = useState("");
   const [jobUrl, setJobUrl] = useState("");
+  const [fetchingUrl, setFetchingUrl] = useState(false);
+  const jobLoadedRef = useRef(false);
 
   const [analyzingJd, setAnalyzingJd] = useState(false);
   const [jdFields, setJdFields] = useState<JdExtractedFields | null>(null);
@@ -70,6 +74,54 @@ export default function GeneratePage() {
   const [usage, setUsage] = useState<{ tier: string; message_generation: { used: number; limit: number | null }; resume_tailor: { used: number; limit: number | null } } | null>(null);
 
   useEffect(() => { loadResumes(); loadUsage(); }, []);
+
+  // Load saved JD when ?job=id is present
+  useEffect(() => {
+    const jobId = searchParams.get("job");
+    if (!jobId || jobLoadedRef.current) return;
+    jobLoadedRef.current = true;
+    (async () => {
+      try {
+        const { data: jd } = await api.get(`/job-descriptions/${jobId}`);
+        setJobDescription(jd.content || "");
+        if (jd.title) setPositionTitle(jd.title);
+        if (jd.url) setJobUrl(jd.url);
+        if (jd.company_info) {
+          const info = typeof jd.company_info === "string" ? JSON.parse(jd.company_info) : jd.company_info;
+          if (info.recruiter_name && !userEditedRef.current.has("recruiterName")) setRecruiterName(info.recruiter_name);
+          if (info.recipient_email && !userEditedRef.current.has("recipientEmail")) setRecipientEmail(info.recipient_email);
+          if (info.position_title && !userEditedRef.current.has("positionTitle")) setPositionTitle(info.position_title);
+        }
+      } catch {
+        toast.error("Failed to load job description");
+      }
+    })();
+  }, [searchParams]);
+
+  // Auto-fetch JD when a URL is pasted into the Job URL field
+  async function handleJobUrlChange(newUrl: string) {
+    setJobUrl(newUrl);
+    // Detect if a full URL was pasted (not just typing character by character)
+    if (!newUrl.match(/^https?:\/\/.+\..+/)) return;
+    if (jobDescription.trim().length > 50) return; // Don't overwrite existing JD
+    setFetchingUrl(true);
+    try {
+      const { data } = await api.post("/job-descriptions/from-url", { url: newUrl });
+      setJobDescription(data.content || "");
+      if (data.title) setPositionTitle(data.title);
+      if (data.company_info) {
+        const info = typeof data.company_info === "string" ? JSON.parse(data.company_info) : data.company_info;
+        if (info.recruiter_name && !userEditedRef.current.has("recruiterName")) setRecruiterName(info.recruiter_name);
+        if (info.recipient_email && !userEditedRef.current.has("recipientEmail")) setRecipientEmail(info.recipient_email);
+        if (info.position_title && !userEditedRef.current.has("positionTitle")) setPositionTitle(info.position_title);
+      }
+      toast.success("Job description extracted");
+    } catch {
+      toast.error("Could not extract job description from URL");
+    } finally {
+      setFetchingUrl(false);
+    }
+  }
 
   async function loadUsage() {
     try { const { data } = await api.get("/users/usage"); setUsage(data); } catch {}
@@ -302,9 +354,11 @@ export default function GeneratePage() {
               placeholder="recruiter@company.com" className="w-full h-9 px-3 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted-foreground/50" />
           </div>
           <div>
-            <label className="block text-xs font-medium text-muted-foreground mb-1.5">Job URL</label>
-            <input value={jobUrl} onChange={(e) => setJobUrl(e.target.value)} placeholder="https://..."
-              className="w-full h-9 px-3 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted-foreground/50" />
+            <label className="block text-xs font-medium text-muted-foreground mb-1.5">
+              Job URL {fetchingUrl && <span className="text-[10px] text-accent ml-1 font-normal animate-pulse">extracting...</span>}
+            </label>
+            <input value={jobUrl} onChange={(e) => handleJobUrlChange(e.target.value)} placeholder="Paste a job URL to auto-fill everything"
+              className={`w-full h-9 px-3 text-sm bg-background border rounded-md focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted-foreground/50 ${fetchingUrl ? "border-accent" : "border-border"}`} />
           </div>
         </div>
 
@@ -319,8 +373,17 @@ export default function GeneratePage() {
               </label>
             </div>
           </div>
-          <textarea value={jobDescription} onChange={(e) => setJobDescription(e.target.value)}
-            placeholder="Paste the full job description here or upload a PDF..."
+          <textarea value={jobDescription} onChange={(e) => {
+              const val = e.target.value;
+              // If user pastes a URL into the JD box, treat it as a job URL
+              if (val.match(/^https?:\/\/\S+$/) && val.trim() === val && !jobDescription) {
+                setJobDescription("");
+                handleJobUrlChange(val.trim());
+                return;
+              }
+              setJobDescription(val);
+            }}
+            placeholder="Paste a job URL or the full job description here..."
             className="w-full flex-1 min-h-[180px] px-3 py-2 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted-foreground/50 resize-y" />
         </div>
 
