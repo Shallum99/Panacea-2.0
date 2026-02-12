@@ -105,8 +105,11 @@ def migrate_db():
             conn.execute(text(
                 "CREATE INDEX IF NOT EXISTS ix_writing_samples_user_id ON writing_samples (user_id)"
             ))
+            # Job descriptions: url + source
+            conn.execute(text("ALTER TABLE job_descriptions ADD COLUMN IF NOT EXISTS url VARCHAR"))
+            conn.execute(text("ALTER TABLE job_descriptions ADD COLUMN IF NOT EXISTS source VARCHAR"))
             conn.commit()
-            logger.info("DB migration: all columns + usage_log + profile + writing_samples ensured")
+            logger.info("DB migration: all columns + tables ensured")
     except Exception as e:
         logger.warning(f"DB migration skipped: {e}")
 

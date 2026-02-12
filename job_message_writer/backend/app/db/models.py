@@ -78,6 +78,8 @@ class JobDescription(Base):
     title = Column(String)
     content = Column(Text)
     company_info = Column(Text, nullable=True)  # JSON string of extracted company info
+    url = Column(String, nullable=True)
+    source = Column(String, nullable=True)  # "manual", "url", "greenhouse", "lever"
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     owner_id = Column(Integer, ForeignKey("users.id"))
     

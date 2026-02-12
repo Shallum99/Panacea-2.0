@@ -7,10 +7,11 @@ import json
 
 from app.db.database import get_db
 from app.db import models
-from app.schemas.job_description import JobDescriptionBase, JobDescriptionCreate, JobDescriptionResponse
+from app.schemas.job_description import JobDescriptionBase, JobDescriptionCreate, JobDescriptionResponse, UrlExtractRequest
 from app.llm.claude_client import ClaudeClient
 from app.core.supabase_auth import get_current_user
 from app.utils.pdf_extractor import extract_text_from_pdf
+from app.services.web_scraper import fetch_and_extract_jd
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -59,6 +60,54 @@ async def analyze_job_description(
         logger.error(f"Error analyzing job description: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.post("/from-url")
+async def create_jd_from_url(
+    req: UrlExtractRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Fetch a job listing URL, extract the JD text, analyze it, and save."""
+    try:
+        title, content, company_hint = await fetch_and_extract_jd(req.url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"URL extraction failed: {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch the job listing page")
+
+    source = "url"
+    if "greenhouse.io" in req.url:
+        source = "greenhouse"
+    elif "lever.co" in req.url:
+        source = "lever"
+
+    claude_client = ClaudeClient()
+    company_info = await claude_client.extract_company_info(content)
+    if company_hint and company_info.get("company_name") in (None, "Unknown"):
+        company_info["company_name"] = company_hint
+
+    db_jd = models.JobDescription(
+        title=title or "Untitled Job Description",
+        content=content,
+        company_info=json.dumps(company_info),
+        url=req.url,
+        source=source,
+        owner_id=current_user.id,
+    )
+    db.add(db_jd)
+    db.commit()
+    db.refresh(db_jd)
+
+    return {
+        "id": db_jd.id,
+        "title": db_jd.title,
+        "content": db_jd.content,
+        "company_info": company_info,
+        "url": db_jd.url,
+        "source": db_jd.source,
+    }
+
+
 @router.post("/", response_model=JobDescriptionResponse)
 async def create_job_description(
     job_desc: JobDescriptionCreate,
@@ -79,6 +128,8 @@ async def create_job_description(
             title=job_desc.title or "Untitled Job Description",
             content=job_desc.content,
             company_info=json.dumps(company_info),  # Convert to JSON string for storage
+            url=job_desc.url,
+            source=job_desc.source or "manual",
             owner_id=user.id
         )
         
@@ -127,9 +178,11 @@ def read_job_descriptions(
                 "id": jd.id,
                 "title": jd.title,
                 "content": jd.content,
-                "company_info": company_info
+                "company_info": company_info,
+                "url": jd.url,
+                "source": jd.source,
             })
-            
+
         return result
     except Exception as e:
         logger.error(f"Error reading job descriptions: {str(e)}")
@@ -161,7 +214,9 @@ def read_job_description(
             "id": jd.id,
             "title": jd.title,
             "content": jd.content,
-            "company_info": company_info
+            "company_info": company_info,
+            "url": jd.url,
+            "source": jd.source,
         }
     except HTTPException:
         raise

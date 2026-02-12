@@ -1,7 +1,7 @@
 # Update in backend/app/api/api.py
 from fastapi import APIRouter
 
-from app.api.endpoints import messages, resumes, job_descriptions, users, test, auth, resume_tailor, applications, auto_apply, admin, billing, profile
+from app.api.endpoints import messages, resumes, job_descriptions, users, test, auth, resume_tailor, applications, auto_apply, admin, billing, profile, job_search
 
 api_router = APIRouter(prefix="/api")
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
@@ -16,3 +16,4 @@ api_router.include_router(resume_tailor.router, prefix="/resume-tailor", tags=["
 api_router.include_router(admin.router, prefix="/admin", tags=["admin"])
 api_router.include_router(billing.router, prefix="/billing", tags=["billing"])
 api_router.include_router(profile.router, prefix="/profile", tags=["profile"])
+api_router.include_router(job_search.router, prefix="/jobs", tags=["job-search"])
