@@ -293,28 +293,54 @@ async def optimize_resume_pdf(
                 tailored_path = f"{current_user.id}/{download_id}.pdf"
                 await upload_file(TAILORED_BUCKET, tailored_path, output_bytes)
 
-                # Generate diff PDF: tailored PDF with green highlights on changed text
+                # Generate diff PDF: tailored PDF with green highlights on CHANGED words only
                 try:
+                    import difflib
                     diff_doc = fitz.open(stream=output_bytes, filetype="pdf")
                     green = fitz.utils.getColor("green")
                     for change in result.get("changes", []):
+                        orig_text = change.get("original", "")
                         opt_text = change.get("optimized", "")
-                        if not opt_text:
+                        if not opt_text or not orig_text:
                             continue
-                        # Search for fragments of the optimized text in the PDF
-                        # Use first ~60 chars to find the region
-                        search_text = opt_text[:60].strip()
-                        if len(search_text) < 5:
+                        # Word-level diff: find words/phrases that are new or changed
+                        orig_words = orig_text.split()
+                        opt_words = opt_text.split()
+                        matcher = difflib.SequenceMatcher(None, orig_words, opt_words)
+                        changed_fragments = []
+                        for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+                            if tag in ("replace", "insert"):
+                                # These words are new/changed in the optimized version
+                                fragment = " ".join(opt_words[j1:j2])
+                                if fragment.strip():
+                                    changed_fragments.append(fragment)
+                        if not changed_fragments:
                             continue
-                        for page in diff_doc:
-                            rects = page.search_for(search_text)
-                            if rects:
-                                for rect in rects:
-                                    annot = page.add_highlight_annot(rect)
-                                    annot.set_colors(stroke=green)
-                                    annot.set_opacity(0.35)
-                                    annot.update()
-                                break  # found on this page, skip to next change
+                        # Search for each changed fragment in the PDF and highlight
+                        for fragment in changed_fragments:
+                            # For long fragments, search in chunks to handle line wraps
+                            search_terms = [fragment]
+                            if len(fragment) > 50:
+                                # Split into smaller searchable chunks (3-5 words each)
+                                frag_words = fragment.split()
+                                chunk_size = 4
+                                search_terms = []
+                                for ci in range(0, len(frag_words), chunk_size):
+                                    chunk = " ".join(frag_words[ci:ci + chunk_size])
+                                    if chunk.strip():
+                                        search_terms.append(chunk)
+                            for term in search_terms:
+                                if len(term.strip()) < 3:
+                                    continue
+                                for page in diff_doc:
+                                    rects = page.search_for(term)
+                                    if rects:
+                                        for rect in rects:
+                                            annot = page.add_highlight_annot(rect)
+                                            annot.set_colors(stroke=green)
+                                            annot.set_opacity(0.35)
+                                            annot.update()
+                                        break  # found on this page, next term
                     diff_bytes = diff_doc.tobytes()
                     diff_doc.close()
                     diff_path = f"{current_user.id}/{diff_download_id}.pdf"
