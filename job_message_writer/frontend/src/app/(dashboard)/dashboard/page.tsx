@@ -14,6 +14,7 @@ import {
   Upload,
   Inbox,
   CheckCircle2,
+  Search,
 } from "lucide-react";
 import {
   AreaChart,
@@ -256,6 +257,159 @@ function GettingStarted({ stats, loading }: { stats: Stats; loading: boolean }) 
   );
 }
 
+function SmartCTA({ stats, loading }: { stats: Stats; loading: boolean }) {
+  if (loading) {
+    return (
+      <div className="card-elevated p-8 animate-pulse bg-gradient-to-r from-accent/5 to-accent-secondary/5">
+        <div className="h-6 bg-muted rounded w-64 mb-3" />
+        <div className="h-4 bg-muted/50 rounded w-96 mb-5" />
+        <div className="h-10 bg-muted/30 rounded w-40" />
+      </div>
+    );
+  }
+
+  const unsent = stats.applications - stats.sent;
+
+  // State 1: No resumes uploaded
+  if (stats.resumes === 0) {
+    return (
+      <div className="card-elevated p-8 bg-gradient-to-r from-accent/5 to-accent-secondary/5 animate-fade-in">
+        <div className="flex items-start gap-5">
+          <div className="shrink-0 w-12 h-12 rounded-full bg-accent/10 flex items-center justify-center">
+            <Upload className="w-6 h-6 text-accent" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <h2 className="text-lg font-semibold tracking-tight text-gradient">
+              Upload your resume to get started
+            </h2>
+            <p className="text-sm text-muted-foreground mt-1 max-w-lg">
+              Your resume powers everything &mdash; message generation, resume tailoring, and auto-apply
+            </p>
+            <div className="mt-5">
+              <Link
+                href="/resumes/upload"
+                className="inline-flex items-center gap-2 btn-gradient px-5 py-2.5 rounded-lg text-sm font-medium"
+              >
+                Upload Resume &rarr;
+              </Link>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // State 2: Has resume but no applications
+  if (stats.resumes > 0 && stats.applications === 0) {
+    return (
+      <div className="card-elevated p-8 bg-gradient-to-r from-accent/5 to-accent-secondary/5 animate-fade-in">
+        <div className="flex items-start gap-5">
+          <div className="shrink-0 w-12 h-12 rounded-full bg-accent/10 flex items-center justify-center">
+            <Search className="w-6 h-6 text-accent" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <h2 className="text-lg font-semibold tracking-tight text-gradient">
+              Ready to apply! Find your next opportunity
+            </h2>
+            <p className="text-sm text-muted-foreground mt-1 max-w-lg">
+              Search job boards or paste a job URL to generate a tailored application
+            </p>
+            <div className="mt-5 flex items-center gap-3">
+              <Link
+                href="/jobs"
+                className="inline-flex items-center gap-2 btn-gradient px-5 py-2.5 rounded-lg text-sm font-medium"
+              >
+                <Search className="w-4 h-4" />
+                Search Jobs &rarr;
+              </Link>
+              <Link
+                href="/generate"
+                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-medium border border-accent/30 text-accent hover:bg-accent/5 transition-colors"
+              >
+                <Sparkles className="w-4 h-4" />
+                Paste a Job URL &rarr;
+              </Link>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // State 3: Has unsent applications
+  if (unsent > 0 && stats.sent < stats.applications) {
+    return (
+      <div className="card-elevated p-8 bg-gradient-to-r from-accent/5 to-accent-secondary/5 animate-fade-in relative overflow-hidden">
+        {/* Subtle accent glow */}
+        <div className="absolute inset-0 bg-accent/[0.03] pointer-events-none" />
+        <div className="absolute -top-24 -right-24 w-48 h-48 bg-accent/10 rounded-full blur-3xl pointer-events-none" />
+        <div className="relative flex items-start gap-5">
+          <div className="shrink-0 w-12 h-12 rounded-full bg-accent/10 flex items-center justify-center">
+            <Send className="w-6 h-6 text-accent" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <h2 className="text-lg font-semibold tracking-tight text-gradient">
+              You have {unsent} unsent application{unsent !== 1 ? "s" : ""}
+            </h2>
+            <p className="text-sm text-muted-foreground mt-1 max-w-lg">
+              Review and send your generated messages
+            </p>
+            <div className="mt-5">
+              <Link
+                href="/applications"
+                className="inline-flex items-center gap-2 btn-gradient px-5 py-2.5 rounded-lg text-sm font-medium"
+              >
+                <Send className="w-4 h-4" />
+                Review Applications &rarr;
+              </Link>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // State 4: All caught up
+  if (stats.sent > 0 && stats.sent >= stats.applications) {
+    return (
+      <div className="card-elevated p-8 bg-gradient-to-r from-accent/5 to-accent-secondary/5 animate-fade-in">
+        <div className="flex items-start gap-5">
+          <div className="shrink-0 w-12 h-12 rounded-full bg-accent/10 flex items-center justify-center">
+            <CheckCircle2 className="w-6 h-6 text-accent" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <h2 className="text-lg font-semibold tracking-tight text-gradient">
+              All applications sent! Keep the momentum going
+            </h2>
+            <p className="text-sm text-muted-foreground mt-1 max-w-lg">
+              Search for more opportunities or check for responses
+            </p>
+            <div className="mt-5 flex items-center gap-3">
+              <Link
+                href="/jobs"
+                className="inline-flex items-center gap-2 btn-gradient px-5 py-2.5 rounded-lg text-sm font-medium"
+              >
+                <Search className="w-4 h-4" />
+                Search Jobs &rarr;
+              </Link>
+              <Link
+                href="/applications?filter=replied"
+                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-medium border border-accent/30 text-accent hover:bg-accent/5 transition-colors"
+              >
+                <MessageCircle className="w-4 h-4" />
+                View Responses &rarr;
+              </Link>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Fallback: should not reach here, but render nothing
+  return null;
+}
+
 function timeAgo(dateStr: string): string {
   const diff = Date.now() - new Date(dateStr).getTime();
   const mins = Math.floor(diff / 60000);
@@ -357,23 +511,23 @@ export default function DashboardPage() {
         <StatCard label="Replies" value={stats.replies} loading={loading} />
       </div>
 
-      {/* Quick Actions */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+      {/* Smart Contextual CTA */}
+      <SmartCTA stats={stats} loading={loading} />
+
+      {/* Quick Actions (secondary) */}
+      <div className="grid grid-cols-3 gap-2">
         {QUICK_ACTIONS.map((action) => (
           <Link
             key={action.href}
             href={action.href}
-            className="card-interactive p-4 group flex items-start gap-3"
+            className="card-interactive px-3 py-2.5 group flex items-center gap-2.5"
           >
-            <div className="text-accent mt-0.5 shrink-0 transition-transform group-hover:scale-110">
+            <div className="text-accent shrink-0 transition-transform group-hover:scale-110">
               {action.icon}
             </div>
             <div className="min-w-0">
-              <p className="text-sm font-medium group-hover:text-accent transition-colors">
+              <p className="text-xs font-medium group-hover:text-accent transition-colors">
                 {action.label}
-              </p>
-              <p className="text-xs text-muted-foreground mt-1">
-                {action.desc}
               </p>
             </div>
           </Link>

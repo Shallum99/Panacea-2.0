@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { toast } from "sonner";
-import { Link as LinkIcon, Search, Bookmark, Briefcase } from "lucide-react";
+import { Link as LinkIcon, Search, Bookmark, Briefcase, Zap } from "lucide-react";
 import api from "@/lib/api";
 import {
   searchJobs,
@@ -96,7 +96,7 @@ export default function JobsPage() {
     }
   }
 
-  async function handleApplyFromSearch(job: JobSearchResult) {
+  async function handleApplyFromSearch(job: JobSearchResult, quickApply = false) {
     setSavingJobId(job.id);
     try {
       // Get full JD content
@@ -108,7 +108,12 @@ export default function JobsPage() {
         url: detail.url,
         source: detail.source,
       });
-      router.push(`/generate?job=${saved.id}`);
+      if (quickApply) {
+        toast.info("Auto-generating message and tailoring resume...");
+        router.push(`/generate?job=${saved.id}&auto=true`);
+      } else {
+        router.push(`/generate?job=${saved.id}`);
+      }
     } catch {
       toast.error("Failed to load job details");
     } finally {
@@ -227,49 +232,62 @@ export default function JobsPage() {
           )}
 
           {!searching && searchResults.length > 0 && (
-            <div className="grid grid-cols-2 gap-2 max-h-[400px] overflow-y-auto">
-              {searchResults.map((job) => (
-                <div
-                  key={`${job.source}-${job.id}`}
-                  className="card-interactive p-3"
-                >
-                  <div className="flex items-start justify-between gap-2">
-                    <div className="min-w-0 flex-1">
-                      <p className="text-sm font-medium truncate">{job.title}</p>
-                      <p className="text-xs text-muted-foreground mt-0.5">
-                        {job.company}
-                        {job.location && ` \u2022 ${job.location}`}
-                      </p>
-                      {job.department && (
-                        <p className="text-[10px] text-muted-foreground/60 mt-0.5 truncate">
-                          {job.department}
+            <>
+              <div className="grid grid-cols-2 gap-2 max-h-[400px] overflow-y-auto">
+                {searchResults.map((job) => (
+                  <div
+                    key={`${job.source}-${job.id}`}
+                    className="card-interactive p-3"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm font-medium truncate">{job.title}</p>
+                        <p className="text-xs text-muted-foreground mt-0.5">
+                          {job.company}
+                          {job.location && ` \u2022 ${job.location}`}
                         </p>
-                      )}
+                        {job.department && (
+                          <p className="text-[10px] text-muted-foreground/60 mt-0.5 truncate">
+                            {job.department}
+                          </p>
+                        )}
+                      </div>
+                      <span className="text-[9px] px-1.5 py-0.5 bg-muted rounded text-muted-foreground shrink-0 uppercase font-mono">
+                        {SOURCE_BADGE[job.source] || job.source}
+                      </span>
                     </div>
-                    <span className="text-[9px] px-1.5 py-0.5 bg-muted rounded text-muted-foreground shrink-0 uppercase font-mono">
-                      {SOURCE_BADGE[job.source] || job.source}
-                    </span>
+                    <div className="flex items-center gap-2 mt-2">
+                      <a
+                        href={job.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-xs text-accent hover:underline"
+                      >
+                        View
+                      </a>
+                      <button
+                        onClick={() => handleApplyFromSearch(job)}
+                        disabled={savingJobId === job.id}
+                        className="text-xs text-foreground hover:text-accent disabled:opacity-40"
+                      >
+                        {savingJobId === job.id ? "Loading..." : "Save & Apply"}
+                      </button>
+                      <button
+                        onClick={() => handleApplyFromSearch(job, true)}
+                        disabled={savingJobId === job.id}
+                        className="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-md bg-accent text-accent-foreground hover:opacity-90 disabled:opacity-40 transition-opacity"
+                      >
+                        <Zap className="w-3 h-3" />
+                        Quick Apply
+                      </button>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2 mt-2">
-                    <a
-                      href={job.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-xs text-accent hover:underline"
-                    >
-                      View
-                    </a>
-                    <button
-                      onClick={() => handleApplyFromSearch(job)}
-                      disabled={savingJobId === job.id}
-                      className="text-xs text-foreground hover:text-accent disabled:opacity-40"
-                    >
-                      {savingJobId === job.id ? "Loading..." : "Apply"}
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+              <p className="text-[10px] text-muted-foreground/60 text-center pt-1">
+                Tip: Use Quick Apply to auto-generate a message and tailor your resume in one click
+              </p>
+            </>
           )}
         </div>
       </section>
@@ -345,6 +363,14 @@ export default function JobsPage() {
                         className="text-xs text-muted-foreground hover:text-foreground transition-colors"
                       >
                         Apply
+                      </Link>
+                      <Link
+                        href={`/generate?job=${job.id}&auto=true`}
+                        onClick={() => toast.info("Auto-generating message and tailoring resume...")}
+                        className="inline-flex items-center justify-center w-6 h-6 rounded-md bg-accent/10 text-accent hover:bg-accent hover:text-accent-foreground transition-colors"
+                        title="Quick Apply"
+                      >
+                        <Zap className="w-3 h-3" />
                       </Link>
                     </div>
                   </div>

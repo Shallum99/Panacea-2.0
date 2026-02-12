@@ -2,6 +2,7 @@
 
 import { Suspense, useEffect, useState, useCallback, useRef } from "react";
 import { useSearchParams } from "next/navigation";
+import Link from "next/link";
 import { toast } from "sonner";
 import { createClient } from "@/lib/supabase/client";
 import { getResumes, getResumePdfUrl, type Resume } from "@/lib/api/resumes";
@@ -12,7 +13,6 @@ import {
   updateApplication,
   sendApplication,
   type Application,
-  type CreateApplicationRequest,
   type JdExtractedFields,
 } from "@/lib/api/applications";
 import {
@@ -21,6 +21,17 @@ import {
   type PDFOptimizeResponse,
 } from "@/lib/api/resumeTailor";
 import api from "@/lib/api";
+import {
+  Check,
+  ArrowRight,
+  ArrowLeft,
+  Sparkles,
+  Send as SendIcon,
+  Download,
+  RotateCcw,
+  Search,
+  LayoutDashboard,
+} from "lucide-react";
 
 const MESSAGE_TYPES = [
   { value: "email_detailed", label: "Detailed Email" },
@@ -31,6 +42,45 @@ const MESSAGE_TYPES = [
   { value: "ycombinator", label: "Y Combinator" },
 ];
 
+const WIZARD_STEPS = ["Job Details", "Review", "Send"];
+
+// ── Step indicator ──
+
+function StepIndicator({ current }: { current: number }) {
+  return (
+    <div className="flex items-center justify-center gap-0 py-4">
+      {WIZARD_STEPS.map((label, i) => {
+        const num = i + 1;
+        const done = current > num;
+        const active = current === num;
+        return (
+          <div key={i} className="flex items-center">
+            {i > 0 && (
+              <div className={`w-12 sm:w-20 h-0.5 mx-1.5 rounded-full transition-colors ${done ? "bg-accent" : "bg-border"}`} />
+            )}
+            <div className="flex items-center gap-2">
+              <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold transition-all ${
+                done ? "bg-accent text-accent-foreground" :
+                active ? "border-2 border-accent text-accent" :
+                "border border-border text-muted-foreground"
+              }`}>
+                {done ? <Check className="w-3.5 h-3.5" /> : num}
+              </div>
+              <span className={`text-sm hidden sm:inline transition-colors ${
+                active ? "text-foreground font-medium" :
+                done ? "text-accent" :
+                "text-muted-foreground"
+              }`}>{label}</span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Suspense wrapper ──
+
 export default function GeneratePageWrapper() {
   return (
     <Suspense fallback={<div className="flex items-center justify-center h-64"><div className="w-6 h-6 border-2 border-accent border-t-transparent rounded-full animate-spin" /></div>}>
@@ -39,12 +89,22 @@ export default function GeneratePageWrapper() {
   );
 }
 
+// ── Main component ──
+
 function GeneratePage() {
   const searchParams = useSearchParams();
+
+  // Wizard state
+  const [step, setStep] = useState(1);
+  const autoTriggeredRef = useRef(false);
+  const lastGeneratedJdRef = useRef("");
+
+  // Resumes
   const [resumes, setResumes] = useState<Resume[]>([]);
   const [loadingResumes, setLoadingResumes] = useState(true);
-
   const [selectedResumeId, setSelectedResumeId] = useState<number | undefined>();
+
+  // Inputs
   const [jobDescription, setJobDescription] = useState("");
   const [messageType, setMessageType] = useState("email_detailed");
   const [recruiterName, setRecruiterName] = useState("");
@@ -54,6 +114,7 @@ function GeneratePage() {
   const [fetchingUrl, setFetchingUrl] = useState(false);
   const jobLoadedRef = useRef(false);
 
+  // JD analysis
   const [analyzingJd, setAnalyzingJd] = useState(false);
   const [jdFields, setJdFields] = useState<JdExtractedFields | null>(null);
   const [uploadingPdf, setUploadingPdf] = useState(false);
@@ -61,6 +122,7 @@ function GeneratePage() {
   const lastAnalyzedRef = useRef("");
   const userEditedRef = useRef<Set<string>>(new Set());
 
+  // Generation
   const [generating, setGenerating] = useState(false);
   const [result, setResult] = useState<Application | null>(null);
   const [streamedText, setStreamedText] = useState("");
@@ -69,10 +131,12 @@ function GeneratePage() {
   const [editedRecipient, setEditedRecipient] = useState("");
   const [sending, setSending] = useState(false);
 
+  // Resume tailoring
   const [tailoring, setTailoring] = useState(false);
   const [tailorResult, setTailorResult] = useState<PDFOptimizeResponse | null>(null);
   const [attachTailored, setAttachTailored] = useState(false);
 
+  // Resume PDF viewer
   const [activeTab, setActiveTab] = useState<"message" | "resume">("message");
   const [pdfView, setPdfView] = useState<"tailored" | "original" | "diff">("tailored");
   const [originalPdfBlobUrl, setOriginalPdfBlobUrl] = useState<string | null>(null);
@@ -81,9 +145,12 @@ function GeneratePage() {
   const [loadingPdf, setLoadingPdf] = useState(false);
   const [usage, setUsage] = useState<{ tier: string; message_generation: { used: number; limit: number | null }; resume_tailor: { used: number; limit: number | null } } | null>(null);
 
+  const isSent = result?.status === "sent";
+
+  // ── Data loading ──
+
   useEffect(() => { loadResumes(); loadUsage(); }, []);
 
-  // Load saved JD when ?job=id is present
   useEffect(() => {
     const jobId = searchParams.get("job");
     if (!jobId || jobLoadedRef.current) return;
@@ -106,35 +173,6 @@ function GeneratePage() {
     })();
   }, [searchParams]);
 
-  // Auto-fetch JD when a URL is pasted into the Job URL field
-  async function handleJobUrlChange(newUrl: string) {
-    setJobUrl(newUrl);
-    // Detect if a full URL was pasted (not just typing character by character)
-    if (!newUrl.match(/^https?:\/\/.+\..+/)) return;
-    if (jobDescription.trim().length > 50) return; // Don't overwrite existing JD
-    setFetchingUrl(true);
-    try {
-      const { data } = await api.post("/job-descriptions/from-url", { url: newUrl });
-      setJobDescription(data.content || "");
-      if (data.title) setPositionTitle(data.title);
-      if (data.company_info) {
-        const info = typeof data.company_info === "string" ? JSON.parse(data.company_info) : data.company_info;
-        if (info.recruiter_name && !userEditedRef.current.has("recruiterName")) setRecruiterName(info.recruiter_name);
-        if (info.recipient_email && !userEditedRef.current.has("recipientEmail")) setRecipientEmail(info.recipient_email);
-        if (info.position_title && !userEditedRef.current.has("positionTitle")) setPositionTitle(info.position_title);
-      }
-      toast.success("Job description extracted");
-    } catch {
-      toast.error("Could not extract job description from URL");
-    } finally {
-      setFetchingUrl(false);
-    }
-  }
-
-  async function loadUsage() {
-    try { const { data } = await api.get("/users/usage"); setUsage(data); } catch {}
-  }
-
   useEffect(() => {
     return () => {
       if (originalPdfBlobUrl) URL.revokeObjectURL(originalPdfBlobUrl);
@@ -154,6 +192,12 @@ function GeneratePage() {
     } catch { toast.error("Failed to load resumes"); }
     finally { setLoadingResumes(false); }
   }
+
+  async function loadUsage() {
+    try { const { data } = await api.get("/users/usage"); setUsage(data); } catch {}
+  }
+
+  // ── JD analysis ──
 
   const analyzeJd = useCallback(async (text: string) => {
     if (text.trim().length < 100 || text === lastAnalyzedRef.current) return;
@@ -176,6 +220,31 @@ function GeneratePage() {
     return () => { if (analyzeTimerRef.current) clearTimeout(analyzeTimerRef.current); };
   }, [jobDescription, analyzeJd]);
 
+  // ── Input handlers ──
+
+  async function handleJobUrlChange(newUrl: string) {
+    setJobUrl(newUrl);
+    if (!newUrl.match(/^https?:\/\/.+\..+/)) return;
+    if (jobDescription.trim().length > 50) return;
+    setFetchingUrl(true);
+    try {
+      const { data } = await api.post("/job-descriptions/from-url", { url: newUrl });
+      setJobDescription(data.content || "");
+      if (data.title) setPositionTitle(data.title);
+      if (data.company_info) {
+        const info = typeof data.company_info === "string" ? JSON.parse(data.company_info) : data.company_info;
+        if (info.recruiter_name && !userEditedRef.current.has("recruiterName")) setRecruiterName(info.recruiter_name);
+        if (info.recipient_email && !userEditedRef.current.has("recipientEmail")) setRecipientEmail(info.recipient_email);
+        if (info.position_title && !userEditedRef.current.has("positionTitle")) setPositionTitle(info.position_title);
+      }
+      toast.success("Job description extracted");
+    } catch {
+      toast.error("Could not extract job description from URL");
+    } finally {
+      setFetchingUrl(false);
+    }
+  }
+
   async function handleJdPdfUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -184,6 +253,8 @@ function GeneratePage() {
     catch { toast.error("Failed to extract text from PDF"); }
     finally { setUploadingPdf(false); e.target.value = ""; }
   }
+
+  // ── PDF helpers ──
 
   async function fetchPdfBlob(url: string): Promise<string> {
     const supabase = createClient();
@@ -199,11 +270,11 @@ function GeneratePage() {
     if (diffPdfBlobUrl) { URL.revokeObjectURL(diffPdfBlobUrl); setDiffPdfBlobUrl(null); }
   }
 
-  // ── Handlers ──
+  // ── Core actions ──
 
   async function handleGenerate() {
     if (!jobDescription.trim()) { toast.error("Paste a job description first"); return; }
-    setGenerating(true); setResult(null); setStreamedText(""); setEditedMessage(""); setEditedSubject(""); setActiveTab("message");
+    setGenerating(true); setResult(null); setStreamedText(""); setEditedMessage(""); setEditedSubject("");
     try {
       await streamApplication(
         {
@@ -226,18 +297,16 @@ function GeneratePage() {
   }
 
   async function handleTailor() {
-    if (!jobDescription.trim()) { toast.error("Paste a job description first"); return; }
-    setTailoring(true); setActiveTab("resume");
+    if (!jobDescription.trim() || !selectedResumeId) return;
+    setTailoring(true);
     try {
       const res = await optimizePDF(jobDescription, selectedResumeId);
       setTailorResult(res); setAttachTailored(true); setPdfView("tailored");
-      // Fetch tailored PDF blob
       try {
         const blobUrl = await fetchPdfBlob(getDownloadUrl(res.download_id));
         if (tailoredPdfBlobUrl) URL.revokeObjectURL(tailoredPdfBlobUrl);
         setTailoredPdfBlobUrl(blobUrl);
       } catch {}
-      // Fetch diff PDF blob
       if (res.diff_download_id) {
         try {
           const blobUrl = await fetchPdfBlob(getDownloadUrl(res.diff_download_id));
@@ -285,11 +354,86 @@ function GeneratePage() {
     } finally { setSending(false); }
   }
 
-  function handleReset() {
+  function handleFullReset() {
+    setStep(1);
     setResult(null); setStreamedText(""); setEditedMessage(""); setEditedSubject(""); setEditedRecipient("");
     setTailorResult(null); setAttachTailored(false); setActiveTab("message"); setPdfView("tailored");
+    setJobDescription(""); setPositionTitle(""); setRecruiterName(""); setRecipientEmail(""); setJobUrl("");
+    lastGeneratedJdRef.current = "";
+    jobLoadedRef.current = false;
+    autoTriggeredRef.current = false;
+    userEditedRef.current.clear();
     revokeAllBlobs();
   }
+
+  // ── Wizard navigation ──
+
+  function advanceToStep2() {
+    if (!jobDescription.trim()) { toast.error("Paste a job description first"); return; }
+    setStep(2);
+    setActiveTab("message");
+    // Only re-generate if JD changed since last generation
+    if (jobDescription !== lastGeneratedJdRef.current || !result) {
+      lastGeneratedJdRef.current = jobDescription;
+      handleGenerate();
+      if (selectedResumeId) handleTailor();
+    }
+  }
+
+  function advanceToStep3() {
+    if (!result) { toast.error("Wait for message generation to complete"); return; }
+    setStep(3);
+  }
+
+  // ── Auto-mode (?auto=true) ──
+
+  useEffect(() => {
+    const isAuto = searchParams.get("auto") === "true";
+    if (isAuto && jobDescription.trim().length > 50 && !autoTriggeredRef.current && step === 1 && !loadingResumes) {
+      autoTriggeredRef.current = true;
+      setTimeout(() => advanceToStep2(), 300);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobDescription, step, loadingResumes]);
+
+  // ── Keyboard shortcuts ──
+
+  const keyHandlerRef = useRef<((e: KeyboardEvent) => void) | undefined>(undefined);
+  useEffect(() => {
+    keyHandlerRef.current = (e: KeyboardEvent) => {
+      // Escape: go back
+      if (e.key === "Escape") {
+        e.preventDefault();
+        if (step === 3) setStep(2);
+        else if (step === 2) setStep(1);
+        return;
+      }
+      // Cmd+Shift+Enter: quick send (from any step)
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "Enter") {
+        e.preventDefault();
+        if (result && editedRecipient.trim() && !sending && !isSent) {
+          if (step !== 3) setStep(3);
+          handleSend();
+        }
+        return;
+      }
+      // Cmd+Enter: step-specific action
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        e.preventDefault();
+        if (step === 1 && jobDescription.trim()) advanceToStep2();
+        else if (step === 2 && result) advanceToStep3();
+        else if (step === 3 && !sending && !isSent) handleSend();
+      }
+    };
+  });
+
+  useEffect(() => {
+    function handler(e: KeyboardEvent) { keyHandlerRef.current?.(e); }
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+  }, []);
+
+  // ── Helpers ──
 
   const isAutoFilled = (field: string, value: string) => {
     if (!jdFields || userEditedRef.current.has(field) || !value) return false;
@@ -297,363 +441,471 @@ function GeneratePage() {
     return jdFields[key as keyof JdExtractedFields] === value;
   };
 
-  const isSent = result?.status === "sent";
-  const hasRightContent = generating || result || tailoring || tailorResult;
+  const isMac = typeof navigator !== "undefined" && /Mac/.test(navigator.userAgent);
+  const cmdKey = isMac ? "\u2318" : "Ctrl+";
 
   // ── Render ──
 
   return (
-    <div className="grid grid-cols-1 xl:grid-cols-2 gap-0" style={{ height: "calc(100vh - 4rem)" }}>
+    <div className="flex flex-col animate-fade-in" style={{ height: "calc(100vh - 4rem)" }}>
+      <StepIndicator current={step} />
 
-      {/* ═══ LEFT — Inputs ═══ */}
-      <div className="xl:overflow-y-auto xl:pr-6 xl:border-r xl:border-border space-y-4 py-4">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight">Generate & Tailor</h1>
-          <p className="text-sm text-muted-foreground mt-1">Create a message, optimize your resume, or both</p>
-        </div>
+      {/* ═══════════════════════════════════════════════════════════════════ */}
+      {/* STEP 1 — Job Details                                              */}
+      {/* ═══════════════════════════════════════════════════════════════════ */}
+      {step === 1 && (
+        <div className="flex-1 overflow-y-auto">
+          <div className="max-w-2xl mx-auto space-y-5 pb-8">
+            <div>
+              <h1 className="text-2xl font-bold tracking-tight">Job Details</h1>
+              <p className="text-sm text-muted-foreground mt-1">Paste a job description to generate a message and optimize your resume</p>
+            </div>
 
-        <div>
-          <label className="block text-xs font-medium text-muted-foreground mb-1.5">Resume</label>
-          {loadingResumes ? <div className="h-9 bg-muted rounded-md animate-pulse" /> : resumes.length === 0 ? (
-            <p className="text-xs text-muted-foreground">No resumes. <a href="/resumes/upload" className="text-accent hover:underline">Upload one</a></p>
-          ) : (
-            <select value={selectedResumeId ?? ""} onChange={(e) => setSelectedResumeId(Number(e.target.value))}
-              className="w-full h-9 px-3 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-accent">
-              {resumes.map((r) => <option key={r.id} value={r.id}>{r.title}{r.is_active ? " (Active)" : ""}</option>)}
-            </select>
-          )}
-        </div>
+            {/* JD textarea */}
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="text-xs font-medium text-muted-foreground">Job Description *</label>
+                <div className="flex items-center gap-3">
+                  {analyzingJd && <span className="text-[10px] text-accent animate-pulse">Analyzing...</span>}
+                  <label className={`text-xs cursor-pointer transition-colors ${uploadingPdf ? "text-muted-foreground" : "text-accent hover:text-accent/80"}`}>
+                    {uploadingPdf ? "Extracting..." : "Upload PDF"}
+                    <input type="file" accept=".pdf" className="hidden" onChange={handleJdPdfUpload} disabled={uploadingPdf} />
+                  </label>
+                </div>
+              </div>
+              <textarea
+                value={jobDescription}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  if (val.match(/^https?:\/\/\S+$/) && val.trim() === val && !jobDescription) {
+                    setJobDescription("");
+                    handleJobUrlChange(val.trim());
+                    return;
+                  }
+                  setJobDescription(val);
+                }}
+                placeholder="Paste a job URL or the full job description here..."
+                className="w-full min-h-[200px] px-3 py-2.5 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-accent/50 placeholder:text-muted-foreground/50 resize-y"
+              />
+            </div>
 
-        <div>
-          <label className="block text-xs font-medium text-muted-foreground mb-1.5">Message Type</label>
-          <div className="flex flex-wrap gap-1.5">
-            {MESSAGE_TYPES.map((t) => (
-              <button key={t.value} onClick={() => setMessageType(t.value)}
-                className={`px-3 py-1.5 text-xs rounded-md border transition-colors ${messageType === t.value ? "border-accent bg-accent/10 text-accent" : "border-border text-muted-foreground hover:text-foreground hover:border-muted-foreground"}`}>
-                {t.label}
+            {/* Config row */}
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-medium text-muted-foreground mb-1.5">Resume</label>
+                {loadingResumes ? <div className="h-9 bg-muted rounded-md animate-pulse" /> : resumes.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">No resumes. <a href="/resumes/upload" className="text-accent hover:underline">Upload one</a></p>
+                ) : (
+                  <select value={selectedResumeId ?? ""} onChange={(e) => setSelectedResumeId(Number(e.target.value))}
+                    className="w-full h-9 px-3 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-accent">
+                    {resumes.map((r) => <option key={r.id} value={r.id}>{r.title}{r.is_active ? " (Active)" : ""}</option>)}
+                  </select>
+                )}
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-muted-foreground mb-1.5">
+                  Job URL {fetchingUrl && <span className="text-[10px] text-accent ml-1 font-normal animate-pulse">extracting...</span>}
+                </label>
+                <input value={jobUrl} onChange={(e) => handleJobUrlChange(e.target.value)} placeholder="Paste URL to auto-fill"
+                  className={`w-full h-9 px-3 text-sm bg-background border rounded-md focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted-foreground/50 ${fetchingUrl ? "border-accent" : "border-border"}`} />
+              </div>
+            </div>
+
+            {/* Message type */}
+            <div>
+              <label className="block text-xs font-medium text-muted-foreground mb-1.5">Message Type</label>
+              <div className="flex flex-wrap gap-1.5">
+                {MESSAGE_TYPES.map((t) => (
+                  <button key={t.value} onClick={() => setMessageType(t.value)}
+                    className={`px-3 py-1.5 text-xs rounded-md border transition-colors ${messageType === t.value ? "border-accent bg-accent/10 text-accent" : "border-border text-muted-foreground hover:text-foreground hover:border-muted-foreground"}`}>
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Optional fields */}
+            <div className="grid grid-cols-3 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-muted-foreground mb-1.5">
+                  Position Title {isAutoFilled("positionTitle", positionTitle) && <span className="text-[10px] text-accent ml-1 font-normal">auto</span>}
+                </label>
+                <input value={positionTitle} onChange={(e) => { userEditedRef.current.add("positionTitle"); setPositionTitle(e.target.value); }}
+                  placeholder="e.g. Senior Engineer" className="w-full h-9 px-3 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted-foreground/50" />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-muted-foreground mb-1.5">
+                  Recruiter Name {isAutoFilled("recruiterName", recruiterName) && <span className="text-[10px] text-accent ml-1 font-normal">auto</span>}
+                </label>
+                <input value={recruiterName} onChange={(e) => { userEditedRef.current.add("recruiterName"); setRecruiterName(e.target.value); }}
+                  placeholder="Optional" className="w-full h-9 px-3 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted-foreground/50" />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-muted-foreground mb-1.5">
+                  Recipient Email {isAutoFilled("recipientEmail", recipientEmail) && <span className="text-[10px] text-accent ml-1 font-normal">auto</span>}
+                </label>
+                <input type="email" value={recipientEmail} onChange={(e) => { userEditedRef.current.add("recipientEmail"); setRecipientEmail(e.target.value); }}
+                  placeholder="recruiter@company.com" className="w-full h-9 px-3 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted-foreground/50" />
+              </div>
+            </div>
+
+            {/* CTA */}
+            <div className="pt-2">
+              <button
+                onClick={advanceToStep2}
+                disabled={!jobDescription.trim() || fetchingUrl}
+                className="w-full h-11 btn-gradient text-sm font-medium rounded-lg flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <Sparkles className="w-4 h-4" />
+                Generate Message & Tailor Resume
+                <ArrowRight className="w-4 h-4" />
               </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label className="block text-xs font-medium text-muted-foreground mb-1.5">
-              Position Title {isAutoFilled("positionTitle", positionTitle) && <span className="text-[10px] text-accent ml-1 font-normal">auto-detected</span>}
-            </label>
-            <input value={positionTitle} onChange={(e) => { userEditedRef.current.add("positionTitle"); setPositionTitle(e.target.value); }}
-              placeholder="e.g. Senior Engineer" className="w-full h-9 px-3 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted-foreground/50" />
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-muted-foreground mb-1.5">
-              Recruiter Name {isAutoFilled("recruiterName", recruiterName) && <span className="text-[10px] text-accent ml-1 font-normal">auto-detected</span>}
-            </label>
-            <input value={recruiterName} onChange={(e) => { userEditedRef.current.add("recruiterName"); setRecruiterName(e.target.value); }}
-              placeholder="Optional" className="w-full h-9 px-3 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted-foreground/50" />
-          </div>
-        </div>
-
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label className="block text-xs font-medium text-muted-foreground mb-1.5">
-              Recipient Email {isAutoFilled("recipientEmail", recipientEmail) && <span className="text-[10px] text-accent ml-1 font-normal">auto-detected</span>}
-            </label>
-            <input type="email" value={recipientEmail} onChange={(e) => { userEditedRef.current.add("recipientEmail"); setRecipientEmail(e.target.value); }}
-              placeholder="recruiter@company.com" className="w-full h-9 px-3 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted-foreground/50" />
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-muted-foreground mb-1.5">
-              Job URL {fetchingUrl && <span className="text-[10px] text-accent ml-1 font-normal animate-pulse">extracting...</span>}
-            </label>
-            <input value={jobUrl} onChange={(e) => handleJobUrlChange(e.target.value)} placeholder="Paste a job URL to auto-fill everything"
-              className={`w-full h-9 px-3 text-sm bg-background border rounded-md focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted-foreground/50 ${fetchingUrl ? "border-accent" : "border-border"}`} />
-          </div>
-        </div>
-
-        <div className="flex-1 flex flex-col">
-          <div className="flex items-center justify-between mb-1.5">
-            <label className="text-xs font-medium text-muted-foreground">Job Description</label>
-            <div className="flex items-center gap-3">
-              {analyzingJd && <span className="text-[10px] text-accent animate-pulse">Analyzing JD...</span>}
-              <label className={`text-xs cursor-pointer transition-colors ${uploadingPdf ? "text-muted-foreground" : "text-accent hover:text-accent/80"}`}>
-                {uploadingPdf ? "Extracting..." : "Upload PDF"}
-                <input type="file" accept=".pdf" className="hidden" onChange={handleJdPdfUpload} disabled={uploadingPdf} />
-              </label>
+              <p className="text-[10px] text-muted-foreground/50 text-center mt-2">
+                {cmdKey}Enter to continue
+              </p>
             </div>
-          </div>
-          <textarea value={jobDescription} onChange={(e) => {
-              const val = e.target.value;
-              // If user pastes a URL into the JD box, treat it as a job URL
-              if (val.match(/^https?:\/\/\S+$/) && val.trim() === val && !jobDescription) {
-                setJobDescription("");
-                handleJobUrlChange(val.trim());
-                return;
-              }
-              setJobDescription(val);
-            }}
-            placeholder="Paste a job URL or the full job description here..."
-            className="w-full flex-1 min-h-[180px] px-3 py-2 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted-foreground/50 resize-y" />
-        </div>
 
-        <div className="grid grid-cols-2 gap-3">
-          <button onClick={handleGenerate} disabled={generating || !jobDescription.trim()}
-            className="h-10 bg-accent text-accent-foreground text-sm font-medium rounded-lg hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed">
-            {generating ? "Generating..." : "Generate Message"}
-          </button>
-          <button onClick={handleTailor} disabled={tailoring || !jobDescription.trim()}
-            className="h-10 border border-accent text-accent text-sm font-medium rounded-lg hover:bg-accent/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
-            {tailoring ? "Optimizing..." : "Tailor Resume"}
-          </button>
-        </div>
-
-        {/* Usage indicator */}
-        {usage && usage.message_generation.limit !== null && (
-          <div className="flex items-center gap-4 text-xs text-muted-foreground">
-            <div className="flex items-center gap-2 flex-1">
-              <span className="shrink-0">Messages</span>
-              <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
-                <div className="h-full bg-accent rounded-full transition-all" style={{ width: `${Math.min(100, (usage.message_generation.used / usage.message_generation.limit) * 100)}%` }} />
+            {/* Usage */}
+            {usage && usage.message_generation.limit !== null && (
+              <div className="flex items-center gap-4 text-xs text-muted-foreground pt-2 border-t border-border">
+                <div className="flex items-center gap-2 flex-1">
+                  <span className="shrink-0">Messages</span>
+                  <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
+                    <div className="h-full bg-accent rounded-full transition-all" style={{ width: `${Math.min(100, (usage.message_generation.used / usage.message_generation.limit) * 100)}%` }} />
+                  </div>
+                  <span className="shrink-0 font-mono">{usage.message_generation.used}/{usage.message_generation.limit}</span>
+                </div>
+                <div className="flex items-center gap-2 flex-1">
+                  <span className="shrink-0">Resumes</span>
+                  <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
+                    <div className="h-full bg-accent rounded-full transition-all" style={{ width: `${Math.min(100, (usage.resume_tailor.used / (usage.resume_tailor.limit || 1)) * 100)}%` }} />
+                  </div>
+                  <span className="shrink-0 font-mono">{usage.resume_tailor.used}/{usage.resume_tailor.limit}</span>
+                </div>
+                {usage.tier === "free" && <a href="/pricing" className="text-accent hover:underline shrink-0">Upgrade</a>}
               </div>
-              <span className="shrink-0 font-mono">{usage.message_generation.used}/{usage.message_generation.limit}</span>
-            </div>
-            <div className="flex items-center gap-2 flex-1">
-              <span className="shrink-0">Resumes</span>
-              <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
-                <div className="h-full bg-accent rounded-full transition-all" style={{ width: `${Math.min(100, (usage.resume_tailor.used / (usage.resume_tailor.limit || 1)) * 100)}%` }} />
-              </div>
-              <span className="shrink-0 font-mono">{usage.resume_tailor.used}/{usage.resume_tailor.limit}</span>
-            </div>
-            {usage.tier === "free" && (
-              <a href="/pricing" className="text-accent hover:underline shrink-0">Upgrade</a>
             )}
           </div>
-        )}
-      </div>
+        </div>
+      )}
 
-      {/* ═══ RIGHT — Viewer (starts at very top) ═══ */}
-      <div className="xl:pl-6 flex flex-col min-h-0 py-4">
-
-        {/* Tab bar + compact ATS score (always at top) */}
-        <div className="shrink-0">
-          {hasRightContent ? (
-            <div className="flex items-center justify-between border-b border-border">
-              <div className="flex">
-                <button onClick={() => setActiveTab("message")}
-                  className={`px-4 py-2.5 text-sm font-medium border-b-2 transition-colors ${activeTab === "message" ? "border-accent text-accent" : "border-transparent text-muted-foreground hover:text-foreground"}`}>
-                  Message
-                  {result && <span className="ml-1.5 text-[10px] px-1.5 py-0.5 rounded bg-accent/10 text-accent">{isSent ? "sent" : "ready"}</span>}
-                </button>
-                <button onClick={() => setActiveTab("resume")}
-                  className={`px-4 py-2.5 text-sm font-medium border-b-2 transition-colors ${activeTab === "resume" ? "border-accent text-accent" : "border-transparent text-muted-foreground hover:text-foreground"}`}>
-                  Resume
-                  {tailorResult && <span className="ml-1.5 text-[10px] px-1.5 py-0.5 rounded bg-green-500/10 text-green-500">+{Math.round(tailorResult.optimized_ats_score - tailorResult.original_ats_score)} ATS</span>}
-                  {tailoring && <span className="ml-1.5 text-[10px] px-1.5 py-0.5 rounded bg-accent/10 text-accent animate-pulse">optimizing</span>}
-                </button>
-              </div>
-              {/* Compact ATS score in tab bar */}
-              {activeTab === "resume" && tailorResult && (
-                <div className="flex items-center gap-3 pr-1 text-xs">
-                  <span className="text-muted-foreground">ATS</span>
-                  <span className="font-mono font-bold">{Math.round(tailorResult.original_ats_score)}</span>
-                  <svg className="w-3.5 h-3.5 text-muted-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" /></svg>
-                  <span className="font-mono font-bold text-accent">{Math.round(tailorResult.optimized_ats_score)}</span>
-                  <span className="text-green-500 font-medium">(+{Math.round(tailorResult.optimized_ats_score - tailorResult.original_ats_score)})</span>
-                </div>
-              )}
+      {/* ═══════════════════════════════════════════════════════════════════ */}
+      {/* STEP 2 — Review                                                   */}
+      {/* ═══════════════════════════════════════════════════════════════════ */}
+      {step === 2 && (
+        <div className="flex-1 min-h-0 flex flex-col">
+          {/* Header with back/forward nav */}
+          <div className="shrink-0 flex items-center justify-between pb-3 border-b border-border">
+            <button onClick={() => setStep(1)} className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors">
+              <ArrowLeft className="w-3.5 h-3.5" /> Back
+            </button>
+            <div className="flex gap-1">
+              <button onClick={() => setActiveTab("message")}
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${activeTab === "message" ? "bg-foreground/[0.08] text-foreground" : "text-muted-foreground hover:text-foreground"}`}>
+                Message
+                {result && <span className="ml-1.5 text-[10px] px-1 py-0.5 rounded bg-accent/10 text-accent">{isSent ? "sent" : "ready"}</span>}
+              </button>
+              <button onClick={() => setActiveTab("resume")}
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${activeTab === "resume" ? "bg-foreground/[0.08] text-foreground" : "text-muted-foreground hover:text-foreground"}`}>
+                Resume
+                {tailorResult && <span className="ml-1.5 text-[10px] px-1 py-0.5 rounded bg-green-500/10 text-green-500">+{Math.round(tailorResult.optimized_ats_score - tailorResult.original_ats_score)} ATS</span>}
+                {tailoring && <span className="ml-1.5 text-[10px] px-1 py-0.5 rounded bg-accent/10 text-accent animate-pulse">optimizing</span>}
+              </button>
             </div>
-          ) : (
-            <div className="border-b border-border py-2.5 px-1">
-              <p className="text-sm text-muted-foreground">Preview</p>
+            <button onClick={advanceToStep3} disabled={!result}
+              className="flex items-center gap-1.5 text-sm font-medium text-accent hover:text-accent/80 transition-colors disabled:opacity-30 disabled:cursor-not-allowed">
+              Send <ArrowRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          {/* Resume sub-nav */}
+          {activeTab === "resume" && tailorResult && (
+            <div className="shrink-0 px-1 py-2 border-b border-border flex items-center justify-between">
+              <div className="flex items-center gap-1">
+                {(["tailored", "original", "diff"] as const).map((view) => (
+                  <button key={view} onClick={() => view === "original" ? handleViewOriginalPdf() : setPdfView(view)}
+                    className={`px-3 py-1 text-xs rounded-md transition-colors ${pdfView === view ? "bg-accent/10 text-accent font-medium" : "text-muted-foreground hover:text-foreground"}`}>
+                    {view === "tailored" ? "Tailored PDF" : view === "original" ? "Original PDF" : `Diff (${tailorResult.changes.length})`}
+                  </button>
+                ))}
+              </div>
+              <div className="flex items-center gap-3 text-xs">
+                <span className="text-muted-foreground">ATS</span>
+                <span className="font-mono font-bold">{Math.round(tailorResult.original_ats_score)}</span>
+                <ArrowRight className="w-3 h-3 text-muted-foreground" />
+                <span className="font-mono font-bold text-accent">{Math.round(tailorResult.optimized_ats_score)}</span>
+                <span className="text-green-500 font-medium">(+{Math.round(tailorResult.optimized_ats_score - tailorResult.original_ats_score)})</span>
+              </div>
             </div>
           )}
-        </div>
 
-        {/* Resume sub-nav: Tailored / Original / Diff */}
-        {activeTab === "resume" && tailorResult && (
-          <div className="shrink-0 px-1 py-2 border-b border-border flex items-center gap-1">
-            {(["tailored", "original", "diff"] as const).map((view) => (
-              <button key={view} onClick={() => view === "original" ? handleViewOriginalPdf() : setPdfView(view)}
-                className={`px-3 py-1 text-xs rounded-md transition-colors ${pdfView === view ? "bg-accent/10 text-accent font-medium" : "text-muted-foreground hover:text-foreground"}`}>
-                {view === "tailored" ? "Tailored PDF" : view === "original" ? "Original PDF" : `Diff (${tailorResult.changes.length})`}
-              </button>
-            ))}
-          </div>
-        )}
+          {/* Content area */}
+          <div className="flex-1 min-h-0 flex flex-col overflow-hidden pt-3">
 
-        {/* Content — fills all remaining height */}
-        <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
-
-          {/* ── MESSAGE TAB ── */}
-          {activeTab === "message" && (
-            <div className="flex-1 min-h-0 flex flex-col">
-              {generating ? (
-                streamedText ? (
-                  <div className="flex-1 flex flex-col border border-accent/30 rounded-lg overflow-hidden mt-2">
-                    <div className="px-4 py-3 border-b border-border flex items-center gap-2 shrink-0">
-                      <div className="h-2 w-2 bg-accent rounded-full animate-pulse" />
-                      <p className="text-sm font-medium text-muted-foreground">Generating...</p>
+            {/* MESSAGE TAB */}
+            {activeTab === "message" && (
+              <div className="flex-1 min-h-0 flex flex-col">
+                {generating ? (
+                  streamedText ? (
+                    <div className="flex-1 flex flex-col border border-accent/30 rounded-lg overflow-hidden">
+                      <div className="px-4 py-3 border-b border-border flex items-center gap-2 shrink-0">
+                        <div className="h-2 w-2 bg-accent rounded-full animate-pulse" />
+                        <p className="text-sm font-medium text-muted-foreground">Generating message...</p>
+                      </div>
+                      <div className="px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap flex-1 overflow-y-auto">
+                        {streamedText}
+                        <span className="inline-block w-2 h-4 bg-accent/70 animate-pulse ml-0.5 align-text-bottom" />
+                      </div>
                     </div>
-                    <div className="px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap flex-1 overflow-y-auto">
-                      {streamedText}
-                      <span className="inline-block w-2 h-4 bg-accent/70 animate-pulse ml-0.5 align-text-bottom" />
+                  ) : (
+                    <div className="border border-border rounded-lg p-6 space-y-3 animate-pulse">
+                      <div className="h-4 bg-muted rounded w-1/3" />
+                      <div className="h-3 bg-muted rounded w-full" />
+                      <div className="h-3 bg-muted rounded w-5/6" />
+                      <div className="h-3 bg-muted rounded w-4/6" />
+                      <div className="h-3 bg-muted rounded w-full" />
+                      <div className="h-3 bg-muted rounded w-3/4" />
+                    </div>
+                  )
+                ) : result ? (
+                  <div className="flex-1 flex flex-col border border-border rounded-lg overflow-hidden min-h-0">
+                    <div className="px-4 py-3 border-b border-border flex items-center justify-between shrink-0">
+                      <div>
+                        <p className="text-sm font-medium">{result.company_name || "Application"}</p>
+                        <p className="text-xs text-muted-foreground">{result.position_title || result.message_type}</p>
+                      </div>
+                      <span className="text-[10px] font-medium px-2 py-0.5 rounded bg-accent/10 text-accent">
+                        {result.status.replace("_", " ")}
+                      </span>
+                    </div>
+                    <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap">
+                      {editedMessage}
+                    </div>
+                    <div className="px-4 py-2 border-t border-border shrink-0 flex items-center justify-between">
+                      <p className="text-[10px] text-muted-foreground">{cmdKey}Enter to continue to send</p>
+                      <button onClick={() => { lastGeneratedJdRef.current = ""; handleGenerate(); }}
+                        className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors">
+                        <RotateCcw className="w-3 h-3" /> Regenerate
+                      </button>
                     </div>
                   </div>
                 ) : (
-                  <div className="border border-border rounded-lg p-6 space-y-3 animate-pulse mt-2">
-                    <div className="h-4 bg-muted rounded w-1/3" />
-                    <div className="h-3 bg-muted rounded w-full" />
-                    <div className="h-3 bg-muted rounded w-5/6" />
-                    <div className="h-3 bg-muted rounded w-4/6" />
-                    <div className="h-3 bg-muted rounded w-full" />
-                    <div className="h-3 bg-muted rounded w-3/4" />
-                  </div>
-                )
-              ) : result ? (
-                <div className="flex-1 flex flex-col border border-border rounded-lg overflow-hidden mt-2 min-h-0">
-                  <div className="px-4 py-3 border-b border-border flex items-center justify-between shrink-0">
-                    <div>
-                      <p className="text-sm font-medium">{result.company_name || "Application"}</p>
-                      <p className="text-xs text-muted-foreground">{result.position_title || result.message_type}</p>
+                  <div className="flex-1 border border-dashed border-border rounded-lg flex items-center justify-center">
+                    <div className="text-center space-y-2">
+                      <div className="w-8 h-8 border-2 border-accent border-t-transparent rounded-full animate-spin mx-auto" />
+                      <p className="text-sm text-muted-foreground">Starting generation...</p>
                     </div>
-                    <span className={`text-[10px] font-medium px-2 py-0.5 rounded ${isSent ? "bg-green-500/10 text-green-500" : "bg-accent/10 text-accent"}`}>
-                      {isSent ? "sent" : result.status.replace("_", " ")}
-                    </span>
                   </div>
-                  <div className="px-4 py-2 border-b border-border shrink-0">
-                    <label className="text-[10px] text-muted-foreground uppercase tracking-wider">Subject</label>
-                    <input value={editedSubject} onChange={(e) => setEditedSubject(e.target.value)} disabled={isSent}
-                      className="w-full text-sm bg-transparent border-none focus:outline-none mt-0.5 disabled:opacity-60" placeholder="Email subject line..." />
-                  </div>
-                  <div className="px-4 py-2 border-b border-border shrink-0">
-                    <label className="text-[10px] text-muted-foreground uppercase tracking-wider">To</label>
-                    <input type="email" value={editedRecipient} onChange={(e) => setEditedRecipient(e.target.value)} disabled={isSent}
-                      className="w-full text-sm bg-transparent border-none focus:outline-none mt-0.5 disabled:opacity-60" placeholder="recruiter@company.com" />
-                  </div>
-                  <textarea value={editedMessage} onChange={(e) => setEditedMessage(e.target.value)} disabled={isSent}
-                    className="w-full flex-1 min-h-0 px-4 py-3 text-sm bg-background border-none focus:outline-none resize-none leading-relaxed disabled:opacity-60" />
-                  {tailorResult && !isSent && (
-                    <div className="px-4 py-2 border-t border-border shrink-0">
-                      <label className="flex items-center gap-2 text-sm cursor-pointer">
-                        <input type="checkbox" checked={attachTailored} onChange={(e) => setAttachTailored(e.target.checked)} className="rounded border-border" />
-                        <span className="text-muted-foreground">Attach tailored resume <span className="text-[10px] text-green-500 ml-1">(ATS {Math.round(tailorResult.optimized_ats_score)})</span></span>
-                      </label>
+                )}
+              </div>
+            )}
+
+            {/* RESUME TAB */}
+            {activeTab === "resume" && (
+              <div className="flex-1 min-h-0 flex flex-col">
+                {tailoring ? (
+                  <div className="flex-1 border border-border rounded-lg flex items-center justify-center">
+                    <div className="text-center space-y-4">
+                      <div className="w-8 h-8 border-2 border-accent border-t-transparent rounded-full animate-spin mx-auto" />
+                      <p className="text-sm font-medium">Optimizing your resume...</p>
+                      <p className="text-xs text-muted-foreground">Preserving exact formatting. 30-60 seconds.</p>
                     </div>
-                  )}
-                  <div className="px-4 py-3 border-t border-border flex items-center gap-2 shrink-0">
-                    {isSent ? (
-                      <div className="flex items-center gap-2 text-sm text-green-500">
-                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-                        Email sent {result.resume_id && <span className="text-xs text-muted-foreground ml-1">with resume attached</span>}
-                      </div>
-                    ) : (
-                      <button onClick={handleSend} disabled={sending || !editedRecipient.trim()}
-                        className="px-4 py-2 text-sm font-medium bg-accent text-accent-foreground rounded-md hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed">
-                        {sending ? "Sending..." : "Send Email"}
+                  </div>
+                ) : tailorResult ? (
+                  <div className="flex-1 flex flex-col min-h-0">
+                    <div className="flex-1 min-h-0 relative rounded-lg overflow-hidden border border-border">
+                      {pdfView === "tailored" && (
+                        tailoredPdfBlobUrl ? (
+                          <iframe src={tailoredPdfBlobUrl} className="absolute inset-0 w-full h-full border-0" title="Tailored Resume PDF" />
+                        ) : (
+                          <div className="absolute inset-0 flex items-center justify-center">
+                            <div className="text-center space-y-2">
+                              <div className="w-6 h-6 border-2 border-accent border-t-transparent rounded-full animate-spin mx-auto" />
+                              <p className="text-xs text-muted-foreground">Loading PDF...</p>
+                            </div>
+                          </div>
+                        )
+                      )}
+                      {pdfView === "original" && (
+                        loadingPdf ? (
+                          <div className="absolute inset-0 flex items-center justify-center">
+                            <div className="text-center space-y-2">
+                              <div className="w-6 h-6 border-2 border-accent border-t-transparent rounded-full animate-spin mx-auto" />
+                              <p className="text-xs text-muted-foreground">Loading original PDF...</p>
+                            </div>
+                          </div>
+                        ) : originalPdfBlobUrl ? (
+                          <iframe src={originalPdfBlobUrl} className="absolute inset-0 w-full h-full border-0" title="Original Resume PDF" />
+                        ) : (
+                          <div className="absolute inset-0 flex items-center justify-center">
+                            <p className="text-xs text-muted-foreground">Could not load original PDF</p>
+                          </div>
+                        )
+                      )}
+                      {pdfView === "diff" && (
+                        diffPdfBlobUrl ? (
+                          <iframe src={diffPdfBlobUrl} className="absolute inset-0 w-full h-full border-0" title="Resume Diff" />
+                        ) : (
+                          <div className="absolute inset-0 flex items-center justify-center">
+                            <div className="text-center space-y-2">
+                              <div className="w-6 h-6 border-2 border-accent border-t-transparent rounded-full animate-spin mx-auto" />
+                              <p className="text-xs text-muted-foreground">Loading diff PDF...</p>
+                            </div>
+                          </div>
+                        )
+                      )}
+                    </div>
+                    <div className="px-1 py-2 flex items-center gap-3 shrink-0">
+                      <button onClick={handleDownloadTailored}
+                        className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-accent text-accent-foreground rounded-md hover:opacity-90 transition-opacity">
+                        <Download className="w-3 h-3" /> Download PDF
                       </button>
-                    )}
-                    <button onClick={handleReset} className="px-4 py-2 text-sm text-muted-foreground hover:text-foreground transition-colors">
-                      {isSent ? "New Message" : "Discard"}
-                    </button>
+                      <button onClick={() => { setTailorResult(null); setAttachTailored(false); revokeAllBlobs(); handleTailor(); }}
+                        className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors">
+                        <RotateCcw className="w-3 h-3" /> Re-tailor
+                      </button>
+                    </div>
                   </div>
-                </div>
-              ) : (
-                <div className="flex-1 border border-dashed border-border rounded-lg flex items-center justify-center mt-2">
-                  <p className="text-sm text-muted-foreground text-center">
-                    Paste a job description and click Generate<br />
-                    <span className="text-xs opacity-60">The AI will craft a personalized message using your resume</span>
-                  </p>
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* ── RESUME TAB ── */}
-          {activeTab === "resume" && (
-            <div className="flex-1 min-h-0 flex flex-col">
-              {tailoring ? (
-                <div className="flex-1 border border-border rounded-lg flex items-center justify-center mt-2">
-                  <div className="text-center space-y-4">
-                    <div className="w-8 h-8 border-2 border-accent border-t-transparent rounded-full animate-spin mx-auto" />
-                    <p className="text-sm font-medium">Optimizing your resume...</p>
-                    <p className="text-xs text-muted-foreground">Preserving exact formatting. 30-60 seconds.</p>
+                ) : !selectedResumeId ? (
+                  <div className="flex-1 border border-dashed border-border rounded-lg flex items-center justify-center">
+                    <p className="text-sm text-muted-foreground text-center">
+                      No resume selected<br />
+                      <span className="text-xs opacity-60">Go back and select a resume to tailor</span>
+                    </p>
                   </div>
-                </div>
-              ) : tailorResult ? (
-                <div className="flex-1 flex flex-col min-h-0">
-                  {/* PDF viewer — fills all space */}
-                  <div className="flex-1 min-h-0 relative mt-2 rounded-lg overflow-hidden border border-border">
-                    {pdfView === "tailored" && (
-                      tailoredPdfBlobUrl ? (
-                        <iframe src={tailoredPdfBlobUrl} className="absolute inset-0 w-full h-full border-0" title="Tailored Resume PDF" />
-                      ) : (
-                        <div className="absolute inset-0 flex items-center justify-center">
-                          <div className="text-center space-y-2">
-                            <div className="w-6 h-6 border-2 border-accent border-t-transparent rounded-full animate-spin mx-auto" />
-                            <p className="text-xs text-muted-foreground">Loading PDF...</p>
-                          </div>
-                        </div>
-                      )
-                    )}
-                    {pdfView === "original" && (
-                      loadingPdf ? (
-                        <div className="absolute inset-0 flex items-center justify-center">
-                          <div className="text-center space-y-2">
-                            <div className="w-6 h-6 border-2 border-accent border-t-transparent rounded-full animate-spin mx-auto" />
-                            <p className="text-xs text-muted-foreground">Loading original PDF...</p>
-                          </div>
-                        </div>
-                      ) : originalPdfBlobUrl ? (
-                        <iframe src={originalPdfBlobUrl} className="absolute inset-0 w-full h-full border-0" title="Original Resume PDF" />
-                      ) : (
-                        <div className="absolute inset-0 flex items-center justify-center">
-                          <p className="text-xs text-muted-foreground">Could not load original PDF</p>
-                        </div>
-                      )
-                    )}
-                    {pdfView === "diff" && (
-                      diffPdfBlobUrl ? (
-                        <iframe src={diffPdfBlobUrl} className="absolute inset-0 w-full h-full border-0" title="Resume Diff — green highlights show changes" />
-                      ) : (
-                        <div className="absolute inset-0 flex items-center justify-center">
-                          <div className="text-center space-y-2">
-                            <div className="w-6 h-6 border-2 border-accent border-t-transparent rounded-full animate-spin mx-auto" />
-                            <p className="text-xs text-muted-foreground">Loading diff PDF...</p>
-                          </div>
-                        </div>
-                      )
-                    )}
+                ) : (
+                  <div className="flex-1 border border-dashed border-border rounded-lg flex items-center justify-center">
+                    <div className="text-center space-y-3">
+                      <p className="text-sm text-muted-foreground">Resume tailoring will start automatically</p>
+                      <button onClick={handleTailor}
+                        className="text-xs text-accent hover:text-accent/80 transition-colors">
+                        Start manually
+                      </button>
+                    </div>
                   </div>
-
-                  {/* Actions bar */}
-                  <div className="px-1 py-3 flex items-center gap-3 shrink-0">
-                    <button onClick={handleDownloadTailored}
-                      className="px-4 py-2 text-sm font-medium bg-accent text-accent-foreground rounded-md hover:opacity-90 transition-opacity">
-                      Download PDF
-                    </button>
-                    <button onClick={() => { setTailorResult(null); setAttachTailored(false); revokeAllBlobs(); }}
-                      className="px-4 py-2 text-sm text-muted-foreground hover:text-foreground transition-colors">
-                      Re-tailor
-                    </button>
-                    {result && (
-                      <label className="flex items-center gap-2 text-sm cursor-pointer ml-auto">
-                        <input type="checkbox" checked={attachTailored} onChange={(e) => setAttachTailored(e.target.checked)} className="rounded border-border" />
-                        <span className="text-muted-foreground">Attach to email</span>
-                      </label>
-                    )}
-                  </div>
-                </div>
-              ) : (
-                <div className="flex-1 border border-dashed border-border rounded-lg flex items-center justify-center mt-2">
-                  <p className="text-sm text-muted-foreground text-center">
-                    Click &quot;Tailor Resume&quot; to optimize for this JD<br />
-                    <span className="text-xs opacity-60">Preserves exact formatting while boosting ATS keyword match</span>
-                  </p>
-                </div>
-              )}
-            </div>
-          )}
+                )}
+              </div>
+            )}
+          </div>
         </div>
-      </div>
+      )}
+
+      {/* ═══════════════════════════════════════════════════════════════════ */}
+      {/* STEP 3 — Send                                                     */}
+      {/* ═══════════════════════════════════════════════════════════════════ */}
+      {step === 3 && (
+        <div className="flex-1 overflow-y-auto">
+          <div className="max-w-2xl mx-auto pb-8">
+            {/* Back button */}
+            <button onClick={() => setStep(2)} className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors mb-4">
+              <ArrowLeft className="w-3.5 h-3.5" /> Back to review
+            </button>
+
+            {isSent ? (
+              /* ── Success + Next Actions ── */
+              <div className="space-y-6 animate-fade-in">
+                <div className="card-elevated p-8 text-center">
+                  <div className="w-12 h-12 rounded-full bg-green-500/10 flex items-center justify-center mx-auto mb-4">
+                    <Check className="w-6 h-6 text-green-500" />
+                  </div>
+                  <h2 className="text-xl font-bold">Email Sent!</h2>
+                  <p className="text-sm text-muted-foreground mt-2">
+                    Your application to <span className="text-foreground font-medium">{result?.company_name || "the company"}</span>
+                    {result?.position_title && <> for <span className="text-foreground font-medium">{result.position_title}</span></>}
+                    {" "}has been sent to <span className="text-foreground font-medium">{editedRecipient}</span>
+                  </p>
+                  {attachTailored && tailorResult && (
+                    <p className="text-xs text-green-500 mt-1">
+                      Tailored resume attached (ATS score: {Math.round(tailorResult.optimized_ats_score)})
+                    </p>
+                  )}
+                </div>
+
+                <div>
+                  <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-3">What&apos;s next?</h3>
+                  <div className="grid grid-cols-3 gap-3">
+                    <Link href="/jobs" className="card-interactive p-4 text-center group">
+                      <Search className="w-5 h-5 text-accent mx-auto mb-2 group-hover:scale-110 transition-transform" />
+                      <p className="text-sm font-medium">Search More Jobs</p>
+                      <p className="text-[10px] text-muted-foreground mt-1">Find your next opportunity</p>
+                    </Link>
+                    <Link href={`/applications/${result?.id}`} className="card-interactive p-4 text-center group">
+                      <SendIcon className="w-5 h-5 text-accent mx-auto mb-2 group-hover:scale-110 transition-transform" />
+                      <p className="text-sm font-medium">View Application</p>
+                      <p className="text-[10px] text-muted-foreground mt-1">Track your application</p>
+                    </Link>
+                    <Link href="/dashboard" className="card-interactive p-4 text-center group">
+                      <LayoutDashboard className="w-5 h-5 text-accent mx-auto mb-2 group-hover:scale-110 transition-transform" />
+                      <p className="text-sm font-medium">Dashboard</p>
+                      <p className="text-[10px] text-muted-foreground mt-1">Back to overview</p>
+                    </Link>
+                  </div>
+                </div>
+
+                <div className="text-center pt-4">
+                  <button onClick={handleFullReset} className="text-sm text-accent hover:text-accent/80 transition-colors">
+                    Start a new application
+                  </button>
+                </div>
+              </div>
+            ) : (
+              /* ── Send form ── */
+              <div className="space-y-5">
+                <div>
+                  <h1 className="text-2xl font-bold tracking-tight">Send Application</h1>
+                  <p className="text-sm text-muted-foreground mt-1">Review and send your message</p>
+                </div>
+
+                {/* Subject */}
+                <div>
+                  <label className="block text-xs font-medium text-muted-foreground mb-1.5">Subject Line</label>
+                  <input value={editedSubject} onChange={(e) => setEditedSubject(e.target.value)}
+                    placeholder="Email subject..."
+                    className="w-full h-9 px-3 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted-foreground/50" />
+                </div>
+
+                {/* Recipient */}
+                <div>
+                  <label className="block text-xs font-medium text-muted-foreground mb-1.5">Recipient Email *</label>
+                  <input type="email" value={editedRecipient} onChange={(e) => setEditedRecipient(e.target.value)}
+                    placeholder="recruiter@company.com"
+                    className="w-full h-9 px-3 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted-foreground/50" />
+                </div>
+
+                {/* Message body */}
+                <div>
+                  <label className="block text-xs font-medium text-muted-foreground mb-1.5">Message</label>
+                  <textarea value={editedMessage} onChange={(e) => setEditedMessage(e.target.value)}
+                    className="w-full min-h-[280px] px-3 py-2.5 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-accent/50 resize-y leading-relaxed" />
+                </div>
+
+                {/* Attach resume toggle */}
+                {tailorResult && (
+                  <label className="flex items-center gap-3 p-3 border border-border rounded-lg cursor-pointer hover:bg-muted/30 transition-colors">
+                    <input type="checkbox" checked={attachTailored} onChange={(e) => setAttachTailored(e.target.checked)} className="rounded border-border" />
+                    <div>
+                      <p className="text-sm">Attach tailored resume</p>
+                      <p className="text-[10px] text-muted-foreground">ATS score: {Math.round(tailorResult.optimized_ats_score)} (+{Math.round(tailorResult.optimized_ats_score - tailorResult.original_ats_score)} improvement)</p>
+                    </div>
+                  </label>
+                )}
+
+                {/* Send CTA */}
+                <div className="pt-2">
+                  <button onClick={handleSend} disabled={sending || !editedRecipient.trim()}
+                    className="w-full h-11 btn-gradient text-sm font-medium rounded-lg flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed">
+                    <SendIcon className="w-4 h-4" />
+                    {sending ? "Sending..." : "Send Email"}
+                  </button>
+                  <p className="text-[10px] text-muted-foreground/50 text-center mt-2">
+                    {cmdKey}Enter to send &middot; {cmdKey}Shift+Enter to quick-send from anywhere &middot; Esc to go back
+                  </p>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

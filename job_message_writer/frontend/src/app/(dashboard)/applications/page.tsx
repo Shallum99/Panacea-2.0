@@ -14,6 +14,8 @@ import {
   MessageCircle,
   XCircle,
   Inbox,
+  ArrowRight,
+  Zap,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -91,6 +93,165 @@ function truncateEmail(email: string | null, max = 24): string {
   return email.slice(0, max - 1) + "\u2026";
 }
 
+function timeAgo(dateStr: string | null): string {
+  if (!dateStr) return "";
+  const diff = Date.now() - new Date(dateStr).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+// ---------------------------------------------------------------------------
+// Next-action helpers
+// ---------------------------------------------------------------------------
+
+function NextActionHint({ app }: { app: Application }) {
+  switch (app.status) {
+    case "message_generated":
+      return (
+        <span className="text-[11px] text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1">
+          Review and approve this message
+          <ArrowRight className="w-2.5 h-2.5" />
+        </span>
+      );
+    case "approved":
+      return (
+        <span className="text-[11px] text-accent opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1">
+          Ready to send &mdash; Send email
+          <Send className="w-2.5 h-2.5" />
+        </span>
+      );
+    case "sent":
+      return (
+        <span className="text-[11px] text-muted-foreground/60">
+          Waiting for response &middot; Sent {timeAgo(app.sent_at)}
+        </span>
+      );
+    case "opened":
+      return (
+        <span className="text-[11px] text-emerald-400/80 opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1">
+          They opened your email! Follow up?
+          <ArrowRight className="w-2.5 h-2.5" />
+        </span>
+      );
+    case "replied":
+      return (
+        <span className="text-[11px] text-success opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1">
+          They replied! View conversation
+          <ArrowRight className="w-2.5 h-2.5" />
+        </span>
+      );
+    case "failed":
+      return (
+        <span className="text-[11px] text-destructive flex items-center gap-1">
+          Sending failed &mdash; Retry
+          <ArrowRight className="w-2.5 h-2.5" />
+        </span>
+      );
+    default:
+      return null;
+  }
+}
+
+function BoardCardAction({ app }: { app: Application }) {
+  switch (app.status) {
+    case "message_generated":
+      return (
+        <span className="text-[10px] text-accent hover:underline">Review</span>
+      );
+    case "approved":
+      return (
+        <span className="text-[10px] font-medium text-accent hover:underline flex items-center gap-0.5">
+          <Send className="w-2.5 h-2.5" />
+          Send
+        </span>
+      );
+    case "sent":
+      return (
+        <span className="text-[10px] text-muted-foreground/50">
+          Awaiting...
+        </span>
+      );
+    case "opened":
+      return (
+        <span className="text-[10px] text-emerald-400 hover:underline">
+          Follow up
+        </span>
+      );
+    case "replied":
+      return (
+        <span className="text-[10px] text-success hover:underline">View</span>
+      );
+    default:
+      return null;
+  }
+}
+
+function SummaryBanner({
+  applications,
+  onFilterChange,
+}: {
+  applications: Application[];
+  onFilterChange: (status: string) => void;
+}) {
+  const readyToSend = applications.filter(
+    (a) => a.status === "message_generated" || a.status === "approved"
+  ).length;
+  const opened = applications.filter((a) => a.status === "opened").length;
+  const allSentOrWaiting =
+    applications.length > 0 &&
+    readyToSend === 0 &&
+    opened === 0 &&
+    applications.every((a) =>
+      ["sent", "delivered", "sending", "replied"].includes(a.status)
+    );
+
+  if (readyToSend === 0 && opened === 0 && !allSentOrWaiting) return null;
+
+  return (
+    <div className="space-y-2">
+      {readyToSend > 0 && (
+        <button
+          onClick={() => onFilterChange("approved")}
+          className="w-full flex items-center gap-3 px-4 py-2.5 rounded-lg bg-card border-l-2 border-accent text-left transition-colors hover:bg-card-hover"
+        >
+          <Zap className="w-3.5 h-3.5 text-accent shrink-0" />
+          <span className="text-xs text-foreground">
+            <span className="font-medium">{readyToSend} application{readyToSend !== 1 ? "s" : ""}</span>{" "}
+            <span className="text-muted-foreground">ready to send</span>
+          </span>
+          <ArrowRight className="w-3 h-3 text-muted-foreground ml-auto" />
+        </button>
+      )}
+      {opened > 0 && (
+        <button
+          onClick={() => onFilterChange("opened")}
+          className="w-full flex items-center gap-3 px-4 py-2.5 rounded-lg bg-card border-l-2 border-emerald-400 text-left transition-colors hover:bg-card-hover"
+        >
+          <Eye className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+          <span className="text-xs text-foreground">
+            <span className="font-medium">{opened} email{opened !== 1 ? "s" : ""} opened</span>{" "}
+            <span className="text-muted-foreground">&mdash; consider following up</span>
+          </span>
+          <ArrowRight className="w-3 h-3 text-muted-foreground ml-auto" />
+        </button>
+      )}
+      {allSentOrWaiting && (
+        <div className="flex items-center gap-3 px-4 py-2.5 rounded-lg bg-card border-l-2 border-success">
+          <CheckCircle className="w-3.5 h-3.5 text-success shrink-0" />
+          <span className="text-xs text-muted-foreground">
+            All caught up! Your applications are in progress.
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Sub-components
 // ---------------------------------------------------------------------------
@@ -138,6 +299,9 @@ function BoardCard({ app }: { app: Application }) {
       <div className="flex items-center justify-between text-[11px] text-muted-foreground pt-1">
         <span>{truncateEmail(app.recipient_email)}</span>
         <span className="shrink-0 ml-2">{formatDate(app.created_at)}</span>
+      </div>
+      <div className="pt-0.5">
+        <BoardCardAction app={app} />
       </div>
     </Link>
   );
@@ -204,7 +368,7 @@ function ListView({ applications }: { applications: Application[] }) {
         <Link
           key={app.id}
           href={`/applications/${app.id}`}
-          className="card-interactive block p-4"
+          className="card-interactive group block p-4"
         >
           <div className="flex items-center justify-between">
             <div className="space-y-1 min-w-0">
@@ -225,6 +389,7 @@ function ListView({ applications }: { applications: Application[] }) {
                 {app.recipient_email && <span>{app.recipient_email}</span>}
                 {app.created_at && <span>{formatDate(app.created_at)}</span>}
               </div>
+              <NextActionHint app={app} />
             </div>
             <div className="flex items-center gap-3 shrink-0">
               {/* Email tracking timeline */}
@@ -351,6 +516,14 @@ export default function ApplicationsPage() {
           </button>
         ))}
       </div>
+
+      {/* Summary banner */}
+      {!loading && applications.length > 0 && (
+        <SummaryBanner
+          applications={applications}
+          onFilterChange={setStatusFilter}
+        />
+      )}
 
       {/* Content area */}
       {loading ? (
