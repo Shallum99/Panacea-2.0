@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { toast } from "sonner";
 import { createClient } from "@/lib/supabase/client";
-import { getResumes, type Resume } from "@/lib/api/resumes";
+import { getResumes, getResumePdfUrl, type Resume } from "@/lib/api/resumes";
 import {
   streamApplication,
   extractJdFields,
@@ -93,20 +93,6 @@ function DiffView({ change }: { change: TextChange }) {
   );
 }
 
-function OptimizedView({ change }: { change: TextChange }) {
-  const diff = computeWordDiff(change.original, change.optimized);
-  return (
-    <div className="text-sm leading-relaxed">
-      {diff.filter(p => p.type !== "removed").map((part, i) => (
-        <span
-          key={i}
-          className={part.type === "added" ? "bg-green-500/15 text-green-400 font-medium" : ""}
-        >{part.text}</span>
-      ))}
-    </div>
-  );
-}
-
 const MESSAGE_TYPES = [
   { value: "email_detailed", label: "Detailed Email" },
   { value: "email_short", label: "Short Email" },
@@ -153,10 +139,22 @@ export default function GeneratePage() {
 
   // Tab state for right panel
   const [activeTab, setActiveTab] = useState<"message" | "resume">("message");
-  const [diffMode, setDiffMode] = useState<"preview" | "diff">("preview");
+  const [pdfView, setPdfView] = useState<"tailored" | "original" | "changes">("tailored");
+  const [originalPdfBlobUrl, setOriginalPdfBlobUrl] = useState<string | null>(null);
+  const [tailoredPdfBlobUrl, setTailoredPdfBlobUrl] = useState<string | null>(null);
+  const [loadingPdf, setLoadingPdf] = useState(false);
 
   useEffect(() => {
     loadResumes();
+  }, []);
+
+  // Cleanup blob URLs on unmount
+  useEffect(() => {
+    return () => {
+      if (originalPdfBlobUrl) URL.revokeObjectURL(originalPdfBlobUrl);
+      if (tailoredPdfBlobUrl) URL.revokeObjectURL(tailoredPdfBlobUrl);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function loadResumes() {
@@ -287,6 +285,16 @@ export default function GeneratePage() {
       const res = await optimizePDF(jobDescription, selectedResumeId);
       setTailorResult(res);
       setAttachTailored(true);
+      setPdfView("tailored");
+      // Fetch tailored PDF for inline preview
+      try {
+        const url = getDownloadUrl(res.download_id);
+        const blobUrl = await fetchPdfBlob(url);
+        if (tailoredPdfBlobUrl) URL.revokeObjectURL(tailoredPdfBlobUrl);
+        setTailoredPdfBlobUrl(blobUrl);
+      } catch {
+        // PDF preview is non-critical
+      }
       toast.success("Resume optimized");
     } catch (err: unknown) {
       const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
@@ -314,6 +322,32 @@ export default function GeneratePage() {
       URL.revokeObjectURL(a.href);
     } catch {
       toast.error("Download failed");
+    }
+  }
+
+  async function fetchPdfBlob(url: string): Promise<string> {
+    const supabase = createClient();
+    const { data: { session } } = await supabase.auth.getSession();
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${session?.access_token || ""}` },
+    });
+    if (!response.ok) throw new Error("Failed to fetch PDF");
+    const blob = await response.blob();
+    return URL.createObjectURL(blob);
+  }
+
+  async function handleViewOriginalPdf() {
+    setPdfView("original");
+    if (originalPdfBlobUrl || !selectedResumeId) return;
+    setLoadingPdf(true);
+    try {
+      const url = getResumePdfUrl(selectedResumeId);
+      const blobUrl = await fetchPdfBlob(url);
+      setOriginalPdfBlobUrl(blobUrl);
+    } catch {
+      toast.error("Failed to load original PDF");
+    } finally {
+      setLoadingPdf(false);
     }
   }
 
@@ -353,6 +387,9 @@ export default function GeneratePage() {
     setTailorResult(null);
     setAttachTailored(false);
     setActiveTab("message");
+    setPdfView("tailored");
+    if (originalPdfBlobUrl) { URL.revokeObjectURL(originalPdfBlobUrl); setOriginalPdfBlobUrl(null); }
+    if (tailoredPdfBlobUrl) { URL.revokeObjectURL(tailoredPdfBlobUrl); setTailoredPdfBlobUrl(null); }
   }
 
   const isAutoFilled = (field: string, value: string) => {
@@ -775,65 +812,110 @@ export default function GeneratePage() {
                     </div>
                   </div>
 
-                  {/* View toggle: Preview / Diff */}
+                  {/* View toggle: Tailored / Original / Changes */}
                   <div className="px-4 py-2 border-b border-border flex items-center justify-between">
                     <div className="flex gap-1">
                       <button
-                        onClick={() => setDiffMode("preview")}
+                        onClick={() => setPdfView("tailored")}
                         className={`px-3 py-1 text-xs rounded-md transition-colors ${
-                          diffMode === "preview"
+                          pdfView === "tailored"
                             ? "bg-accent/10 text-accent"
                             : "text-muted-foreground hover:text-foreground"
                         }`}
                       >
-                        Preview
+                        Tailored PDF
                       </button>
                       <button
-                        onClick={() => setDiffMode("diff")}
+                        onClick={handleViewOriginalPdf}
                         className={`px-3 py-1 text-xs rounded-md transition-colors ${
-                          diffMode === "diff"
+                          pdfView === "original"
                             ? "bg-accent/10 text-accent"
                             : "text-muted-foreground hover:text-foreground"
                         }`}
                       >
-                        Diff
+                        Original PDF
+                      </button>
+                      <button
+                        onClick={() => setPdfView("changes")}
+                        className={`px-3 py-1 text-xs rounded-md transition-colors ${
+                          pdfView === "changes"
+                            ? "bg-accent/10 text-accent"
+                            : "text-muted-foreground hover:text-foreground"
+                        }`}
+                      >
+                        Changes ({tailorResult.changes.length})
                       </button>
                     </div>
-                    <span className="text-[10px] text-muted-foreground">
-                      {tailorResult.changes.length} changes
-                    </span>
                   </div>
 
-                  {/* Changes list */}
-                  <div className="max-h-[500px] overflow-y-auto divide-y divide-border">
-                    {tailorResult.changes.length === 0 ? (
-                      <div className="p-6 text-center text-sm text-muted-foreground">
-                        No text changes detected
-                      </div>
+                  {/* PDF viewer or Changes list */}
+                  {pdfView === "tailored" && (
+                    tailoredPdfBlobUrl ? (
+                      <iframe
+                        src={tailoredPdfBlobUrl}
+                        className="w-full border-0"
+                        style={{ height: "600px" }}
+                        title="Tailored Resume PDF"
+                      />
                     ) : (
-                      tailorResult.changes.map((change, i) => (
-                        <div key={i} className="px-4 py-3">
-                          <div className="flex items-center gap-2 mb-2">
-                            <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
-                              {change.section}
-                            </span>
-                            <span className={`text-[10px] px-1.5 py-0.5 rounded ${
-                              change.type === "bullet" ? "bg-blue-500/10 text-blue-400" :
-                              change.type === "skill" ? "bg-purple-500/10 text-purple-400" :
-                              "bg-amber-500/10 text-amber-400"
-                            }`}>
-                              {change.type === "bullet" ? "bullet" : change.type === "skill" ? "skills" : "title"}
-                            </span>
-                          </div>
-                          {diffMode === "diff" ? (
-                            <DiffView change={change} />
-                          ) : (
-                            <OptimizedView change={change} />
-                          )}
+                      <div className="flex items-center justify-center py-20">
+                        <div className="text-center space-y-2">
+                          <div className="w-6 h-6 border-2 border-accent border-t-transparent rounded-full animate-spin mx-auto" />
+                          <p className="text-xs text-muted-foreground">Loading PDF preview...</p>
                         </div>
-                      ))
-                    )}
-                  </div>
+                      </div>
+                    )
+                  )}
+
+                  {pdfView === "original" && (
+                    loadingPdf ? (
+                      <div className="flex items-center justify-center py-20">
+                        <div className="text-center space-y-2">
+                          <div className="w-6 h-6 border-2 border-accent border-t-transparent rounded-full animate-spin mx-auto" />
+                          <p className="text-xs text-muted-foreground">Loading original PDF...</p>
+                        </div>
+                      </div>
+                    ) : originalPdfBlobUrl ? (
+                      <iframe
+                        src={originalPdfBlobUrl}
+                        className="w-full border-0"
+                        style={{ height: "600px" }}
+                        title="Original Resume PDF"
+                      />
+                    ) : (
+                      <div className="flex items-center justify-center py-20">
+                        <p className="text-xs text-muted-foreground">Could not load original PDF</p>
+                      </div>
+                    )
+                  )}
+
+                  {pdfView === "changes" && (
+                    <div className="max-h-[600px] overflow-y-auto divide-y divide-border">
+                      {tailorResult.changes.length === 0 ? (
+                        <div className="p-6 text-center text-sm text-muted-foreground">
+                          No text changes detected
+                        </div>
+                      ) : (
+                        tailorResult.changes.map((change, i) => (
+                          <div key={i} className="px-4 py-3">
+                            <div className="flex items-center gap-2 mb-2">
+                              <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
+                                {change.section}
+                              </span>
+                              <span className={`text-[10px] px-1.5 py-0.5 rounded ${
+                                change.type === "bullet" ? "bg-blue-500/10 text-blue-400" :
+                                change.type === "skill" ? "bg-purple-500/10 text-purple-400" :
+                                "bg-amber-500/10 text-amber-400"
+                              }`}>
+                                {change.type === "bullet" ? "bullet" : change.type === "skill" ? "skills" : "title"}
+                              </span>
+                            </div>
+                            <DiffView change={change} />
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  )}
 
                   {/* Actions */}
                   <div className="px-4 py-3 border-t border-border flex items-center gap-3">
@@ -847,6 +929,8 @@ export default function GeneratePage() {
                       onClick={() => {
                         setTailorResult(null);
                         setAttachTailored(false);
+                        if (tailoredPdfBlobUrl) { URL.revokeObjectURL(tailoredPdfBlobUrl); setTailoredPdfBlobUrl(null); }
+                        if (originalPdfBlobUrl) { URL.revokeObjectURL(originalPdfBlobUrl); setOriginalPdfBlobUrl(null); }
                       }}
                       className="px-4 py-2 text-sm text-muted-foreground hover:text-foreground transition-colors"
                     >

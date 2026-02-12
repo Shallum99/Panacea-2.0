@@ -74,6 +74,11 @@ export async function getResumeContent(id: number): Promise<ResumeWithContent> {
   return data;
 }
 
+export function getResumePdfUrl(id: number): string {
+  const base = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+  return `${base}/resumes/${id}/pdf`;
+}
+
 export async function deleteResume(id: number): Promise<void> {
   await api.delete(`/resumes/${id}`);
 }

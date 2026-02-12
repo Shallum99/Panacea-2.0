@@ -1,5 +1,6 @@
 # File: backend/app/api/endpoints/resumes.py
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi.responses import RedirectResponse, Response
 from sqlalchemy.orm import Session
 from typing import Any, List, Dict, Optional
 import json
@@ -623,6 +624,36 @@ def read_resume_content(
     except Exception as e:
         logger.error(f"Error reading resume content: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{resume_id}/pdf")
+async def download_resume_pdf(
+    resume_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Serve the original resume PDF."""
+    from app.services.storage import is_local_path, download_file, get_signed_url, RESUMES_BUCKET
+
+    resume = db.query(models.Resume).filter(
+        models.Resume.id == resume_id,
+        models.Resume.owner_id == current_user.id,
+    ).first()
+    if not resume or not resume.file_path:
+        raise HTTPException(status_code=404, detail="Resume PDF not found")
+
+    if is_local_path(resume.file_path):
+        if not os.path.exists(resume.file_path):
+            raise HTTPException(status_code=404, detail="Resume PDF not found on disk")
+        with open(resume.file_path, "rb") as f:
+            pdf_bytes = f.read()
+        return Response(content=pdf_bytes, media_type="application/pdf")
+    else:
+        try:
+            signed_url = get_signed_url(RESUMES_BUCKET, resume.file_path, expires_in=300)
+            return RedirectResponse(url=signed_url)
+        except Exception:
+            raise HTTPException(status_code=404, detail="Resume PDF not found in storage")
 
 
 @router.delete("/{resume_id}")
