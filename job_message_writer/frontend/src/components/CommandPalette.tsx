@@ -9,6 +9,7 @@ const pages = [
   { name: "Resumes", href: "/resumes", shortcut: "R", group: "Pages" },
   { name: "Generate Message", href: "/generate", shortcut: "G", group: "Pages" },
   { name: "Tailor Resume", href: "/tailor", shortcut: "T", group: "Pages" },
+  { name: "Agentic Apply", href: "/agentic-apply", shortcut: "A", group: "Pages" },
   { name: "Settings", href: "/settings", shortcut: "S", group: "Pages" },
 ];
 

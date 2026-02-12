@@ -1,10 +1,11 @@
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 
 class ChatMessageCreate(BaseModel):
     message: str
+    context: Optional[Dict[str, Any]] = None
 
 
 class ChatMessageResponse(BaseModel):
@@ -21,6 +22,7 @@ class ChatMessageResponse(BaseModel):
 
 class ChatConversationCreate(BaseModel):
     title: Optional[str] = "New Chat"
+    context: Optional[Dict[str, Any]] = None
 
 
 class ChatConversationResponse(BaseModel):

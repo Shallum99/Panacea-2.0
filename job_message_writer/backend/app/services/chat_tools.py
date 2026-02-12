@@ -106,12 +106,25 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "iterate_message",
+        "description": "Modify an existing generated message based on user instructions (make shorter, more formal, add specific details, change tone, etc.).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "application_id": {"type": "integer", "description": "ID of the application whose message to modify"},
+                "instructions": {"type": "string", "description": "Instructions for how to modify the message (e.g. 'make it shorter', 'more formal tone', 'emphasize my Python experience')"},
+            },
+            "required": ["application_id", "instructions"],
+        },
+    },
+    {
         "name": "send_email",
         "description": "Send an application email to a recipient. Requires Gmail to be connected.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "application_id": {"type": "integer", "description": "ID of the application to send"},
+                "recipient_email": {"type": "string", "description": "Recipient email address (optional, uses application's recipient_email if omitted)"},
             },
             "required": ["application_id"],
         },
@@ -162,6 +175,7 @@ async def execute_tool(
         "import_job_url": _tool_import_job_url,
         "list_resumes": _tool_list_resumes,
         "generate_message": _tool_generate_message,
+        "iterate_message": _tool_iterate_message,
         "tailor_resume": _tool_tailor_resume,
         "get_ats_score": _tool_get_ats_score,
         "send_email": _tool_send_email,
@@ -369,6 +383,42 @@ async def _tool_generate_message(args: Dict, user: models.User, db: Session) -> 
     }, "message_preview"
 
 
+async def _tool_iterate_message(args: Dict, user: models.User, db: Session) -> Tuple[Dict, str]:
+    from app.llm.claude_client import ClaudeClient
+
+    app_id = args["application_id"]
+    instructions = args["instructions"]
+
+    app = db.query(models.Application).filter(
+        models.Application.id == app_id, models.Application.owner_id == user.id
+    ).first()
+
+    if not app:
+        return {"error": "Application not found."}, "error"
+
+    current_body = app.final_message or app.generated_message
+    if not current_body:
+        return {"error": "No message to iterate on."}, "error"
+
+    claude = ClaudeClient()
+    revised = await claude._send_request(
+        system_prompt="You are a professional writing assistant. Revise the message according to the instructions. Return ONLY the revised message text, nothing else.",
+        user_prompt=f"Original message:\n\n{current_body}\n\nInstructions: {instructions}",
+        max_tokens=4096,
+    )
+
+    # Update the application
+    app.final_message = revised.strip()
+    db.commit()
+
+    return {
+        "application_id": app.id,
+        "subject": app.subject,
+        "message": app.final_message,
+        "message_type": app.message_type,
+    }, "message_preview"
+
+
 async def _tool_tailor_resume(args: Dict, user: models.User, db: Session) -> Tuple[Dict, str]:
     from app.services.pdf_format_preserver import tailor_resume
 
@@ -452,12 +502,20 @@ async def _tool_send_email(args: Dict, user: models.User, db: Session) -> Tuple[
     from app.services.email_sender import send_application_email
 
     app_id = args["application_id"]
+    recipient_email = args.get("recipient_email")
+
     app = db.query(models.Application).filter(
         models.Application.id == app_id, models.Application.owner_id == user.id
     ).first()
 
     if not app:
         return {"error": "Application not found."}, "error"
+
+    # Update recipient if provided
+    if recipient_email:
+        app.recipient_email = recipient_email
+        db.commit()
+
     if not app.recipient_email:
         return {"error": "No recipient email set on this application."}, "error"
     if not user.gmail_refresh_token:

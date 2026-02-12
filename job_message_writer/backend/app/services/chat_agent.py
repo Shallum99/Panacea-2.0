@@ -40,15 +40,46 @@ When the user asks to apply to multiple jobs, work through them one at a time, c
 Never make up job listings or fake data. Only use information from tool results."""
 
 
+def _build_system_prompt(context: Optional[Dict[str, Any]] = None) -> str:
+    """Build system prompt, appending application context if provided."""
+    prompt = SYSTEM_PROMPT
+    if not context:
+        return prompt
+
+    prompt += "\n\n---\n\n# Current Application Context\n"
+    if context.get("job_description"):
+        prompt += f"\n## Job Description\n{context['job_description'][:4000]}\n"
+    if context.get("resume_id"):
+        prompt += f"\n## Selected Resume ID: {context['resume_id']}\n"
+    if context.get("message_type"):
+        prompt += f"\n## Preferred Message Type: {context['message_type']}\n"
+    if context.get("position_title"):
+        prompt += f"\n## Position: {context['position_title']}\n"
+    if context.get("recruiter_name"):
+        prompt += f"\n## Recruiter: {context['recruiter_name']}\n"
+
+    prompt += """
+When the user has provided context above, use it automatically with your tools:
+- Use the job_description and resume_id from context when calling generate_message, tailor_resume, or get_ats_score
+- Use position_title and recruiter_name when generating messages
+- You can iterate on messages using iterate_message after generation
+- Guide the user conversationally through each step"""
+
+    return prompt
+
+
 async def run_agent(
     conversation_id: int,
     user_message: str,
     user: models.User,
     db: Session,
+    context: Optional[Dict[str, Any]] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Run the agent loop and yield SSE-formatted lines.
     """
+    system_prompt = _build_system_prompt(context)
+
     # 1. Load conversation history
     messages = _load_history(conversation_id, db)
 
@@ -72,7 +103,7 @@ async def run_agent(
         iteration += 1
 
         # Call Claude (non-streaming) with tools
-        response = await _call_claude(claude, messages)
+        response = await _call_claude(claude, messages, system_prompt)
 
         if not response:
             yield _sse({"type": "text", "content": "I encountered an error. Please try again."})
@@ -255,7 +286,7 @@ def _load_history(conversation_id: int, db: Session) -> list:
     return messages
 
 
-async def _call_claude(claude: ClaudeClient, messages: list) -> Optional[dict]:
+async def _call_claude(claude: ClaudeClient, messages: list, system_prompt: str = SYSTEM_PROMPT) -> Optional[dict]:
     """Call Claude API with tool definitions (non-streaming)."""
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
@@ -264,7 +295,7 @@ async def _call_claude(claude: ClaudeClient, messages: list) -> Optional[dict]:
                 headers=claude.headers,
                 json={
                     "model": claude.model,
-                    "system": SYSTEM_PROMPT,
+                    "system": system_prompt,
                     "messages": messages,
                     "tools": TOOL_DEFINITIONS,
                     "max_tokens": 4096,

@@ -28,9 +28,14 @@ async def create_conversation(
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    title = body.title or "New Chat"
+    # If context has a position_title, use it as the conversation title
+    if hasattr(body, "context") and body.context and body.context.get("position_title"):
+        title = body.context["position_title"][:100]
+
     conv = models.ChatConversation(
         user_id=current_user.id,
-        title=body.title or "New Chat",
+        title=title,
     )
     db.add(conv)
     db.commit()
@@ -115,7 +120,7 @@ async def send_message(
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     return StreamingResponse(
-        run_agent(conversation_id, body.message, current_user, db),
+        run_agent(conversation_id, body.message, current_user, db, context=body.context),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
