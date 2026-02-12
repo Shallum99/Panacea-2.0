@@ -7,6 +7,7 @@ import { createClient } from "@/lib/supabase/client";
 import CommandPalette from "@/components/CommandPalette";
 import { useKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts";
 import { useTheme } from "@/hooks/useTheme";
+import ChatPanel from "@/components/chat/ChatPanel";
 import {
   LayoutDashboard,
   Search,
@@ -22,6 +23,7 @@ import {
   Sun,
   Moon,
   Command,
+  MessageSquare,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
@@ -54,8 +56,18 @@ export default function DashboardLayout({
   const { theme, toggle } = useTheme();
   const [collapsed, setCollapsed] = useState(false);
   const [mounted, setMounted] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
 
   useKeyboardShortcuts();
+
+  // Listen for toggle-chat custom event (from Cmd+J shortcut)
+  useEffect(() => {
+    function handleToggle() {
+      setChatOpen((prev) => !prev);
+    }
+    document.addEventListener("toggle-chat", handleToggle);
+    return () => document.removeEventListener("toggle-chat", handleToggle);
+  }, []);
 
   useEffect(() => {
     const stored = localStorage.getItem(STORAGE_KEY);
@@ -136,6 +148,28 @@ export default function DashboardLayout({
         {/* Bottom */}
         <div className={`py-2 space-y-0.5 border-t border-border ${collapsed ? "px-1.5" : "px-2"}`}>
           <button
+            onClick={() => setChatOpen(true)}
+            title={collapsed ? "Chat (Cmd+J)" : undefined}
+            className={`w-full flex items-center py-2 text-[13px] text-muted-foreground hover:text-foreground hover:bg-foreground/[0.04] rounded-lg transition-colors ${
+              collapsed ? "justify-center px-0" : "justify-between px-3"
+            }`}
+          >
+            {collapsed ? (
+              <MessageSquare size={17} />
+            ) : (
+              <>
+                <span className="flex items-center gap-3">
+                  <MessageSquare size={17} />
+                  <span>Chat</span>
+                </span>
+                <kbd className="text-[10px] font-mono text-muted-foreground/60 bg-foreground/[0.05] px-1.5 py-0.5 rounded">
+                  {typeof navigator !== "undefined" && /Mac/.test(navigator.userAgent) ? "\u2318J" : "Ctrl J"}
+                </kbd>
+              </>
+            )}
+          </button>
+
+          <button
             onClick={openCommandPalette}
             title={collapsed ? "Search (Cmd+K)" : undefined}
             className={`w-full flex items-center py-2 text-[13px] text-muted-foreground hover:text-foreground hover:bg-foreground/[0.04] rounded-lg transition-colors ${
@@ -209,6 +243,8 @@ export default function DashboardLayout({
       <main className="flex-1 overflow-y-auto bg-background">
         <div className="p-6 lg:p-8 max-w-screen-2xl mx-auto">{children}</div>
       </main>
+
+      <ChatPanel open={chatOpen} onClose={() => setChatOpen(false)} />
     </div>
   );
 }

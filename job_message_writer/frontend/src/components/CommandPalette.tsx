@@ -15,6 +15,7 @@ const pages = [
 const actions = [
   { name: "New Application", href: "/generate", shortcut: "N", group: "Actions" },
   { name: "Upload Resume", href: "/resumes", shortcut: "U", group: "Actions" },
+  { name: "Open Chat", href: "__chat__", shortcut: "J", group: "Actions" },
 ];
 
 export default function CommandPalette() {
@@ -34,6 +35,10 @@ export default function CommandPalette() {
 
   function navigate(href: string) {
     setOpen(false);
+    if (href === "__chat__") {
+      document.dispatchEvent(new CustomEvent("toggle-chat"));
+      return;
+    }
     router.push(href);
   }
 

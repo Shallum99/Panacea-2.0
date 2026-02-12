@@ -24,6 +24,10 @@ export function useKeyboardShortcuts() {
             e.preventDefault();
             router.push("/generate");
             break;
+          case "j":
+            e.preventDefault();
+            document.dispatchEvent(new CustomEvent("toggle-chat"));
+            break;
         }
         return;
       }

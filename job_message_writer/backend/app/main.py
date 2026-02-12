@@ -108,6 +108,33 @@ def migrate_db():
             # Job descriptions: url + source
             conn.execute(text("ALTER TABLE job_descriptions ADD COLUMN IF NOT EXISTS url VARCHAR"))
             conn.execute(text("ALTER TABLE job_descriptions ADD COLUMN IF NOT EXISTS source VARCHAR"))
+            # Chat tables
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS chat_conversations (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    title VARCHAR DEFAULT 'New Chat',
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_chat_conversations_user_id ON chat_conversations (user_id)"
+            ))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id SERIAL PRIMARY KEY,
+                    conversation_id INTEGER NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
+                    role VARCHAR NOT NULL,
+                    content TEXT NOT NULL,
+                    tool_name VARCHAR,
+                    tool_call_id VARCHAR,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_chat_messages_conversation_id ON chat_messages (conversation_id)"
+            ))
             conn.commit()
             logger.info("DB migration: all columns + tables ensured")
     except Exception as e:
