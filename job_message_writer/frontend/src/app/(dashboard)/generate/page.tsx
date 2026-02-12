@@ -73,22 +73,68 @@ function computeWordDiff(original: string, optimized: string): { text: string; t
   return result;
 }
 
-function DiffView({ change }: { change: TextChange }) {
-  const diff = computeWordDiff(change.original, change.optimized);
+// ── GitHub-style diff view ──
+function GitHubDiffView({ changes }: { changes: TextChange[] }) {
   return (
-    <div className="text-sm leading-relaxed">
-      {diff.map((part, i) => (
-        <span
-          key={i}
-          className={
-            part.type === "added"
-              ? "bg-green-500/20 text-green-400"
-              : part.type === "removed"
-              ? "bg-red-500/20 text-red-400 line-through"
-              : ""
-          }
-        >{part.text}</span>
-      ))}
+    <div className="font-mono text-[11px] leading-5 overflow-x-auto">
+      {changes.map((change, i) => {
+        const wordDiff = computeWordDiff(change.original, change.optimized);
+        const removedParts = wordDiff.filter(w => w.type !== "added");
+        const addedParts = wordDiff.filter(w => w.type !== "removed");
+
+        return (
+          <div key={i}>
+            {/* Section header — like @@ hunk header @@ */}
+            <div className="px-3 py-1 bg-blue-500/8 text-blue-400 text-[10px] font-semibold flex items-center gap-2 border-b border-border/50 sticky top-0">
+              <span>@@</span>
+              <span className="uppercase tracking-wider">{change.section}</span>
+              <span className="text-blue-400/60">
+                {change.type === "bullet" ? "bullet point" : change.type === "skill" ? "skills" : "title"}
+              </span>
+              <span>@@</span>
+            </div>
+
+            {/* Removed line(s) — red */}
+            <div className="bg-red-500/8 border-l-3 border-red-500/40 px-3 py-1.5 flex">
+              <span className="text-red-400/60 select-none shrink-0 w-5 mr-2 text-right">−</span>
+              <div className="min-w-0 break-words">
+                {removedParts.map((part, j) => (
+                  <span
+                    key={j}
+                    className={
+                      part.type === "removed"
+                        ? "bg-red-500/25 text-red-300 rounded-sm px-0.5"
+                        : "text-red-400/70"
+                    }
+                  >{part.text}</span>
+                ))}
+              </div>
+            </div>
+
+            {/* Added line(s) — green */}
+            <div className="bg-green-500/8 border-l-3 border-green-500/40 px-3 py-1.5 flex">
+              <span className="text-green-400/60 select-none shrink-0 w-5 mr-2 text-right">+</span>
+              <div className="min-w-0 break-words">
+                {addedParts.map((part, j) => (
+                  <span
+                    key={j}
+                    className={
+                      part.type === "added"
+                        ? "bg-green-500/25 text-green-300 rounded-sm px-0.5"
+                        : "text-green-400/70"
+                    }
+                  >{part.text}</span>
+                ))}
+              </div>
+            </div>
+
+            {/* Separator between changes */}
+            {i < changes.length - 1 && (
+              <div className="h-px bg-border/50" />
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -843,7 +889,7 @@ export default function GeneratePage() {
                             : "text-muted-foreground hover:text-foreground"
                         }`}
                       >
-                        Changes ({tailorResult.changes.length})
+                        Diff ({tailorResult.changes.length})
                       </button>
                     </div>
                   </div>
@@ -890,29 +936,13 @@ export default function GeneratePage() {
                   )}
 
                   {pdfView === "changes" && (
-                    <div className="max-h-[600px] overflow-y-auto divide-y divide-border">
+                    <div className="max-h-[600px] overflow-y-auto">
                       {tailorResult.changes.length === 0 ? (
                         <div className="p-6 text-center text-sm text-muted-foreground">
                           No text changes detected
                         </div>
                       ) : (
-                        tailorResult.changes.map((change, i) => (
-                          <div key={i} className="px-4 py-3">
-                            <div className="flex items-center gap-2 mb-2">
-                              <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
-                                {change.section}
-                              </span>
-                              <span className={`text-[10px] px-1.5 py-0.5 rounded ${
-                                change.type === "bullet" ? "bg-blue-500/10 text-blue-400" :
-                                change.type === "skill" ? "bg-purple-500/10 text-purple-400" :
-                                "bg-amber-500/10 text-amber-400"
-                              }`}>
-                                {change.type === "bullet" ? "bullet" : change.type === "skill" ? "skills" : "title"}
-                              </span>
-                            </div>
-                            <DiffView change={change} />
-                          </div>
-                        ))
+                        <GitHubDiffView changes={tailorResult.changes} />
                       )}
                     </div>
                   )}
