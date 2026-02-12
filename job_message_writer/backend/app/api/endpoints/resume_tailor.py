@@ -270,6 +270,8 @@ async def optimize_resume_pdf(
             resume.content, request.job_description
         )
 
+        diff_download_id = uuid.uuid4().hex
+
         # Helper to run optimization on a local input path
         async def _run_optimize(input_path: str):
             fd, out_path = tempfile.mkstemp(suffix=".pdf")
@@ -290,6 +292,36 @@ async def optimize_resume_pdf(
                     output_bytes = f.read()
                 tailored_path = f"{current_user.id}/{download_id}.pdf"
                 await upload_file(TAILORED_BUCKET, tailored_path, output_bytes)
+
+                # Generate diff PDF: tailored PDF with green highlights on changed text
+                try:
+                    diff_doc = fitz.open(stream=output_bytes, filetype="pdf")
+                    green = fitz.utils.getColor("green")
+                    for change in result.get("changes", []):
+                        opt_text = change.get("optimized", "")
+                        if not opt_text:
+                            continue
+                        # Search for fragments of the optimized text in the PDF
+                        # Use first ~60 chars to find the region
+                        search_text = opt_text[:60].strip()
+                        if len(search_text) < 5:
+                            continue
+                        for page in diff_doc:
+                            rects = page.search_for(search_text)
+                            if rects:
+                                for rect in rects:
+                                    annot = page.add_highlight_annot(rect)
+                                    annot.set_colors(stroke=green)
+                                    annot.set_opacity(0.35)
+                                    annot.update()
+                                break  # found on this page, skip to next change
+                    diff_bytes = diff_doc.tobytes()
+                    diff_doc.close()
+                    diff_path = f"{current_user.id}/{diff_download_id}.pdf"
+                    await upload_file(TAILORED_BUCKET, diff_path, diff_bytes)
+                except Exception as e:
+                    logger.warning(f"Failed to generate diff PDF: {e}")
+
                 return result, optimized_text
             finally:
                 try:
@@ -311,6 +343,7 @@ async def optimize_resume_pdf(
 
         return PDFOptimizeResponse(
             download_id=download_id,
+            diff_download_id=diff_download_id,
             sections_found=result["sections_found"],
             sections_optimized=result["sections_optimized"],
             original_ats_score=original_score,

@@ -22,6 +22,7 @@ export interface TextChange {
 
 export interface PDFOptimizeResponse {
   download_id: string;
+  diff_download_id: string | null;
   sections_found: string[];
   sections_optimized: string[];
   original_ats_score: number;

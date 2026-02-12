@@ -62,6 +62,7 @@ class TextChange(BaseModel):
 
 class PDFOptimizeResponse(BaseModel):
     download_id: str
+    diff_download_id: Optional[str] = None
     sections_found: List[str]
     sections_optimized: List[str]
     original_ats_score: float
