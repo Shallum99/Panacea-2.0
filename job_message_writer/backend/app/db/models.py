@@ -39,10 +39,36 @@ class User(Base):
     stripe_customer_id = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    # Profile: Personal Details
+    full_name = Column(String, nullable=True)
+    phone = Column(String, nullable=True)
+    linkedin_url = Column(String, nullable=True)
+    portfolio_url = Column(String, nullable=True)
+
+    # Profile: Professional Summary
+    professional_summary = Column(Text, nullable=True)
+
+    # Profile: Master Skills (comma-separated)
+    master_skills = Column(Text, nullable=True)
+
+    # Profile: Job Preferences
+    target_roles = Column(Text, nullable=True)
+    target_industries = Column(Text, nullable=True)
+    target_locations = Column(Text, nullable=True)
+    work_arrangement = Column(String, nullable=True)
+    salary_range_min = Column(Integer, nullable=True)
+    salary_range_max = Column(Integer, nullable=True)
+
+    # Profile: Tone Settings
+    tone_formality = Column(String, default="balanced", server_default="balanced")
+    tone_confidence = Column(String, default="confident", server_default="confident")
+    tone_verbosity = Column(String, default="concise", server_default="concise")
+
     resumes = relationship("Resume", back_populates="owner")
     job_descriptions = relationship("JobDescription", back_populates="owner")
     messages = relationship("Message", back_populates="owner")
     applications = relationship("Application", back_populates="owner")
+    writing_samples = relationship("WritingSample", back_populates="user")
 
 
 class JobDescription(Base):
@@ -169,3 +195,16 @@ class UsageLog(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User")
+
+
+class WritingSample(Base):
+    __tablename__ = "writing_samples"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    title = Column(String, nullable=True)
+    content = Column(Text, nullable=False)
+    sample_type = Column(String, nullable=True)  # email/linkedin/cover_letter/other
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="writing_samples")

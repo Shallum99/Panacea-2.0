@@ -71,8 +71,42 @@ def migrate_db():
             conn.execute(text(
                 "CREATE INDEX IF NOT EXISTS ix_usage_log_user_id ON usage_log (user_id)"
             ))
+            # Profile: Personal Details
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name VARCHAR"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS linkedin_url VARCHAR"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS portfolio_url VARCHAR"))
+            # Profile: Professional Summary
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS professional_summary TEXT"))
+            # Profile: Master Skills
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS master_skills TEXT"))
+            # Profile: Job Preferences
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS target_roles TEXT"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS target_industries TEXT"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS target_locations TEXT"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS work_arrangement VARCHAR"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS salary_range_min INTEGER"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS salary_range_max INTEGER"))
+            # Profile: Tone Settings
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS tone_formality VARCHAR DEFAULT 'balanced'"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS tone_confidence VARCHAR DEFAULT 'confident'"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS tone_verbosity VARCHAR DEFAULT 'concise'"))
+            # Writing Samples table
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS writing_samples (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    title VARCHAR,
+                    content TEXT NOT NULL,
+                    sample_type VARCHAR,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_writing_samples_user_id ON writing_samples (user_id)"
+            ))
             conn.commit()
-            logger.info("DB migration: all columns + usage_log table ensured")
+            logger.info("DB migration: all columns + usage_log + profile + writing_samples ensured")
     except Exception as e:
         logger.warning(f"DB migration skipped: {e}")
 
