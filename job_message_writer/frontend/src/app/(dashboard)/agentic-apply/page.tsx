@@ -67,6 +67,7 @@ function AgenticApplyInner() {
           <ContextButton
             context={state.context}
             onClick={() => state.setContextModalOpen(true)}
+            showHint={state.messages.length === 0}
           />
         </div>
 

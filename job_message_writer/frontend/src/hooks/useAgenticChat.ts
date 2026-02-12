@@ -168,6 +168,12 @@ export function useAgenticChat(searchParams?: URLSearchParams) {
     setConversationId(null);
     setMessages([]);
     setInput("");
+    setContextState({});
+    try {
+      sessionStorage.removeItem(CONTEXT_STORAGE_KEY);
+    } catch {
+      // ignore
+    }
   }, []);
 
   const handleDeleteConversation = useCallback(
