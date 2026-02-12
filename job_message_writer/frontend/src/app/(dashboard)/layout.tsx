@@ -40,7 +40,7 @@ const nav: NavItem[] = [
   { href: "/profile", label: "Profile", icon: UserCircle },
   { href: "/resumes", label: "Resumes", icon: FileText },
   { href: "/generate", label: "Generate", icon: Sparkles },
-  { href: "/agentic-apply", label: "Apply", icon: Wand2 },
+  { href: "/agentic-apply", label: "Agentic Apply", icon: Wand2 },
   { href: "/applications", label: "Applications", icon: Send },
   { href: "/pricing", label: "Pricing", icon: CreditCard },
 ];
