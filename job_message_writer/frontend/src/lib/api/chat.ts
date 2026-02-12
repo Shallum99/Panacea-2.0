@@ -54,6 +54,8 @@ export interface ChatContext {
   message_type?: string;
   position_title?: string;
   recruiter_name?: string;
+  recipient_email?: string;
+  job_url?: string;
 }
 
 export async function createConversationWithContext(
