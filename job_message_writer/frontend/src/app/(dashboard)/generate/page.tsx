@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef } from "react";
+import { Suspense, useEffect, useState, useCallback, useRef } from "react";
 import { useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import { createClient } from "@/lib/supabase/client";
@@ -31,7 +31,15 @@ const MESSAGE_TYPES = [
   { value: "ycombinator", label: "Y Combinator" },
 ];
 
-export default function GeneratePage() {
+export default function GeneratePageWrapper() {
+  return (
+    <Suspense fallback={<div className="flex items-center justify-center h-64"><div className="w-6 h-6 border-2 border-accent border-t-transparent rounded-full animate-spin" /></div>}>
+      <GeneratePage />
+    </Suspense>
+  );
+}
+
+function GeneratePage() {
   const searchParams = useSearchParams();
   const [resumes, setResumes] = useState<Resume[]>([]);
   const [loadingResumes, setLoadingResumes] = useState(true);
