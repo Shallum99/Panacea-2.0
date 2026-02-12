@@ -17,8 +17,8 @@ import {
   CreditCard,
   Settings,
   LogOut,
-  ChevronLeft,
-  ChevronRight,
+  PanelLeftClose,
+  PanelLeftOpen,
   Sun,
   Moon,
   Command,
@@ -57,12 +57,9 @@ export default function DashboardLayout({
 
   useKeyboardShortcuts();
 
-  // Hydrate collapsed state from localStorage
   useEffect(() => {
     const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored === "true") {
-      setCollapsed(true);
-    }
+    if (stored === "true") setCollapsed(true);
     setMounted(true);
   }, []);
 
@@ -87,42 +84,32 @@ export default function DashboardLayout({
     return pathname === href || pathname.startsWith(href + "/");
   }
 
-  // Prevent flash of wrong sidebar width before hydration
-  const sidebarWidth = !mounted ? "w-56" : collapsed ? "w-16" : "w-56";
+  const w = !mounted ? "w-56" : collapsed ? "w-[60px]" : "w-56";
 
   return (
     <div className="flex h-screen">
       <CommandPalette />
 
-      {/* Sidebar */}
       <aside
-        className={`${sidebarWidth} border-r border-border flex flex-col shrink-0 transition-all duration-200 overflow-hidden`}
+        className={`${w} bg-sidebar flex flex-col shrink-0 transition-all duration-200 overflow-hidden border-r border-border`}
       >
-        {/* Brand + Theme toggle */}
-        <div className="p-4 border-b border-border flex items-center justify-between min-h-[57px]">
-          <Link
-            href="/dashboard"
-            className="text-lg font-bold tracking-tight text-gradient whitespace-nowrap"
-          >
+        {/* Brand */}
+        <div className={`flex items-center min-h-[56px] ${collapsed ? "justify-center px-2" : "justify-between px-4"}`}>
+          <Link href="/dashboard" className="text-gradient text-lg font-semibold tracking-tight whitespace-nowrap">
             {collapsed ? "P" : "Panacea"}
           </Link>
           {!collapsed && (
             <button
               onClick={toggle}
-              className="w-7 h-7 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
-              title={
-                theme === "dark"
-                  ? "Switch to light mode"
-                  : "Switch to dark mode"
-              }
+              className="w-7 h-7 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground transition-colors"
             >
               {theme === "dark" ? <Sun size={14} /> : <Moon size={14} />}
             </button>
           )}
         </div>
 
-        {/* Main navigation */}
-        <nav className="flex-1 p-2 space-y-0.5">
+        {/* Nav */}
+        <nav className={`flex-1 py-2 space-y-0.5 ${collapsed ? "px-1.5" : "px-2"}`}>
           {nav.map((item) => {
             const active = isActive(item.href);
             const Icon = item.icon;
@@ -131,127 +118,95 @@ export default function DashboardLayout({
                 key={item.href}
                 href={item.href}
                 title={collapsed ? item.label : undefined}
-                className={`flex items-center gap-3 py-2 text-sm rounded-md transition-colors relative ${
+                className={`flex items-center gap-3 py-2 rounded-lg text-[13px] transition-colors ${
                   collapsed ? "justify-center px-0" : "px-3"
                 } ${
                   active
-                    ? "bg-accent/10 text-foreground border-l-[3px] border-accent"
-                    : "text-muted-foreground hover:text-foreground hover:bg-muted/50 border-l-[3px] border-transparent"
+                    ? "bg-foreground/[0.08] text-foreground font-medium"
+                    : "text-muted-foreground hover:text-foreground hover:bg-foreground/[0.04]"
                 }`}
               >
-                <Icon
-                  size={18}
-                  className={`shrink-0 transition-opacity ${
-                    active ? "opacity-100" : "opacity-70"
-                  }`}
-                />
-                {!collapsed && (
-                  <span className="whitespace-nowrap">{item.label}</span>
-                )}
+                <Icon size={17} className="shrink-0" />
+                {!collapsed && <span className="whitespace-nowrap">{item.label}</span>}
               </Link>
             );
           })}
         </nav>
 
-        {/* Separator */}
-        <div className="mx-3 border-t border-border" />
-
-        {/* Bottom section */}
-        <div className="p-2 space-y-0.5">
-          {/* Command palette trigger */}
+        {/* Bottom */}
+        <div className={`py-2 space-y-0.5 border-t border-border ${collapsed ? "px-1.5" : "px-2"}`}>
           <button
             onClick={openCommandPalette}
             title={collapsed ? "Search (Cmd+K)" : undefined}
-            className={`w-full flex items-center py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-md transition-colors ${
+            className={`w-full flex items-center py-2 text-[13px] text-muted-foreground hover:text-foreground hover:bg-foreground/[0.04] rounded-lg transition-colors ${
               collapsed ? "justify-center px-0" : "justify-between px-3"
             }`}
           >
             {collapsed ? (
-              <Command
-                size={18}
-                className="opacity-70 shrink-0"
-              />
+              <Command size={17} />
             ) : (
               <>
                 <span className="flex items-center gap-3">
-                  <Command size={18} className="opacity-70 shrink-0" />
-                  <span className="whitespace-nowrap">Search</span>
+                  <Command size={17} />
+                  <span>Search</span>
                 </span>
-                <kbd className="text-[10px] font-mono bg-muted/50 px-1.5 py-0.5 rounded">
-                  {typeof navigator !== "undefined" &&
-                  /Mac/.test(navigator.userAgent)
-                    ? "\u2318"
-                    : "Ctrl+"}
-                  K
+                <kbd className="text-[10px] font-mono text-muted-foreground/60 bg-foreground/[0.05] px-1.5 py-0.5 rounded">
+                  {typeof navigator !== "undefined" && /Mac/.test(navigator.userAgent) ? "\u2318K" : "Ctrl K"}
                 </kbd>
               </>
             )}
           </button>
 
-          {/* Settings */}
           {(() => {
             const active = isActive("/settings");
             return (
               <Link
                 href="/settings"
                 title={collapsed ? "Settings" : undefined}
-                className={`flex items-center gap-3 py-2 text-sm rounded-md transition-colors ${
+                className={`flex items-center gap-3 py-2 text-[13px] rounded-lg transition-colors ${
                   collapsed ? "justify-center px-0" : "px-3"
                 } ${
                   active
-                    ? "bg-accent/10 text-foreground border-l-[3px] border-accent"
-                    : "text-muted-foreground hover:text-foreground hover:bg-muted/50 border-l-[3px] border-transparent"
+                    ? "bg-foreground/[0.08] text-foreground font-medium"
+                    : "text-muted-foreground hover:text-foreground hover:bg-foreground/[0.04]"
                 }`}
               >
-                <Settings
-                  size={18}
-                  className={`shrink-0 transition-opacity ${
-                    active ? "opacity-100" : "opacity-70"
-                  }`}
-                />
-                {!collapsed && (
-                  <span className="whitespace-nowrap">Settings</span>
-                )}
+                <Settings size={17} className="shrink-0" />
+                {!collapsed && <span>Settings</span>}
               </Link>
             );
           })()}
 
-          {/* Sign out */}
           <button
             onClick={handleSignOut}
             title={collapsed ? "Sign Out" : undefined}
-            className={`w-full flex items-center gap-3 py-2 text-sm text-muted-foreground hover:text-destructive hover:bg-muted/50 rounded-md transition-colors ${
+            className={`w-full flex items-center gap-3 py-2 text-[13px] text-muted-foreground hover:text-destructive hover:bg-foreground/[0.04] rounded-lg transition-colors ${
               collapsed ? "justify-center px-0" : "px-3"
-            } border-l-[3px] border-transparent`}
+            }`}
           >
-            <LogOut size={18} className="opacity-70 shrink-0" />
-            {!collapsed && (
-              <span className="whitespace-nowrap">Sign Out</span>
-            )}
+            <LogOut size={17} className="shrink-0" />
+            {!collapsed && <span>Sign Out</span>}
           </button>
 
-          {/* Collapse toggle */}
           <button
             onClick={toggleCollapsed}
-            className={`w-full flex items-center py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-md transition-colors ${
-              collapsed ? "justify-center px-0" : "justify-between px-3"
+            className={`w-full flex items-center py-2 text-[13px] text-muted-foreground hover:text-foreground hover:bg-foreground/[0.04] rounded-lg transition-colors ${
+              collapsed ? "justify-center px-0" : "px-3 gap-3"
             }`}
-            title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
           >
             {collapsed ? (
-              <ChevronRight size={18} className="opacity-70 shrink-0" />
+              <PanelLeftOpen size={17} />
             ) : (
               <>
-                <span className="whitespace-nowrap">Collapse</span>
-                <ChevronLeft size={18} className="opacity-70 shrink-0" />
+                <PanelLeftClose size={17} />
+                <span>Collapse</span>
               </>
             )}
           </button>
         </div>
       </aside>
 
-      {/* Main content */}
-      <main className="flex-1 overflow-y-auto">
+      <main className="flex-1 overflow-y-auto bg-background">
         <div className="p-6 lg:p-8 max-w-screen-2xl mx-auto">{children}</div>
       </main>
     </div>

@@ -14,7 +14,7 @@ export default function AuthLayout({
           className="absolute inset-0 opacity-30"
           style={{
             background:
-              "radial-gradient(ellipse at 20% 50%, rgba(59,130,246,0.15) 0%, transparent 50%), radial-gradient(ellipse at 80% 20%, rgba(139,92,246,0.12) 0%, transparent 50%), radial-gradient(ellipse at 50% 80%, rgba(59,130,246,0.08) 0%, transparent 50%)",
+              "radial-gradient(ellipse at 20% 50%, rgba(129,140,248,0.12) 0%, transparent 50%), radial-gradient(ellipse at 80% 20%, rgba(167,139,250,0.10) 0%, transparent 50%), radial-gradient(ellipse at 50% 80%, rgba(129,140,248,0.06) 0%, transparent 50%)",
           }}
         />
         {/* Subtle grid pattern */}
