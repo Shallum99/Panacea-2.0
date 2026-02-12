@@ -19,6 +19,7 @@ import {
   getDownloadUrl,
   type PDFOptimizeResponse,
 } from "@/lib/api/resumeTailor";
+import api from "@/lib/api";
 
 const MESSAGE_TYPES = [
   { value: "email_detailed", label: "Detailed Email" },
@@ -66,8 +67,13 @@ export default function GeneratePage() {
   const [tailoredPdfBlobUrl, setTailoredPdfBlobUrl] = useState<string | null>(null);
   const [diffPdfBlobUrl, setDiffPdfBlobUrl] = useState<string | null>(null);
   const [loadingPdf, setLoadingPdf] = useState(false);
+  const [usage, setUsage] = useState<{ tier: string; message_generation: { used: number; limit: number | null }; resume_tailor: { used: number; limit: number | null } } | null>(null);
 
-  useEffect(() => { loadResumes(); }, []);
+  useEffect(() => { loadResumes(); loadUsage(); }, []);
+
+  async function loadUsage() {
+    try { const { data } = await api.get("/users/usage"); setUsage(data); } catch {}
+  }
 
   useEffect(() => {
     return () => {
@@ -151,7 +157,7 @@ export default function GeneratePage() {
           setEditedMessage(app.final_message || app.generated_message || "");
           setEditedSubject(app.subject || "");
           setEditedRecipient(app.recipient_email || recipientEmail || "");
-          setGenerating(false); toast.success("Message generated");
+          setGenerating(false); toast.success("Message generated"); loadUsage();
         },
         (error) => { toast.error(error || "Failed to generate"); setGenerating(false); },
         async () => { const sb = createClient(); const { data: { session } } = await sb.auth.getSession(); return session?.access_token || null; },
@@ -179,7 +185,7 @@ export default function GeneratePage() {
           setDiffPdfBlobUrl(blobUrl);
         } catch {}
       }
-      toast.success("Resume optimized");
+      toast.success("Resume optimized"); loadUsage();
     } catch (err: unknown) {
       const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
       const message = typeof detail === "object" && detail !== null ? (detail as { message?: string }).message : detail || "Failed to optimize resume";
@@ -328,6 +334,29 @@ export default function GeneratePage() {
             {tailoring ? "Optimizing..." : "Tailor Resume"}
           </button>
         </div>
+
+        {/* Usage indicator */}
+        {usage && usage.message_generation.limit !== null && (
+          <div className="flex items-center gap-4 text-xs text-muted-foreground">
+            <div className="flex items-center gap-2 flex-1">
+              <span className="shrink-0">Messages</span>
+              <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
+                <div className="h-full bg-accent rounded-full transition-all" style={{ width: `${Math.min(100, (usage.message_generation.used / usage.message_generation.limit) * 100)}%` }} />
+              </div>
+              <span className="shrink-0 font-mono">{usage.message_generation.used}/{usage.message_generation.limit}</span>
+            </div>
+            <div className="flex items-center gap-2 flex-1">
+              <span className="shrink-0">Resumes</span>
+              <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
+                <div className="h-full bg-accent rounded-full transition-all" style={{ width: `${Math.min(100, (usage.resume_tailor.used / (usage.resume_tailor.limit || 1)) * 100)}%` }} />
+              </div>
+              <span className="shrink-0 font-mono">{usage.resume_tailor.used}/{usage.resume_tailor.limit}</span>
+            </div>
+            {usage.tier === "free" && (
+              <a href="/pricing" className="text-accent hover:underline shrink-0">Upgrade</a>
+            )}
+          </div>
+        )}
       </div>
 
       {/* ═══ RIGHT — Viewer (starts at very top) ═══ */}

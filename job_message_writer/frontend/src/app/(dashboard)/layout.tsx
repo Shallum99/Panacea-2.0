@@ -13,6 +13,7 @@ const nav = [
   { href: "/resumes", label: "Resumes", icon: "R" },
   { href: "/generate", label: "Generate", icon: "G" },
   { href: "/applications", label: "Applications", icon: "A" },
+  { href: "/pricing", label: "Pricing", icon: "$" },
 ];
 
 export default function DashboardLayout({

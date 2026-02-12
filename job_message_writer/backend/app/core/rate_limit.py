@@ -14,9 +14,22 @@ from app.core.supabase_auth import get_current_user
 
 logger = logging.getLogger(__name__)
 
-# Default limits for the "free" tier (lifetime)
+# Tier limits (lifetime)
 FREE_MESSAGE_LIMIT = 5
 FREE_TAILOR_LIMIT = 5
+PRO_MESSAGE_LIMIT = 50
+PRO_TAILOR_LIMIT = 50
+BUSINESS_MESSAGE_LIMIT = 150
+BUSINESS_TAILOR_LIMIT = 150
+ENTERPRISE_MESSAGE_LIMIT = 1000
+ENTERPRISE_TAILOR_LIMIT = 1000
+
+TIER_LIMITS = {
+    "free":       {"message_generation": FREE_MESSAGE_LIMIT,       "resume_tailor": FREE_TAILOR_LIMIT},
+    "pro":        {"message_generation": PRO_MESSAGE_LIMIT,        "resume_tailor": PRO_TAILOR_LIMIT},
+    "business":   {"message_generation": BUSINESS_MESSAGE_LIMIT,   "resume_tailor": BUSINESS_TAILOR_LIMIT},
+    "enterprise": {"message_generation": ENTERPRISE_MESSAGE_LIMIT, "resume_tailor": ENTERPRISE_TAILOR_LIMIT},
+}
 
 
 def _get_usage_count(db: Session, user_id: int, action_type: str) -> int:
@@ -34,17 +47,14 @@ def _get_limit(user: models.User, action_type: str):
 
     if user.tier == "custom":
         if action_type == "message_generation":
-            return user.custom_message_limit  # None = unlimited for this action
+            return user.custom_message_limit
         elif action_type == "resume_tailor":
             return user.custom_tailor_limit
         return None
 
-    # Default: "free" tier
-    if action_type == "message_generation":
-        return FREE_MESSAGE_LIMIT
-    elif action_type == "resume_tailor":
-        return FREE_TAILOR_LIMIT
-    return None
+    # Named tiers (free, pro, business, enterprise)
+    tier_limits = TIER_LIMITS.get(user.tier, TIER_LIMITS["free"])
+    return tier_limits.get(action_type)
 
 
 def require_quota(action_type: str):
@@ -80,7 +90,7 @@ def require_quota(action_type: str):
                         "action": action_type,
                         "used": used,
                         "limit": limit,
-                        "message": f"You've used all {limit} free {label}s. Contact us to upgrade your account.",
+                        "message": f"You've used all {limit} {label}s. Upgrade your plan for more.",
                     },
                 )
 

@@ -56,6 +56,9 @@ def migrate_db():
             conn.execute(text(
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS custom_tailor_limit INTEGER"
             ))
+            conn.execute(text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR"
+            ))
             # Usage log table
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS usage_log (

@@ -36,6 +36,7 @@ class User(Base):
     tier = Column(String, default="free", server_default="free", nullable=False)
     custom_message_limit = Column(Integer, nullable=True)
     custom_tailor_limit = Column(Integer, nullable=True)
+    stripe_customer_id = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     resumes = relationship("Resume", back_populates="owner")
