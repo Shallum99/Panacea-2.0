@@ -293,54 +293,74 @@ async def optimize_resume_pdf(
                 tailored_path = f"{current_user.id}/{download_id}.pdf"
                 await upload_file(TAILORED_BUCKET, tailored_path, output_bytes)
 
-                # Generate diff PDF: tailored PDF with green highlights on CHANGED words only
+                # Generate diff PDF: compare original vs optimized PDF word-by-word
+                # using actual PDF positions to highlight ONLY changed/added words
                 try:
                     import difflib
+                    orig_doc = fitz.open(input_path)
                     diff_doc = fitz.open(stream=output_bytes, filetype="pdf")
                     green = fitz.utils.getColor("green")
-                    for change in result.get("changes", []):
-                        orig_text = change.get("original", "")
-                        opt_text = change.get("optimized", "")
-                        if not opt_text or not orig_text:
-                            continue
-                        # Word-level diff: find words/phrases that are new or changed
-                        orig_words = orig_text.split()
-                        opt_words = opt_text.split()
-                        matcher = difflib.SequenceMatcher(None, orig_words, opt_words)
-                        changed_fragments = []
-                        for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
-                            if tag in ("replace", "insert"):
-                                # These words are new/changed in the optimized version
-                                fragment = " ".join(opt_words[j1:j2])
-                                if fragment.strip():
-                                    changed_fragments.append(fragment)
-                        if not changed_fragments:
-                            continue
-                        # Search for each changed fragment in the PDF and highlight
-                        for fragment in changed_fragments:
-                            # For long fragments, search in chunks to handle line wraps
-                            search_terms = [fragment]
-                            if len(fragment) > 50:
-                                # Split into smaller searchable chunks (3-5 words each)
-                                frag_words = fragment.split()
-                                chunk_size = 4
-                                search_terms = []
-                                for ci in range(0, len(frag_words), chunk_size):
-                                    chunk = " ".join(frag_words[ci:ci + chunk_size])
-                                    if chunk.strip():
-                                        search_terms.append(chunk)
-                            for term in search_terms:
-                                if len(term.strip()) < 3:
-                                    continue
-                                for page in diff_doc:
-                                    rects = page.search_for(term)
-                                    if rects:
-                                        for rect in rects:
-                                            annot = page.add_highlight_annot(rect)
-                                            annot.set_colors(stroke=green)
-                                            annot.set_opacity(0.35)
-                                            annot.update()
-                                        break  # found on this page, next term
+
+                    def _group_words_by_line(words, y_tolerance=3):
+                        """Group get_text('words') results by line using y-coordinate."""
+                        lines = {}
+                        for w in words:
+                            # Round y0 to nearest tolerance to bucket into lines
+                            y_key = round(w[1] / y_tolerance) * y_tolerance
+                            if y_key not in lines:
+                                lines[y_key] = []
+                            lines[y_key].append(w)
+                        # Sort words within each line by x coordinate
+                        for y_key in lines:
+                            lines[y_key].sort(key=lambda w: w[0])
+                        return lines
+
+                    for page_idx in range(min(len(diff_doc), len(orig_doc))):
+                        orig_page = orig_doc[page_idx]
+                        diff_page = diff_doc[page_idx]
+
+                        # get_text("words") → (x0, y0, x1, y1, "word", block, line, word_no)
+                        orig_words = orig_page.get_text("words")
+                        opt_words = diff_page.get_text("words")
+
+                        orig_lines = _group_words_by_line(orig_words)
+                        opt_lines = _group_words_by_line(opt_words)
+
+                        orig_y_keys = sorted(orig_lines.keys())
+
+                        for y_key, opt_line_words in opt_lines.items():
+                            # Find closest matching y in original
+                            closest_y = min(orig_y_keys, key=lambda oy: abs(oy - y_key)) if orig_y_keys else None
+                            if closest_y is None or abs(closest_y - y_key) > 6:
+                                # Entirely new line — highlight all words
+                                for w in opt_line_words:
+                                    rect = fitz.Rect(w[0], w[1], w[2], w[3])
+                                    annot = diff_page.add_highlight_annot(rect)
+                                    annot.set_colors(stroke=green)
+                                    annot.set_opacity(0.35)
+                                    annot.update()
+                                continue
+
+                            orig_line_words = orig_lines[closest_y]
+                            # Compare word text sequences on this line
+                            orig_texts = [w[4] for w in orig_line_words]
+                            opt_texts = [w[4] for w in opt_line_words]
+
+                            if orig_texts == opt_texts:
+                                continue  # identical line, skip
+
+                            matcher = difflib.SequenceMatcher(None, orig_texts, opt_texts)
+                            for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+                                if tag in ("replace", "insert"):
+                                    for wi in range(j1, j2):
+                                        w = opt_line_words[wi]
+                                        rect = fitz.Rect(w[0], w[1], w[2], w[3])
+                                        annot = diff_page.add_highlight_annot(rect)
+                                        annot.set_colors(stroke=green)
+                                        annot.set_opacity(0.35)
+                                        annot.update()
+
+                    orig_doc.close()
                     diff_bytes = diff_doc.tobytes()
                     diff_doc.close()
                     diff_path = f"{current_user.id}/{diff_download_id}.pdf"
