@@ -10,6 +10,7 @@ import { useTheme } from "@/hooks/useTheme";
 
 const nav = [
   { href: "/dashboard", label: "Dashboard", icon: "H" },
+  { href: "/profile", label: "Profile", icon: "P" },
   { href: "/resumes", label: "Resumes", icon: "R" },
   { href: "/generate", label: "Generate", icon: "G" },
   { href: "/applications", label: "Applications", icon: "A" },
