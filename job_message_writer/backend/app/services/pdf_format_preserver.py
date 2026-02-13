@@ -16,11 +16,64 @@ import json
 import logging
 import os
 import re
+import unicodedata
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 
 logger = logging.getLogger(__name__)
+
+
+UNICODE_REPLACEMENTS = {
+    "\u2010": "-",  # hyphen
+    "\u2011": "-",  # non-breaking hyphen
+    "\u2012": "-",  # figure dash
+    "\u2013": "-",  # en dash
+    "\u2014": "-",  # em dash
+    "\u2015": "-",  # horizontal bar
+    "\u2212": "-",  # minus sign
+    "\u00ad": "",   # soft hyphen
+    "\u2022": "•",
+    "\u00a0": " ",  # nbsp
+    "\u2007": " ",  # figure space
+    "\u202f": " ",  # narrow nbsp
+    "\u2009": " ",  # thin space
+    "\u200a": " ",  # hair space
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u201c": '"',
+    "\u201d": '"',
+    "\u2026": "...",
+    "\u00b7": "·",
+    "\u037e": ";",  # greek question mark visually similar to semicolon
+}
+
+ZERO_WIDTH_CHARS = {
+    "\u200b", "\u200c", "\u200d", "\ufeff", "\u2060",
+}
+
+UNICODE_FALLBACKS = {
+    "\u2010": "-",
+    "\u2011": "-",
+    "\u2012": "-",
+    "\u2013": "-",
+    "\u2014": "-",
+    "\u2015": "-",
+    "\u2212": "-",
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u201c": '"',
+    "\u201d": '"',
+    "\u2026": "...",
+    "\u00b7": ".",
+    "\u2122": "TM",
+    "\u00ae": "(R)",
+    "\u00a9": "(C)",
+}
+
+# Strict formatting defaults: do not change font family or font size.
+ALLOW_BASE14_FONT_FALLBACK = False
+MAX_FONT_SIZE_REDUCTION = 0.0
 
 
 # ─── Data classes ───────────────────────────────────────────────────────────
@@ -593,7 +646,11 @@ async def generate_optimized_content(
                 continue
             lines_info = []
             for j, lt in enumerate(bp.line_texts):
-                lines_info.append(f"    Line {j+1} ({len(lt)} chars): {lt}")
+                max_chars = max(8, len(lt))
+                min_chars = max(4, int(max_chars * 0.65))
+                lines_info.append(
+                    f"    Line {j+1} (target={len(lt)} chars, min={min_chars}, max={max_chars}): {lt}"
+                )
             bullet_texts.append(f"  BULLET {i+1} ({bp.section_name}):\n" + "\n".join(lines_info))
 
         if not bullet_texts:
@@ -618,9 +675,10 @@ RULES:
 3. Use action verbs and terminology that mirror the job posting's language
 4. PRESERVE: company names, metrics, percentages, dates, and factual claims — do NOT fabricate
 5. Each bullet must have EXACTLY the same number of lines as the original
-6. Each line should be SIMILAR length to the original (±15% character count) to fit the PDF layout
+6. Each line must stay within the provided min/max character range for that line (hard constraint)
 7. Every bullet MUST be modified — do not return any bullet unchanged
 8. Focus on what the job description specifically asks for and weave those themes into each bullet
+9. Use plain ASCII punctuation only: use "-" instead of en/em dashes, ";" instead of unusual semicolons, and no soft hyphens.
 
 JOB DESCRIPTION:
 {job_description[:3000]}
@@ -865,6 +923,10 @@ def apply_changes_to_pdf(
     def add_replacement(page_num: int, spans: List[TextSpan], new_text: str) -> bool:
         """Queue a text replacement: redact spans, then insert new text."""
         ensure_page(page_num)
+        normalized_text = _normalize_replacement_text(new_text)
+        if not normalized_text:
+            logger.warning("[APPLY] Skipping replacement: normalized text is empty")
+            return False
 
         # Redact each span individually
         for s in spans:
@@ -872,21 +934,50 @@ def apply_changes_to_pdf(
 
         # Queue insertion at first span's origin
         first = spans[0]
-        font_name, font_buffer, font_obj = _resolve_font(first.font_name, new_text, font_cache)
+        font_name, font_buffer, font_obj, insert_text, used_fallback_font = _resolve_font(
+            first.font_name, normalized_text, font_cache
+        )
+        if used_fallback_font and not ALLOW_BASE14_FONT_FALLBACK:
+            logger.warning(
+                f"[APPLY] Skipping replacement: preserving original font failed for '{first.font_name}'"
+            )
+            return False
         color = _int_to_rgb(first.color)
         # Fit to the original span envelope, not page margin, to avoid layout bleed.
         original_right = max(s.bbox[2] for s in spans)
         available_width = max((original_right - first.origin[0]) + 1.0, 20.0)
-        fitted_text, fitted_size = _fit_text(
-            new_text, font_name, first.font_size, available_width, font_obj=font_obj
+        fit_result = _fit_text(
+            insert_text,
+            font_name,
+            first.font_size,
+            available_width,
+            font_obj=font_obj,
+            max_size_reduction=MAX_FONT_SIZE_REDUCTION,
         )
+        if not fit_result:
+            compacted = _compact_text_to_fit(
+                insert_text, available_width, font_name, first.font_size, font_obj=font_obj
+            )
+            if not compacted:
+                logger.warning("[APPLY] Skipping replacement: cannot fit text without changing style")
+                return False
+            fit_result = _fit_text(
+                compacted,
+                font_name,
+                first.font_size,
+                available_width,
+                font_obj=font_obj,
+                max_size_reduction=MAX_FONT_SIZE_REDUCTION,
+            )
+            if not fit_result:
+                logger.warning("[APPLY] Skipping replacement after compaction: still cannot fit")
+                return False
+        fitted_text, fitted_size = fit_result
 
         # Guardrail: if text still cannot fit, keep original text in place (skip replacement).
         try:
-            fitted_width = (
-                font_obj.text_length(fitted_text, fontsize=fitted_size)
-                if font_obj
-                else fitz.get_text_length(fitted_text, fontname=font_name, fontsize=fitted_size)
+            fitted_width = _measure_text_width(
+                fitted_text, font_name, fitted_size, font_obj=font_obj
             )
             if fitted_width > (available_width + 0.5):
                 logger.warning(
@@ -1095,14 +1186,173 @@ def _build_font_cache(doc) -> Dict[str, Dict[str, Any]]:
     return cache
 
 
+def _normalize_replacement_text(text: str) -> str:
+    """Normalize replacement text to reduce glyph fallback/font substitution issues."""
+    if not text:
+        return ""
+
+    normalized = unicodedata.normalize("NFKC", text)
+    for bad, good in UNICODE_REPLACEMENTS.items():
+        normalized = normalized.replace(bad, good)
+    for z in ZERO_WIDTH_CHARS:
+        normalized = normalized.replace(z, "")
+
+    # Remove control chars and normalize whitespace.
+    normalized = "".join(
+        ch for ch in normalized
+        if ch == "\n" or ch == "\t" or unicodedata.category(ch)[0] != "C"
+    )
+    normalized = normalized.replace("\n", " ").replace("\t", " ")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _coerce_text_for_font(text: str, font_obj: Any) -> Tuple[str, bool]:
+    """
+    Replace unsupported glyphs with ASCII-safe fallbacks to preserve the original font.
+    Returns (coerced_text, changed).
+    """
+    changed = False
+    out: List[str] = []
+    has_question = font_obj.has_glyph(ord("?"))
+
+    for ch in text:
+        if ch.isspace():
+            out.append(ch)
+            continue
+
+        if font_obj.has_glyph(ord(ch)):
+            out.append(ch)
+            continue
+
+        fallback = UNICODE_FALLBACKS.get(ch)
+        if fallback and all(c.isspace() or font_obj.has_glyph(ord(c)) for c in fallback):
+            out.append(fallback)
+            changed = True
+            continue
+
+        if has_question:
+            out.append("?")
+            changed = True
+            continue
+
+        # Drop last-resort unsupported glyph to avoid forcing a full font fallback.
+        changed = True
+
+    return "".join(out), changed
+
+
+def _measure_text_width(
+    text: str,
+    font_name: str,
+    font_size: float,
+    font_obj: Optional[Any] = None,
+) -> float:
+    if font_obj:
+        return font_obj.text_length(text, fontsize=font_size)
+    return fitz.get_text_length(text, fontname=font_name, fontsize=font_size)
+
+
+def _compact_text_to_fit(
+    text: str,
+    max_width: float,
+    font_name: str,
+    font_size: float,
+    font_obj: Optional[Any] = None,
+) -> Optional[str]:
+    """
+    Deterministically shorten text while preserving meaning as much as possible.
+    Returns a fitted string or None if no safe compaction fits.
+    """
+    original = _normalize_replacement_text(text)
+    if not original:
+        return None
+
+    def width(s: str) -> float:
+        return _measure_text_width(s, font_name, font_size, font_obj=font_obj)
+
+    if width(original) <= max_width:
+        return original
+
+    def apply_replacements(s: str, replacements: List[Tuple[str, str]]) -> str:
+        out = s
+        for src, dst in replacements:
+            out = re.sub(rf"\b{re.escape(src)}\b", dst, out, flags=re.IGNORECASE)
+        return re.sub(r"\s+", " ", out).strip()
+
+    phrase_replacements = [
+        ("application programming interfaces", "APIs"),
+        ("application programming interface", "API"),
+        ("machine learning", "ML"),
+        ("artificial intelligence", "AI"),
+        ("with respect to", "for"),
+        ("in order to", "to"),
+        ("as well as", "and"),
+        ("real-time", "realtime"),
+        ("real time", "realtime"),
+        ("approximately", "~"),
+        ("percent", "%"),
+        ("through", "via"),
+    ]
+    word_replacements = [
+        ("implemented", "built"),
+        ("implementation", "build"),
+        ("developed", "built"),
+        ("utilized", "used"),
+        ("leveraged", "used"),
+        ("optimized", "improved"),
+        ("facilitated", "enabled"),
+    ]
+    filler_words = [
+        "the", "a", "an", "that", "which", "very", "really", "successfully",
+    ]
+
+    candidates: List[str] = []
+
+    c1 = apply_replacements(original, phrase_replacements)
+    candidates.append(c1)
+
+    c2 = apply_replacements(c1, word_replacements)
+    candidates.append(c2)
+
+    c3 = c2
+    for fw in filler_words:
+        c3 = re.sub(rf"\b{re.escape(fw)}\b\s*", "", c3, flags=re.IGNORECASE)
+    c3 = re.sub(r"\s+", " ", c3).strip(" ,;")
+    candidates.append(c3)
+
+    # Clause trimming as a last resort.
+    # Preserve at least 70% of original character length to avoid semantic collapse.
+    min_chars = max(8, int(len(original) * 0.7))
+    c4 = c3
+    for sep in ["; ", ", ", " - "]:
+        if width(c4) <= max_width:
+            break
+        parts = c4.split(sep)
+        while len(parts) > 1 and len(sep.join(parts[:-1])) >= min_chars:
+            trial = sep.join(parts[:-1]).strip(" ,;")
+            if trial and width(trial) <= max_width:
+                return trial
+            parts = parts[:-1]
+        c4 = sep.join(parts)
+    candidates.append(c4)
+
+    for cand in candidates:
+        cand = _normalize_replacement_text(cand)
+        if cand and len(cand) >= min_chars and width(cand) <= max_width:
+            return cand
+
+    return None
+
+
 def _resolve_font(
     original_font_name: str,
     new_text: str,
     font_cache: Dict[str, Dict[str, Any]],
-) -> Tuple[str, Optional[bytes], Optional[Any]]:
+) -> Tuple[str, Optional[bytes], Optional[Any], str, bool]:
     """Try to reuse the original embedded font. Falls back to Base14.
 
-    Returns (fontname_for_insert, font_buffer_or_None, font_obj_or_None).
+    Returns (fontname_for_insert, font_buffer_or_None, font_obj_or_None, text_for_insert, used_fallback_font).
     When font_buffer is not None, the caller must call page.insert_font() before insert_text().
     """
     # Try exact match
@@ -1128,17 +1378,27 @@ def _resolve_font(
             missing = [c for c in new_text if not c.isspace() and not font_obj.has_glyph(ord(c))]
             if not missing:
                 ref_name = f"f{info['xref']}"
-                return ref_name, info["buffer"], font_obj
+                return ref_name, info["buffer"], font_obj, new_text, False
             else:
+                coerced_text, changed = _coerce_text_for_font(new_text, font_obj)
+                missing_after = [c for c in coerced_text if not c.isspace() and not font_obj.has_glyph(ord(c))]
+                if not missing_after:
+                    if changed:
+                        logger.info(
+                            f"[FONTS] Coerced {len(missing)} unsupported glyph(s) for '{original_font_name}' "
+                            f"to preserve original font"
+                        )
+                    ref_name = f"f{info['xref']}"
+                    return ref_name, info["buffer"], font_obj, coerced_text, False
                 logger.info(
-                    f"[FONTS] Font '{original_font_name}' missing {len(missing)} glyphs "
-                    f"({set(missing) if len(set(missing)) <= 5 else '...'}), falling back to Base14"
+                    f"[FONTS] Font '{original_font_name}' missing {len(missing_after)} glyphs after coercion, "
+                    f"falling back to Base14"
                 )
         except Exception as e:
             logger.warning(f"[FONTS] Glyph check failed for '{original_font_name}': {e}")
 
     # Fallback to Base14
-    return _map_to_base14(original_font_name), None, None
+    return _map_to_base14(original_font_name), None, None, new_text, True
 
 
 def _map_to_base14(font_name: str) -> str:
@@ -1194,36 +1454,35 @@ def _fit_text(
     size: float,
     max_width: float,
     font_obj: Optional[Any] = None,
-) -> Tuple[str, float]:
+    max_size_reduction: float = 0.0,
+) -> Optional[Tuple[str, float]]:
     """
-    Fit text to available width. Returns (text, font_size).
+    Fit text to available width. Returns (text, font_size) or None if it cannot fit.
     Uses font_obj.text_length() for extracted fonts, fitz.get_text_length() for Base14.
-    Tries reducing font size first. Never truncates content.
+    Never truncates content.
     """
-    def measure(txt: str, sz: float) -> float:
-        if font_obj:
-            return font_obj.text_length(txt, fontsize=sz)
-        return fitz.get_text_length(txt, fontname=font, fontsize=sz)
-
     try:
-        text_width = measure(text, size)
+        text_width = _measure_text_width(text, font, size, font_obj=font_obj)
         if text_width <= max_width:
             return text, size
 
-        # Try reducing font size by up to 1.5pt
-        for reduction in [0.25, 0.5, 0.75, 1.0, 1.25, 1.5]:
+        if max_size_reduction <= 0:
+            return None
+
+        # Controlled reductions if explicitly allowed.
+        step = 0.1
+        reduction = step
+        while reduction <= max_size_reduction + 1e-9:
             smaller = size - reduction
             if smaller < 6:
                 break
-            if measure(text, smaller) <= max_width:
+            if _measure_text_width(text, font, smaller, font_obj=font_obj) <= max_width:
                 return text, smaller
-
-        # Last resort: preserve full text at minimum size (do not truncate content).
-        min_size = max(size - 1.5, 6)
-        return text, min_size
+            reduction += step
+        return None
 
     except Exception:
-        return text, size
+        return None
 
 
 # ─── Public API ────────────────────────────────────────────────────────────
