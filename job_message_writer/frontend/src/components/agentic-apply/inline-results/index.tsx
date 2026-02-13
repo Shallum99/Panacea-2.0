@@ -6,18 +6,76 @@ import InlineATSScore from "./InlineATSScore";
 import InlineEmailForm from "./InlineEmailForm";
 import InlineJobCards from "./InlineJobCards";
 import InlineJobDetail from "./InlineJobDetail";
+import ArtifactCard from "./ArtifactCard";
+
+const ARTIFACT_TYPES = new Set(["message_preview", "resume_tailored", "resume_score"]);
 
 interface Props {
   richType: string;
   data: unknown;
   onSendMessage?: (text: string) => void;
+  onOpenArtifact?: (messageId: string) => void;
+  activeArtifactMessageId?: string | null;
+  messageId?: string;
+}
+
+function getArtifactTitle(richType: string, data: Record<string, unknown>): string {
+  switch (richType) {
+    case "message_preview":
+      return (data.subject as string) || "Generated Message";
+    case "resume_tailored":
+      return `Tailored: ${(data.resume_title as string) || "Resume"}`;
+    case "resume_score":
+      return `ATS Score${data.resume_title ? ` \u2014 ${data.resume_title}` : ""}`;
+    default:
+      return "Artifact";
+  }
+}
+
+function getArtifactSubtitle(richType: string, data: Record<string, unknown>): string | undefined {
+  switch (richType) {
+    case "message_preview":
+      return data.message_type as string | undefined;
+    case "resume_tailored": {
+      const before = data.ats_score_before as number | undefined;
+      const after = data.ats_score_after as number | undefined;
+      if (before != null && after != null) return `ATS: ${before}% \u2192 ${after}%`;
+      return undefined;
+    }
+    case "resume_score":
+      return data.score != null ? `Score: ${data.score}` : undefined;
+    default:
+      return undefined;
+  }
 }
 
 export default function InlineRichResult({
   richType,
   data,
   onSendMessage,
+  onOpenArtifact,
+  activeArtifactMessageId,
+  messageId,
 }: Props) {
+  // Route artifact types to compact cards when artifact handler is available
+  if (
+    onOpenArtifact &&
+    messageId &&
+    ARTIFACT_TYPES.has(richType)
+  ) {
+    const d = data as Record<string, unknown>;
+    return (
+      <ArtifactCard
+        type={richType as "message_preview" | "resume_tailored" | "resume_score"}
+        title={getArtifactTitle(richType, d)}
+        subtitle={getArtifactSubtitle(richType, d)}
+        isActive={activeArtifactMessageId === messageId}
+        onClick={() => onOpenArtifact(messageId)}
+      />
+    );
+  }
+
+  // Full inline rendering (fallback or non-artifact types)
   switch (richType) {
     case "message_preview":
       return (

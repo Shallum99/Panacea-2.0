@@ -420,7 +420,16 @@ async def _tool_iterate_message(args: Dict, user: models.User, db: Session) -> T
 
 
 async def _tool_tailor_resume(args: Dict, user: models.User, db: Session) -> Tuple[Dict, str]:
-    from app.services.pdf_format_preserver import tailor_resume
+    import os
+    import uuid
+    import tempfile
+    import fitz
+    from app.services.pdf_format_preserver import optimize_pdf
+    from app.services.storage import (
+        is_local_path, download_to_tempfile, upload_file,
+        RESUMES_BUCKET, TAILORED_BUCKET,
+    )
+    from app.utils.ats_scorer import calculate_match_score
 
     jd = args["job_description"]
     resume_id = args.get("resume_id")
@@ -439,14 +448,55 @@ async def _tool_tailor_resume(args: Dict, user: models.User, db: Session) -> Tup
     if not resume.file_path:
         return {"error": "Resume has no PDF file."}, "error"
 
-    result = await tailor_resume(resume.file_path, jd, user.id)
+    download_id = uuid.uuid4().hex
+
+    # Calculate original ATS score
+    original_score = await calculate_match_score(
+        resume.content or "", jd
+    )
+
+    async def _run_optimize(input_path: str):
+        fd, out_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        try:
+            result = await optimize_pdf(
+                pdf_path=input_path,
+                output_path=out_path,
+                job_description=jd,
+                resume_content=resume.content or "",
+            )
+            # Read optimized text for ATS scoring
+            doc = fitz.open(out_path)
+            optimized_text = "".join(page.get_text() for page in doc)
+            doc.close()
+            # Upload tailored PDF to storage
+            with open(out_path, "rb") as f:
+                output_bytes = f.read()
+            tailored_path = f"{user.id}/{download_id}.pdf"
+            await upload_file(TAILORED_BUCKET, tailored_path, output_bytes)
+            return result, optimized_text
+        finally:
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+
+    if is_local_path(resume.file_path):
+        if not os.path.exists(resume.file_path):
+            return {"error": "Original PDF not found. Re-upload the resume."}, "error"
+        result, optimized_text = await _run_optimize(resume.file_path)
+    else:
+        with download_to_tempfile(RESUMES_BUCKET, resume.file_path) as tmp_path:
+            result, optimized_text = await _run_optimize(tmp_path)
+
+    optimized_score = await calculate_match_score(optimized_text, jd)
 
     return {
         "resume_title": resume.title,
-        "download_id": result.get("download_id"),
+        "download_id": download_id,
         "sections_optimized": result.get("sections_optimized", []),
-        "ats_score_before": result.get("ats_score_before"),
-        "ats_score_after": result.get("ats_score_after"),
+        "ats_score_before": original_score,
+        "ats_score_after": optimized_score,
     }, "resume_tailored"
 
 
