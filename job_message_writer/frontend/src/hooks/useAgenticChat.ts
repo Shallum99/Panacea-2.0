@@ -258,6 +258,18 @@ export function useAgenticChat(searchParams?: URLSearchParams) {
                   },
                 ];
               });
+
+              // If this is a context update from set_context tool, merge into context state
+              if (event.rich_type === "context_update" && event.result) {
+                const update = event.result as Partial<ChatContext>;
+                setContextState((prev) => {
+                  const merged = { ...prev, ...update };
+                  try {
+                    sessionStorage.setItem(CONTEXT_STORAGE_KEY, JSON.stringify(merged));
+                  } catch { /* ignore */ }
+                  return merged;
+                });
+              }
               break;
             }
             case "text": {
@@ -357,6 +369,9 @@ function inferRichType(toolName: string | null): string {
     list_applications: "applications_list",
     list_resumes: "resumes_list",
     save_job: "job_saved",
+    research_company: "company_research",
+    set_context: "context_update",
+    edit_tailored_resume: "resume_tailored",
   };
   return map[toolName || ""] || "generic";
 }

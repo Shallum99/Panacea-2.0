@@ -154,6 +154,45 @@ TOOL_DEFINITIONS = [
             "required": ["title", "content"],
         },
     },
+    {
+        "name": "research_company",
+        "description": "Research a company by scraping their website for info about mission, values, products, culture, and tech stack. Use this when the job description doesn't have enough company context to answer interview questions or generate highly personalized content.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "company_name": {"type": "string", "description": "Company name (e.g. 'Stripe', 'Airbnb')"},
+                "url": {"type": "string", "description": "Company website URL (optional — will be guessed from company name if not provided)"},
+            },
+            "required": ["company_name"],
+        },
+    },
+    {
+        "name": "set_context",
+        "description": "Extract and save key context from the conversation. Call this when the user shares a job description, URL, company name, recruiter name, or any application-relevant info. This updates the UI context panel so tools can use it automatically.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "job_description": {"type": "string", "description": "Full job description text"},
+                "position_title": {"type": "string", "description": "Job title extracted from JD"},
+                "recruiter_name": {"type": "string", "description": "Recruiter/hiring manager name if found"},
+                "recipient_email": {"type": "string", "description": "Recruiter email address if found"},
+                "company_name": {"type": "string", "description": "Company name"},
+                "job_url": {"type": "string", "description": "Job listing URL"},
+            },
+        },
+    },
+    {
+        "name": "edit_tailored_resume",
+        "description": "Make targeted text edits to a previously tailored resume PDF. Use when the user wants to change specific bullets, skills, or sections after tailoring. Takes the download_id of the current version and edit instructions, returns a new version.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "download_id": {"type": "string", "description": "download_id of the current tailored resume version"},
+                "instructions": {"type": "string", "description": "What to change (e.g. 'change the second bullet in Experience to emphasize Python and add Kubernetes')"},
+            },
+            "required": ["download_id", "instructions"],
+        },
+    },
 ]
 
 
@@ -181,6 +220,9 @@ async def execute_tool(
         "send_email": _tool_send_email,
         "list_applications": _tool_list_applications,
         "save_job": _tool_save_job,
+        "research_company": _tool_research_company,
+        "set_context": _tool_set_context,
+        "edit_tailored_resume": _tool_edit_tailored_resume,
     }
 
     handler = handlers.get(tool_name)
@@ -727,3 +769,371 @@ async def _tool_save_job(args: Dict, user: models.User, db: Session) -> Tuple[Di
         "company": company_name,
         "source": source,
     }, "job_saved"
+
+
+async def _tool_research_company(args: Dict, user: models.User, db: Session) -> Tuple[Dict, str]:
+    """Scrape a company website and extract structured info via Claude."""
+    import httpx
+    from bs4 import BeautifulSoup
+    from app.llm.claude_client import ClaudeClient
+
+    company_name = args["company_name"]
+    provided_url = args.get("url")
+
+    # Build candidate URLs — strip everything except alphanumeric and hyphens
+    import re as _re
+    slug = _re.sub(r'[^a-z0-9-]', '', company_name.lower().replace(" ", ""))
+    candidates = []
+    if provided_url:
+        candidates.append(provided_url)
+    candidates.extend([
+        f"https://www.{slug}.com",
+        f"https://{slug}.com",
+        f"https://{slug}.io",
+    ])
+
+    # Try to scrape main page + about page
+    scraped_text = ""
+    successful_url = None
+
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=15.0,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        },
+    ) as client:
+        # Try each candidate URL
+        for url in candidates:
+            try:
+                resp = await client.get(url)
+                if resp.status_code == 200:
+                    successful_url = url
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    for tag in soup(["script", "style", "nav", "footer", "noscript"]):
+                        tag.decompose()
+                    main = soup.find("main") or soup.find("article") or soup.body or soup
+                    text = main.get_text(separator="\n", strip=True)
+                    scraped_text += f"--- MAIN PAGE ({url}) ---\n{text[:5000]}\n\n"
+                    break
+            except Exception:
+                continue
+
+        # Try /about page if we found the base URL
+        if successful_url:
+            base = successful_url.rstrip("/")
+            for about_path in ["/about", "/about-us", "/company"]:
+                try:
+                    resp = await client.get(base + about_path)
+                    if resp.status_code == 200:
+                        soup = BeautifulSoup(resp.text, "html.parser")
+                        for tag in soup(["script", "style", "nav", "footer", "noscript"]):
+                            tag.decompose()
+                        main = soup.find("main") or soup.find("article") or soup.body or soup
+                        text = main.get_text(separator="\n", strip=True)
+                        scraped_text += f"--- ABOUT PAGE ({base + about_path}) ---\n{text[:5000]}\n\n"
+                        break
+                except Exception:
+                    continue
+
+    if not scraped_text:
+        return {
+            "company_name": company_name,
+            "error": f"Could not access {company_name}'s website. Try providing the URL directly.",
+        }, "company_research"
+
+    # Send to Claude for structured extraction
+    claude = ClaudeClient()
+    extraction_prompt = f"""Extract key company information from these web pages for {company_name}.
+
+{scraped_text[:8000]}
+
+Return a JSON object with these fields (use null for anything you can't determine):
+{{
+  "company_name": "Official name",
+  "summary": "1-2 sentence description of what the company does",
+  "mission": "Their mission or vision statement",
+  "products": ["List of main products/services"],
+  "tech_stack": ["Known technologies they use"],
+  "culture_values": ["Core values or culture highlights"],
+  "industry": "Primary industry",
+  "size": "Company size if mentioned (e.g. '500+ employees')",
+  "headquarters": "Location",
+  "notable_facts": ["2-3 interesting facts useful for interview prep"]
+}}
+
+Return ONLY the JSON object, no extra text."""
+
+    try:
+        extraction_text = await claude._send_request(
+            system_prompt="You extract structured company information from web content. Return only valid JSON.",
+            user_prompt=extraction_prompt,
+            max_tokens=2048,
+            model=claude.fast_model,
+        )
+
+        import re
+        match = re.search(r'\{[\s\S]*\}', extraction_text)
+        if match:
+            company_data = json.loads(match.group())
+        else:
+            company_data = json.loads(extraction_text)
+
+        company_data["company_name"] = company_data.get("company_name", company_name)
+        company_data["source_url"] = successful_url
+        return company_data, "company_research"
+
+    except Exception as e:
+        logger.error(f"Company research extraction failed: {e}")
+        return {
+            "company_name": company_name,
+            "raw_text": scraped_text[:3000],
+            "note": "Extracted raw text but structured analysis failed.",
+        }, "company_research"
+
+
+async def _tool_set_context(args: Dict, user: models.User, db: Session) -> Tuple[Dict, str]:
+    """Pass-through tool — returns extracted context for the frontend to merge into state."""
+    context = {k: v for k, v in args.items() if v}
+    return context, "context_update"
+
+
+async def _tool_edit_tailored_resume(args: Dict, user: models.User, db: Session) -> Tuple[Dict, str]:
+    """Make targeted text edits to a previously tailored resume PDF."""
+    import os
+    import uuid
+    import tempfile
+    import difflib
+    import fitz
+    from app.services.pdf_format_preserver import (
+        extract_spans_from_pdf,
+        group_into_visual_lines,
+        classify_lines,
+        group_bullet_points,
+        apply_changes_to_pdf,
+    )
+    from app.services.storage import download_file, upload_file, TAILORED_BUCKET
+    from app.llm.claude_client import ClaudeClient
+
+    download_id = args["download_id"]
+    instructions = args["instructions"]
+
+    # 1. Download the current tailored PDF from Supabase
+    storage_path = f"{user.id}/{download_id}.pdf"
+    try:
+        pdf_bytes = await download_file(TAILORED_BUCKET, storage_path)
+    except Exception:
+        return {"error": "Could not find that tailored resume. The download_id may be wrong or expired."}, "error"
+
+    # 2. Write to temp file for processing
+    fd, input_path = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)
+    try:
+        with open(input_path, "wb") as f:
+            f.write(pdf_bytes)
+
+        # 3. Extract and classify text
+        spans = extract_spans_from_pdf(input_path)
+        visual_lines = group_into_visual_lines(spans)
+        classified, _ = classify_lines(visual_lines)
+        bullets, skills, title_skills = group_bullet_points(classified)
+
+        # 4. Build human-readable resume map for Claude
+        resume_map_parts = []
+
+        for i, bp in enumerate(bullets):
+            section = bp.section_name or "Unknown"
+            text = bp.full_text
+            line_count = len(bp.text_lines)
+            char_counts = bp.line_char_counts
+            resume_map_parts.append(
+                f"BULLET {i} [{section}] ({line_count} lines, chars per line: {char_counts}):\n  \"{text}\""
+            )
+
+        for i, sl in enumerate(skills):
+            label_text = "".join(s.text for s in sl.label_spans).strip()
+            content_text = "".join(s.text for s in sl.content_spans).strip()
+            section = sl.section_name or "Skills"
+            resume_map_parts.append(
+                f"SKILL {i} [{section}]: \"{label_text}{content_text}\""
+            )
+
+        for i, tsl in enumerate(title_skills):
+            resume_map_parts.append(
+                f"TITLE_SKILL {i}: \"{tsl.full_text}\" (title: \"{tsl.title_part}\", skills: \"{tsl.skills_part}\")"
+            )
+
+        resume_map = "\n".join(resume_map_parts)
+
+        # 5. Send to Claude for targeted edits
+        claude = ClaudeClient()
+        edit_prompt = f"""You are editing a resume PDF. Below is the current content organized by type (bullets, skills, title skills).
+
+The user wants to make this change:
+{instructions}
+
+CURRENT RESUME CONTENT:
+{resume_map}
+
+RULES:
+- Only change what the user asked for. Leave everything else untouched.
+- For bullets: each replacement MUST have the SAME number of lines as the original.
+- For bullets: each line MUST be SIMILAR length (±15% chars) as the original line to fit the PDF layout.
+- For skills: return only the content part (not the bold label).
+- For title skills: return only the skills part (not the title itself).
+- Preserve all metrics, dates, company names unless the user explicitly asked to change them.
+
+Return a JSON object with ONLY the items you changed:
+{{
+  "bullet_replacements": {{"<bullet_index>": ["line 1 text", "line 2 text", ...]}},
+  "skill_replacements": {{"<skill_index>": "new content without label"}},
+  "title_replacements": {{"<title_index>": "new skills part"}}
+}}
+
+Return ONLY the JSON. If nothing should change, return {{"bullet_replacements": {{}}, "skill_replacements": {{}}, "title_replacements": {{}}}}"""
+
+        edit_text = await claude._send_request(
+            system_prompt="You make precise, targeted edits to resume text. Return only valid JSON.",
+            user_prompt=edit_prompt,
+            max_tokens=4096,
+        )
+
+        import re
+        match = re.search(r'\{[\s\S]*\}', edit_text)
+        if match:
+            edits = json.loads(match.group())
+        else:
+            edits = json.loads(edit_text)
+
+        bullet_replacements = {int(k): v for k, v in edits.get("bullet_replacements", {}).items()}
+        skill_replacements = {int(k): v for k, v in edits.get("skill_replacements", {}).items()}
+        title_replacements = {int(k): v for k, v in edits.get("title_replacements", {}).items()}
+
+        if not bullet_replacements and not skill_replacements and not title_replacements:
+            return {"error": "No edits could be applied based on those instructions."}, "error"
+
+        # 6. Apply changes to PDF
+        fd2, output_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd2)
+        try:
+            apply_changes_to_pdf(
+                input_path, output_path,
+                bullets, skills,
+                bullet_replacements, skill_replacements,
+                title_skills, title_replacements,
+            )
+
+            # Read output
+            with open(output_path, "rb") as f:
+                output_bytes = f.read()
+
+            # 7. Upload new version
+            new_download_id = uuid.uuid4().hex
+            new_storage_path = f"{user.id}/{new_download_id}.pdf"
+            await upload_file(TAILORED_BUCKET, new_storage_path, output_bytes)
+
+            # 8. Generate diff PDF (previous vs new)
+            diff_download_id = uuid.uuid4().hex
+            try:
+                prev_doc = fitz.open(input_path)
+                new_doc = fitz.open(stream=output_bytes, filetype="pdf")
+                green = fitz.utils.getColor("green")
+
+                def _group_words_by_line(words, y_tolerance=3):
+                    lines = {}
+                    for w in words:
+                        y_key = round(w[1] / y_tolerance) * y_tolerance
+                        if y_key not in lines:
+                            lines[y_key] = []
+                        lines[y_key].append(w)
+                    for y_key in lines:
+                        lines[y_key].sort(key=lambda w: w[0])
+                    return lines
+
+                for page_idx in range(min(len(new_doc), len(prev_doc))):
+                    prev_page = prev_doc[page_idx]
+                    new_page = new_doc[page_idx]
+                    prev_words = prev_page.get_text("words")
+                    new_words = new_page.get_text("words")
+                    prev_lines = _group_words_by_line(prev_words)
+                    new_lines = _group_words_by_line(new_words)
+                    prev_y_keys = sorted(prev_lines.keys())
+
+                    for y_key, new_line_words in new_lines.items():
+                        closest_y = min(prev_y_keys, key=lambda oy: abs(oy - y_key)) if prev_y_keys else None
+                        if closest_y is None or abs(closest_y - y_key) > 6:
+                            for w in new_line_words:
+                                rect = fitz.Rect(w[0], w[1], w[2], w[3])
+                                annot = new_page.add_highlight_annot(rect)
+                                annot.set_colors(stroke=green)
+                                annot.set_opacity(0.35)
+                                annot.update()
+                            continue
+                        prev_line_words = prev_lines[closest_y]
+                        prev_texts = [w[4] for w in prev_line_words]
+                        new_texts = [w[4] for w in new_line_words]
+                        if prev_texts == new_texts:
+                            continue
+                        matcher = difflib.SequenceMatcher(None, prev_texts, new_texts)
+                        for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+                            if tag in ("replace", "insert"):
+                                for wi in range(j1, j2):
+                                    w = new_line_words[wi]
+                                    rect = fitz.Rect(w[0], w[1], w[2], w[3])
+                                    annot = new_page.add_highlight_annot(rect)
+                                    annot.set_colors(stroke=green)
+                                    annot.set_opacity(0.35)
+                                    annot.update()
+
+                prev_doc.close()
+                diff_bytes = new_doc.tobytes()
+                new_doc.close()
+                diff_path = f"{user.id}/{diff_download_id}.pdf"
+                await upload_file(TAILORED_BUCKET, diff_path, diff_bytes)
+            except Exception as e:
+                logger.warning(f"Failed to generate edit diff PDF: {e}")
+
+            # 9. Build changes list
+            changes = []
+            for idx, new_lines in bullet_replacements.items():
+                if idx < len(bullets):
+                    changes.append({
+                        "section": bullets[idx].section_name,
+                        "type": "bullet",
+                        "original": bullets[idx].full_text,
+                        "optimized": " ".join(new_lines),
+                    })
+            for idx, new_content in skill_replacements.items():
+                if idx < len(skills):
+                    label = "".join(s.text for s in skills[idx].label_spans).strip()
+                    orig = "".join(s.text for s in skills[idx].content_spans).strip()
+                    changes.append({
+                        "section": skills[idx].section_name,
+                        "type": "skill",
+                        "original": f"{label}{orig}",
+                        "optimized": f"{label}{new_content}",
+                    })
+
+            return {
+                "resume_title": "Edited Resume",
+                "download_id": new_download_id,
+                "diff_download_id": diff_download_id,
+                "sections_optimized": list(set(c["section"] for c in changes)),
+                "changes": changes,
+            }, "resume_tailored"
+
+        finally:
+            try:
+                os.unlink(output_path)
+            except OSError:
+                pass
+
+    finally:
+        try:
+            os.unlink(input_path)
+        except OSError:
+            pass

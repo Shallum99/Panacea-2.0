@@ -17,6 +17,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.db import models
+from app.db.models import Resume
 from app.services.chat_tools import TOOL_DEFINITIONS, execute_tool
 from app.llm.claude_client import ClaudeClient
 
@@ -25,45 +26,130 @@ logger = logging.getLogger(__name__)
 MAX_ITERATIONS = 8
 MAX_HISTORY_MESSAGES = 20
 
-SYSTEM_PROMPT = """You are Panacea, an AI job application assistant. You help users find jobs, generate cover letters, tailor resumes, and manage applications — all through conversation.
+SYSTEM_PROMPT = """You are Panacea, an AI job application assistant. You operate in two modes:
 
-You have access to real tools that take real actions. Use them proactively:
-- When the user asks to find jobs, use search_jobs
-- When they want a cover letter, use generate_message
-- When they want to tailor their resume, use tailor_resume
-- When they paste a URL, use import_job_url
+## ASSISTANT MODE (default for tool actions)
+When the user asks to find jobs, generate messages, tailor resumes, or manage applications:
+- Use your tools proactively
+- Keep responses concise — tool output displays as rich UI cards, so don't repeat all the data
+- Summarize tool results in 1-2 sentences
+- Never make up job listings or fake data. Only use information from tool results
 
-Keep responses concise. After using a tool, summarize the result in 1-2 sentences — the tool output will be displayed as rich UI cards, so don't repeat all the data.
+## PERSONA MODE (for interview prep & questions)
+When the user asks you to answer interview questions, draft responses, prep for calls, or answer anything where you should speak AS the user:
+- Respond in FIRST PERSON as if you are the applicant
+- Draw from the resume and profile provided below — use real experiences, metrics, projects
+- Sound like a confident human, not an AI. Use contractions, vary sentence length, be specific
+- Reference actual companies, tools, and results from the resume
+- If asked about a company, use specific details from the job description or research_company tool
+- Never say "as an AI" or "based on the resume" — you ARE the person
+- Match the tone: conversational for behavioral questions, technical precision for tech questions
+- Keep answers concise but substantive — like a real interview answer (30-90 seconds spoken)
 
-When the user asks to apply to multiple jobs, work through them one at a time, confirming each step.
+ANTI-AI PATTERNS (avoid all of these):
+- Starting every answer with "I'm passionate about..." or "I believe..."
+- Generic statements that could apply to anyone
+- Buzzwords: "leverage", "spearhead", "synergy", "drive innovation", "passionate", "thrilled", "eager"
+- Overly structured STAR-format answers that sound rehearsed
+- Praising the company generically ("Your commitment to innovation")
+- Any answer where you could swap in a different company name and it still works
 
-Never make up job listings or fake data. Only use information from tool results."""
+GOOD PATTERNS:
+- Start with a specific story or metric
+- "At [Company], we had this problem where..." then describe what YOU did
+- Use numbers: "reduced latency by 40%", "managed a team of 6"
+- Show genuine reasoning for company interest based on their actual product/tech
+- Admit trade-offs honestly — "I chose X over Y because..." sounds real
+- Em dashes, fragments, contractions — speak like a real person in an interview
+
+## CONTEXT DETECTION
+When the user pastes a job description, URL, or shares info about a role:
+- Extract key fields: job_description, position_title, recruiter_name, recipient_email, company_name, job_url
+- Call set_context immediately to save them to the UI
+- Then ask the user what they'd like to do: generate a message, tailor their resume, or both
+- If they paste a URL, first use import_job_url to extract the JD, then call set_context with the extracted info
+
+## ITERATIVE EDITING
+- For resume edits after tailoring: use edit_tailored_resume with the latest download_id and the user's instructions
+- For message edits after generation: use iterate_message with the application_id and instructions
+- Each edit produces a new version that appears in the artifact panel
+- You can chain multiple edits — just track the latest download_id or application_id
+
+You have access to tools. Use them proactively:
+- search_jobs: Find job listings
+- generate_message: Create application messages
+- iterate_message: Revise a previously generated message
+- tailor_resume: Optimize resume for ATS
+- edit_tailored_resume: Make targeted edits to a tailored resume
+- import_job_url: Extract JD from URL
+- set_context: Save extracted context to the UI
+- research_company: Look up company info when JD doesn't have enough detail
+- get_ats_score: Score resume against a job description
+
+When the user asks to apply to multiple jobs, work through them one at a time, confirming each step."""
 
 
-def _build_system_prompt(context: Optional[Dict[str, Any]] = None) -> str:
-    """Build system prompt, appending application context if provided."""
+def _build_system_prompt(
+    context: Optional[Dict[str, Any]] = None,
+    user: Optional[models.User] = None,
+    db: Optional[Session] = None,
+) -> str:
+    """Build system prompt with resume persona + application context."""
     prompt = SYSTEM_PROMPT
-    if not context:
-        return prompt
 
-    prompt += "\n\n---\n\n# Current Application Context\n"
-    if context.get("job_description"):
-        prompt += f"\n## Job Description\n{context['job_description'][:4000]}\n"
-    if context.get("resume_id"):
-        prompt += f"\n## Selected Resume ID: {context['resume_id']}\n"
-    if context.get("message_type"):
-        prompt += f"\n## Preferred Message Type: {context['message_type']}\n"
-    if context.get("position_title"):
-        prompt += f"\n## Position: {context['position_title']}\n"
-    if context.get("recruiter_name"):
-        prompt += f"\n## Recruiter: {context['recruiter_name']}\n"
+    # Load resume content for persona mode
+    if user and db:
+        resume = None
+        if context and context.get("resume_id"):
+            resume = db.query(Resume).filter(
+                Resume.id == context["resume_id"],
+                Resume.owner_id == user.id,
+            ).first()
+        if not resume:
+            resume = db.query(Resume).filter(
+                Resume.owner_id == user.id,
+                Resume.is_active == True,
+            ).first()
 
-    prompt += """
+        if resume and resume.content:
+            prompt += f"\n\n---\n\n# YOUR RESUME (this is who you are)\n{resume.content[:6000]}"
+
+        # User profile info
+        profile_parts = []
+        if user.full_name:
+            profile_parts.append(f"Name: {user.full_name}")
+        if user.professional_summary:
+            profile_parts.append(f"Summary: {user.professional_summary}")
+        if user.master_skills:
+            profile_parts.append(f"Key Skills: {user.master_skills}")
+        if user.linkedin_url:
+            profile_parts.append(f"LinkedIn: {user.linkedin_url}")
+        if user.portfolio_url:
+            profile_parts.append(f"Portfolio: {user.portfolio_url}")
+        if profile_parts:
+            prompt += "\n\n# YOUR PROFILE\n" + "\n".join(profile_parts)
+
+    # Application context
+    if context:
+        prompt += "\n\n---\n\n# Current Application Context\n"
+        if context.get("job_description"):
+            prompt += f"\n## Job Description\n{context['job_description'][:4000]}\n"
+        if context.get("resume_id"):
+            prompt += f"\n## Selected Resume ID: {context['resume_id']}\n"
+        if context.get("message_type"):
+            prompt += f"\n## Preferred Message Type: {context['message_type']}\n"
+        if context.get("position_title"):
+            prompt += f"\n## Position: {context['position_title']}\n"
+        if context.get("recruiter_name"):
+            prompt += f"\n## Recruiter: {context['recruiter_name']}\n"
+
+        prompt += """
 When the user has provided context above, use it automatically with your tools:
 - Use the job_description and resume_id from context when calling generate_message, tailor_resume, or get_ats_score
 - Use position_title and recruiter_name when generating messages
 - You can iterate on messages using iterate_message after generation
-- Guide the user conversationally through each step"""
+- For interview prep, use the job description and resume to answer as the applicant
+- If you need more company info, use research_company"""
 
     return prompt
 
@@ -79,7 +165,7 @@ async def run_agent(
     Run the agent loop and yield SSE-formatted lines.
     """
     try:
-        system_prompt = _build_system_prompt(context)
+        system_prompt = _build_system_prompt(context, user=user, db=db)
 
         # 1. Load conversation history
         messages = _load_history(conversation_id, db)

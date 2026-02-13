@@ -42,6 +42,9 @@ const TOOL_LABELS: Record<string, string> = {
   send_email: "Sending email",
   list_applications: "Loading applications",
   save_job: "Saving job",
+  research_company: "Researching company",
+  set_context: "Extracting context",
+  edit_tailored_resume: "Editing resume",
 };
 
 export default function ChatArea({
