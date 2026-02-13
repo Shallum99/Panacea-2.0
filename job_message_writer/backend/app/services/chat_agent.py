@@ -78,145 +78,150 @@ async def run_agent(
     """
     Run the agent loop and yield SSE-formatted lines.
     """
-    system_prompt = _build_system_prompt(context)
+    try:
+        system_prompt = _build_system_prompt(context)
 
-    # 1. Load conversation history
-    messages = _load_history(conversation_id, db)
+        # 1. Load conversation history
+        messages = _load_history(conversation_id, db)
 
-    # 2. Save user message to DB
-    user_msg = models.ChatMessage(
-        conversation_id=conversation_id,
-        role="user",
-        content=user_message,
-    )
-    db.add(user_msg)
-    db.commit()
+        # 2. Save user message to DB
+        user_msg = models.ChatMessage(
+            conversation_id=conversation_id,
+            role="user",
+            content=user_message,
+        )
+        db.add(user_msg)
+        db.commit()
 
-    # 3. Add user message to Claude messages
-    messages.append({"role": "user", "content": user_message})
+        # 3. Add user message to Claude messages
+        messages.append({"role": "user", "content": user_message})
 
-    # 4. Agent loop
-    claude = ClaudeClient()
-    iteration = 0
+        # 4. Agent loop
+        claude = ClaudeClient()
+        iteration = 0
 
-    while iteration < MAX_ITERATIONS:
-        iteration += 1
+        while iteration < MAX_ITERATIONS:
+            iteration += 1
 
-        # Call Claude (non-streaming) with tools
-        response = await _call_claude(claude, messages, system_prompt)
+            # Call Claude (non-streaming) with tools
+            response = await _call_claude(claude, messages, system_prompt)
 
-        if not response:
-            yield _sse({"type": "text", "content": "I encountered an error. Please try again."})
+            if not response:
+                yield _sse({"type": "text", "content": "I encountered an error. Please try again."})
+                yield _sse({"type": "done"})
+                return
+
+            content_blocks = response.get("content", [])
+
+            # Check if Claude wants to use tools
+            tool_uses = [b for b in content_blocks if b.get("type") == "tool_use"]
+            text_blocks = [b for b in content_blocks if b.get("type") == "text"]
+
+            if tool_uses:
+                # Build the assistant message with all content blocks
+                assistant_content = []
+                for block in content_blocks:
+                    if block["type"] == "text":
+                        assistant_content.append({"type": "text", "text": block["text"]})
+                    elif block["type"] == "tool_use":
+                        assistant_content.append({
+                            "type": "tool_use",
+                            "id": block["id"],
+                            "name": block["name"],
+                            "input": block["input"],
+                        })
+
+                messages.append({"role": "assistant", "content": assistant_content})
+
+                # Save assistant tool_use messages to DB
+                for tu in tool_uses:
+                    db.add(models.ChatMessage(
+                        conversation_id=conversation_id,
+                        role="tool_use",
+                        content=json.dumps(tu["input"]),
+                        tool_name=tu["name"],
+                        tool_call_id=tu["id"],
+                    ))
+                db.commit()
+
+                # Execute each tool and collect results
+                tool_results = []
+                for tu in tool_uses:
+                    tool_name = tu["name"]
+                    tool_input = tu["input"]
+                    tool_id = tu["id"]
+
+                    # Notify frontend that tool is running
+                    yield _sse({
+                        "type": "tool_start",
+                        "tool": tool_name,
+                        "args": tool_input,
+                    })
+
+                    # Execute
+                    result, rich_type = await execute_tool(tool_name, tool_input, user, db)
+
+                    # Save tool result to DB
+                    db.add(models.ChatMessage(
+                        conversation_id=conversation_id,
+                        role="tool_result",
+                        content=json.dumps(result),
+                        tool_name=tool_name,
+                        tool_call_id=tool_id,
+                    ))
+                    db.commit()
+
+                    # Notify frontend of result
+                    yield _sse({
+                        "type": "tool_result",
+                        "tool": tool_name,
+                        "result": result,
+                        "rich_type": rich_type,
+                    })
+
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_id,
+                        "content": json.dumps(result),
+                    })
+
+                # Add tool results to messages and continue loop
+                messages.append({"role": "user", "content": tool_results})
+                continue
+
+            # No tool use — Claude is done, extract final text
+            final_text = " ".join(b.get("text", "") for b in text_blocks).strip()
+            if not final_text:
+                final_text = "Done."
+
+            # Save assistant response to DB
+            db.add(models.ChatMessage(
+                conversation_id=conversation_id,
+                role="assistant",
+                content=final_text,
+            ))
+            db.commit()
+
+            # Update conversation title from first exchange
+            _maybe_update_title(conversation_id, user_message, final_text, db)
+
+            # Stream the text in chunks (simulated streaming)
+            chunk_size = 20
+            for i in range(0, len(final_text), chunk_size):
+                chunk = final_text[i:i + chunk_size]
+                yield _sse({"type": "text", "content": chunk})
+
             yield _sse({"type": "done"})
             return
 
-        stop_reason = response.get("stop_reason")
-        content_blocks = response.get("content", [])
-
-        # Check if Claude wants to use tools
-        tool_uses = [b for b in content_blocks if b.get("type") == "tool_use"]
-        text_blocks = [b for b in content_blocks if b.get("type") == "text"]
-
-        if tool_uses:
-            # Build the assistant message with all content blocks
-            assistant_content = []
-            for block in content_blocks:
-                if block["type"] == "text":
-                    assistant_content.append({"type": "text", "text": block["text"]})
-                elif block["type"] == "tool_use":
-                    assistant_content.append({
-                        "type": "tool_use",
-                        "id": block["id"],
-                        "name": block["name"],
-                        "input": block["input"],
-                    })
-
-            messages.append({"role": "assistant", "content": assistant_content})
-
-            # Save assistant tool_use messages to DB
-            for tu in tool_uses:
-                db.add(models.ChatMessage(
-                    conversation_id=conversation_id,
-                    role="tool_use",
-                    content=json.dumps(tu["input"]),
-                    tool_name=tu["name"],
-                    tool_call_id=tu["id"],
-                ))
-            db.commit()
-
-            # Execute each tool and collect results
-            tool_results = []
-            for tu in tool_uses:
-                tool_name = tu["name"]
-                tool_input = tu["input"]
-                tool_id = tu["id"]
-
-                # Notify frontend that tool is running
-                yield _sse({
-                    "type": "tool_start",
-                    "tool": tool_name,
-                    "args": tool_input,
-                })
-
-                # Execute
-                result, rich_type = await execute_tool(tool_name, tool_input, user, db)
-
-                # Save tool result to DB
-                db.add(models.ChatMessage(
-                    conversation_id=conversation_id,
-                    role="tool_result",
-                    content=json.dumps(result),
-                    tool_name=tool_name,
-                    tool_call_id=tool_id,
-                ))
-                db.commit()
-
-                # Notify frontend of result
-                yield _sse({
-                    "type": "tool_result",
-                    "tool": tool_name,
-                    "result": result,
-                    "rich_type": rich_type,
-                })
-
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_id,
-                    "content": json.dumps(result),
-                })
-
-            # Add tool results to messages and continue loop
-            messages.append({"role": "user", "content": tool_results})
-            continue
-
-        # No tool use — Claude is done, extract final text
-        final_text = " ".join(b.get("text", "") for b in text_blocks).strip()
-        if not final_text:
-            final_text = "Done."
-
-        # Save assistant response to DB
-        db.add(models.ChatMessage(
-            conversation_id=conversation_id,
-            role="assistant",
-            content=final_text,
-        ))
-        db.commit()
-
-        # Update conversation title from first exchange
-        _maybe_update_title(conversation_id, user_message, final_text, db)
-
-        # Stream the text in chunks (simulated streaming)
-        chunk_size = 20
-        for i in range(0, len(final_text), chunk_size):
-            chunk = final_text[i:i + chunk_size]
-            yield _sse({"type": "text", "content": chunk})
-
+        # Hit max iterations
+        yield _sse({"type": "text", "content": "I've reached the maximum number of steps for this request. Please try a simpler request or break it into parts."})
         yield _sse({"type": "done"})
-        return
 
-    # Hit max iterations
-    yield _sse({"type": "text", "content": "I've reached the maximum number of steps for this request. Please try a simpler request or break it into parts."})
-    yield _sse({"type": "done"})
+    except Exception as e:
+        logger.error(f"Agent loop crashed: {e}", exc_info=True)
+        yield _sse({"type": "text", "content": f"Internal error: {str(e)}"})
+        yield _sse({"type": "done"})
 
 
 def _load_history(conversation_id: int, db: Session) -> list:
