@@ -129,6 +129,63 @@ class TitleSkillLine:
     full_text: str                 # "Software Engineer (React, Node, AWS)"
 
 
+def sanitize_bullet_replacements(
+    bullets: List[BulletPoint],
+    bullet_replacements: Dict[int, List[str]],
+    length_tolerance: float = 0.15,
+) -> Dict[int, List[str]]:
+    """
+    Keep only bullet replacements that preserve shape closely enough for safe PDF reflow.
+
+    Rules enforced:
+    - replacement index must exist
+    - same number of lines as original bullet
+    - no empty replacement lines
+    - each replacement line length within tolerance of original line length
+    """
+    sanitized: Dict[int, List[str]] = {}
+
+    for idx, lines in bullet_replacements.items():
+        if idx < 0 or idx >= len(bullets):
+            logger.warning(f"[SANITIZE] Bullet idx {idx} out of range, dropping")
+            continue
+
+        original_lines = bullets[idx].line_texts
+        normalized = [line.strip() for line in lines]
+
+        if len(normalized) != len(original_lines):
+            logger.warning(
+                f"[SANITIZE] Bullet {idx}: line count mismatch "
+                f"(orig={len(original_lines)}, new={len(normalized)}), dropping"
+            )
+            continue
+
+        if any(not line for line in normalized):
+            logger.warning(f"[SANITIZE] Bullet {idx}: empty replacement line, dropping")
+            continue
+
+        out_of_bounds = False
+        for line_idx, (orig, new) in enumerate(zip(original_lines, normalized)):
+            orig_len = len(orig.strip())
+            if orig_len == 0:
+                continue
+            delta = abs(len(new) - orig_len) / orig_len
+            if delta > length_tolerance:
+                logger.warning(
+                    f"[SANITIZE] Bullet {idx} line {line_idx}: length delta {delta:.2f} "
+                    f"exceeds tolerance {length_tolerance:.2f}, dropping"
+                )
+                out_of_bounds = True
+                break
+
+        if out_of_bounds:
+            continue
+
+        sanitized[idx] = normalized
+
+    return sanitized
+
+
 # ─── Step 1: Extract spans ─────────────────────────────────────────────────
 
 def extract_spans_from_pdf(pdf_path: str) -> List[TextSpan]:
@@ -429,11 +486,11 @@ def group_bullet_points(
                 skills_part = paren_match.group(1).strip()
                 # Only if it looks like a tech list (multiple comma-separated items)
                 if len(skills_part.split(",")) >= 2:
-                    # Get the bold spans that contain the title text
-                    bold_spans = [s for s in cl.spans if s.is_bold and s.text.strip()]
-                    if bold_spans:
+                    # Use full line spans (not just bold) so parentheses content is fully redacted/replaced.
+                    full_spans = [s for s in cl.spans if not s.is_zwsp_only and s.text.strip()]
+                    if full_spans:
                         title_skills.append(TitleSkillLine(
-                            full_spans=bold_spans,
+                            full_spans=full_spans,
                             title_part=title_part,
                             skills_part=skills_part,
                             full_text=clean.strip(),
@@ -795,9 +852,6 @@ def apply_changes_to_pdf(
     clean_contents() normalizes the content stream so insert_text coordinates work correctly.
     """
     doc = fitz.open(pdf_path)
-    page_width = doc[0].rect.width
-    right_margin = 14.4
-
     # Extract embedded fonts for reuse (avoids Base14 substitution)
     font_cache = _build_font_cache(doc)
 
@@ -808,7 +862,7 @@ def apply_changes_to_pdf(
         if pn not in page_ops:
             page_ops[pn] = {"redacts": [], "inserts": []}
 
-    def add_replacement(page_num: int, spans: List[TextSpan], new_text: str):
+    def add_replacement(page_num: int, spans: List[TextSpan], new_text: str) -> bool:
         """Queue a text replacement: redact spans, then insert new text."""
         ensure_page(page_num)
 
@@ -820,10 +874,29 @@ def apply_changes_to_pdf(
         first = spans[0]
         font_name, font_buffer, font_obj = _resolve_font(first.font_name, new_text, font_cache)
         color = _int_to_rgb(first.color)
-        available_width = page_width - first.origin[0] - right_margin
+        # Fit to the original span envelope, not page margin, to avoid layout bleed.
+        original_right = max(s.bbox[2] for s in spans)
+        available_width = max((original_right - first.origin[0]) + 1.0, 20.0)
         fitted_text, fitted_size = _fit_text(
             new_text, font_name, first.font_size, available_width, font_obj=font_obj
         )
+
+        # Guardrail: if text still cannot fit, keep original text in place (skip replacement).
+        try:
+            fitted_width = (
+                font_obj.text_length(fitted_text, fontsize=fitted_size)
+                if font_obj
+                else fitz.get_text_length(fitted_text, fontname=font_name, fontsize=fitted_size)
+            )
+            if fitted_width > (available_width + 0.5):
+                logger.warning(
+                    f"[APPLY] Skipping replacement: fitted text width {fitted_width:.2f} "
+                    f"exceeds available {available_width:.2f}"
+                )
+                return False
+        except Exception as e:
+            logger.warning(f"[APPLY] Width validation failed, skipping replacement: {e}")
+            return False
 
         page_ops[page_num]["inserts"].append({
             "point": first.origin,
@@ -833,6 +906,7 @@ def apply_changes_to_pdf(
             "color": color,
             "font_buffer": font_buffer,
         })
+        return True
 
     # ── Process bullet replacements ──
     bullet_ops_count = 0
@@ -841,13 +915,34 @@ def apply_changes_to_pdf(
             logger.warning(f"[APPLY] Bullet idx {idx} >= len(bullets) {len(bullets)}, skipping")
             continue
         bp = bullets[idx]
+        original_line_texts = bp.line_texts
+        if len(new_lines) != len(original_line_texts):
+            logger.warning(
+                f"[APPLY] Bullet {idx}: line count mismatch "
+                f"(orig={len(original_line_texts)}, new={len(new_lines)}), skipping bullet"
+            )
+            continue
+
+        # Hard stop on large line-length divergence to avoid wrapping/collisions.
+        oversize = False
+        for line_idx, (orig, new_line) in enumerate(zip(original_line_texts, new_lines)):
+            orig_len = len(orig.strip())
+            new_len = len(new_line.strip())
+            if orig_len == 0:
+                continue
+            delta = abs(new_len - orig_len) / orig_len
+            if delta > 0.15:
+                logger.warning(
+                    f"[APPLY] Bullet {idx} line {line_idx}: length delta {delta:.2f} > 0.15, skipping bullet"
+                )
+                oversize = True
+                break
+        if oversize:
+            continue
+
         logger.info(f"[APPLY] Bullet {idx}: {len(bp.text_lines)} text_lines, {len(new_lines)} new_lines")
 
         for line_idx, text_line in enumerate(bp.text_lines):
-            if line_idx >= len(new_lines):
-                logger.warning(f"[APPLY] Bullet {idx} line {line_idx}: no corresponding new_line")
-                break
-
             new_text = new_lines[line_idx].strip()
             if not new_text:
                 logger.warning(f"[APPLY] Bullet {idx} line {line_idx}: empty new_text")
@@ -863,8 +958,8 @@ def apply_changes_to_pdf(
                 continue
 
             logger.info(f"[APPLY] Bullet {idx} line {line_idx}: replacing {len(text_spans)} spans with '{new_text[:60]}...'")
-            add_replacement(text_spans[0].page_num, text_spans, new_text)
-            bullet_ops_count += 1
+            if add_replacement(text_spans[0].page_num, text_spans, new_text):
+                bullet_ops_count += 1
 
     logger.info(f"[APPLY] Total bullet text replacements queued: {bullet_ops_count}")
 
@@ -1103,7 +1198,7 @@ def _fit_text(
     """
     Fit text to available width. Returns (text, font_size).
     Uses font_obj.text_length() for extracted fonts, fitz.get_text_length() for Base14.
-    Tries reducing font size first, truncates at word boundary as last resort.
+    Tries reducing font size first. Never truncates content.
     """
     def measure(txt: str, sz: float) -> float:
         if font_obj:
@@ -1123,17 +1218,9 @@ def _fit_text(
             if measure(text, smaller) <= max_width:
                 return text, smaller
 
-        # Last resort: truncate at word boundary using smallest tried size
+        # Last resort: preserve full text at minimum size (do not truncate content).
         min_size = max(size - 1.5, 6)
-        words = text.split()
-        result = ""
-        for word in words:
-            test = result + (" " if result else "") + word
-            if measure(test, min_size) > max_width:
-                break
-            result = test
-
-        return (result if result else text), min_size
+        return text, min_size
 
     except Exception:
         return text, size
@@ -1209,6 +1296,9 @@ async def optimize_pdf(
     # Step 3: Optimize with Claude
     bullet_replacements, skill_replacements, title_replacements = await generate_optimized_content(
         bullets, skills, job_description, title_skills,
+    )
+    bullet_replacements = sanitize_bullet_replacements(
+        bullets, bullet_replacements, length_tolerance=0.15
     )
     logger.info(f"Optimized {len(bullet_replacements)} bullets, {len(skill_replacements)} skills, {len(title_replacements)} title skills")
 

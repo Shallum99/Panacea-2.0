@@ -7,12 +7,49 @@ Tool functions return (result_dict, rich_type) tuples.
 
 import json
 import logging
+import os
 from typing import Any, Dict, Tuple, Optional
 from sqlalchemy.orm import Session
 
 from app.db import models
+from app.core.rate_limit import _get_limit, _get_usage_count, log_usage
 
 logger = logging.getLogger(__name__)
+
+
+def _quota_error(action_type: str, used: int, limit: int) -> Dict[str, Any]:
+    label = action_type.replace("_", " ")
+    return {
+        "error": "rate_limit_exceeded",
+        "action": action_type,
+        "used": used,
+        "limit": limit,
+        "message": f"You've used all {limit} {label}s. Upgrade your plan for more.",
+    }
+
+
+def _check_tool_quota(
+    db: Session,
+    user: models.User,
+    action_type: str,
+) -> Optional[Dict[str, Any]]:
+    """Tool-level quota check for agentic flows that bypass FastAPI dependencies."""
+    if os.environ.get("DEV_MODE", "").lower() == "true":
+        return None
+
+    limit = _get_limit(user, action_type)
+    if limit is None:
+        return None
+
+    used = _get_usage_count(db, user.id, action_type)
+    if used >= limit:
+        logger.warning(
+            f"Rate limit hit (tool): user {user.id} ({user.email}) "
+            f"action={action_type} used={used} limit={limit}"
+        )
+        return _quota_error(action_type, used, limit)
+
+    return None
 
 
 # ── Tool definitions (Claude API format) ──────────────────────────────
@@ -476,6 +513,9 @@ async def _tool_tailor_resume(args: Dict, user: models.User, db: Session) -> Tup
 
     jd = args["job_description"]
     resume_id = args.get("resume_id")
+    quota_err = _check_tool_quota(db, user, "resume_tailor")
+    if quota_err:
+        return quota_err, "error"
 
     if resume_id:
         resume = db.query(models.Resume).filter(
@@ -595,6 +635,7 @@ async def _tool_tailor_resume(args: Dict, user: models.User, db: Session) -> Tup
             result, optimized_text = await _run_optimize(tmp_path)
 
     optimized_score = await calculate_match_score(optimized_text, jd)
+    log_usage(db, user.id, "resume_tailor")
 
     return {
         "resume_id": resume.id,
@@ -914,6 +955,7 @@ async def _tool_edit_tailored_resume(args: Dict, user: models.User, db: Session)
         group_into_visual_lines,
         classify_lines,
         group_bullet_points,
+        sanitize_bullet_replacements,
         apply_changes_to_pdf,
     )
     from app.services.storage import download_file, upload_file, TAILORED_BUCKET
@@ -921,6 +963,9 @@ async def _tool_edit_tailored_resume(args: Dict, user: models.User, db: Session)
 
     download_id = args["download_id"]
     instructions = args["instructions"]
+    quota_err = _check_tool_quota(db, user, "resume_tailor")
+    if quota_err:
+        return quota_err, "error"
 
     # 1. Download the current tailored PDF from Supabase
     storage_path = f"{user.id}/{download_id}.pdf"
@@ -1010,11 +1055,30 @@ Return ONLY the JSON. If nothing should change, return {{"bullet_replacements": 
             edits = json.loads(edit_text)
 
         bullet_replacements = {int(k): v for k, v in edits.get("bullet_replacements", {}).items()}
-        skill_replacements = {int(k): v for k, v in edits.get("skill_replacements", {}).items()}
-        title_replacements = {int(k): v for k, v in edits.get("title_replacements", {}).items()}
+        skill_replacements = {
+            int(k): str(v).strip()
+            for k, v in edits.get("skill_replacements", {}).items()
+            if str(v).strip()
+        }
+        title_replacements = {
+            int(k): str(v).strip()
+            for k, v in edits.get("title_replacements", {}).items()
+            if str(v).strip()
+        }
+        bullet_replacements = sanitize_bullet_replacements(
+            bullets, bullet_replacements, length_tolerance=0.15
+        )
+        skill_replacements = {
+            idx: content for idx, content in skill_replacements.items()
+            if 0 <= idx < len(skills)
+        }
+        title_replacements = {
+            idx: content for idx, content in title_replacements.items()
+            if 0 <= idx < len(title_skills)
+        }
 
         if not bullet_replacements and not skill_replacements and not title_replacements:
-            return {"error": "No edits could be applied based on those instructions."}, "error"
+            return {"error": "No valid edits could be applied while preserving layout constraints."}, "error"
 
         # 6. Apply changes to PDF
         fd2, output_path = tempfile.mkstemp(suffix=".pdf")
@@ -1117,12 +1181,28 @@ Return ONLY the JSON. If nothing should change, return {{"bullet_replacements": 
                         "original": f"{label}{orig}",
                         "optimized": f"{label}{new_content}",
                     })
+            for idx, new_skills_part in title_replacements.items():
+                if idx < len(title_skills):
+                    ts = title_skills[idx]
+                    changes.append({
+                        "section": "Title",
+                        "type": "title_skill",
+                        "original": ts.full_text,
+                        "optimized": f"{ts.title_part} ({new_skills_part})",
+                    })
+
+            log_usage(db, user.id, "resume_tailor")
+            optimized_sections = sorted({
+                c.get("section")
+                for c in changes
+                if c.get("section")
+            })
 
             return {
                 "resume_title": "Edited Resume",
                 "download_id": new_download_id,
                 "diff_download_id": diff_download_id,
-                "sections_optimized": list(set(c["section"] for c in changes)),
+                "sections_optimized": optimized_sections,
                 "changes": changes,
             }, "resume_tailored"
 
