@@ -798,6 +798,9 @@ def apply_changes_to_pdf(
     page_width = doc[0].rect.width
     right_margin = 14.4
 
+    # Extract embedded fonts for reuse (avoids Base14 substitution)
+    font_cache = _build_font_cache(doc)
+
     # Collect operations per page: redactions and insertions
     page_ops: Dict[int, Dict] = {}  # {page_num: {"redacts": [...], "inserts": [...]}}
 
@@ -815,17 +818,20 @@ def apply_changes_to_pdf(
 
         # Queue insertion at first span's origin
         first = spans[0]
-        font = _map_to_usable_font(first.font_name)
+        font_name, font_buffer, font_obj = _resolve_font(first.font_name, new_text, font_cache)
         color = _int_to_rgb(first.color)
         available_width = page_width - first.origin[0] - right_margin
-        fitted_text, fitted_size = _fit_text(new_text, font, first.font_size, available_width)
+        fitted_text, fitted_size = _fit_text(
+            new_text, font_name, first.font_size, available_width, font_obj=font_obj
+        )
 
         page_ops[page_num]["inserts"].append({
             "point": first.origin,
             "text": fitted_text,
-            "font": font,
+            "font": font_name,
             "size": fitted_size,
             "color": color,
+            "font_buffer": font_buffer,
         })
 
     # ── Process bullet replacements ──
@@ -905,8 +911,20 @@ def apply_changes_to_pdf(
         # Phase 3: Normalize content stream so insert_text coords work
         page.clean_contents()
 
-        # Phase 4: Insert replacement text at original coordinates
+        # Phase 4: Install extracted fonts and insert replacement text
+        installed_fonts: set = set()
         for ins in ops["inserts"]:
+            # Install custom font on this page if not already done
+            if ins["font_buffer"] and ins["font"] not in installed_fonts:
+                try:
+                    page.insert_font(fontname=ins["font"], fontbuffer=ins["font_buffer"])
+                    installed_fonts.add(ins["font"])
+                except Exception as e:
+                    logger.warning(f"[FONTS] Failed to install font '{ins['font']}' on page {page_num}: {e}")
+                    # Fall back to Base14 for this insert
+                    ins["font"] = "helv"
+                    ins["font_buffer"] = None
+
             page.insert_text(
                 fitz.Point(ins["point"][0], ins["point"][1]),
                 ins["text"],
@@ -928,8 +946,108 @@ def _int_to_rgb(color: int) -> Tuple[float, float, float]:
     return (r, g, b)
 
 
-def _map_to_usable_font(font_name: str) -> str:
-    """Map an original font name to a PyMuPDF-usable font."""
+def _build_font_cache(doc) -> Dict[str, Dict[str, Any]]:
+    """Extract all embedded fonts from the PDF for reuse during text insertion.
+
+    Returns a dict mapping clean font names to their extracted data:
+        {font_name: {"xref": int, "buffer": bytes, "ext": str, "font_obj": fitz.Font}}
+    """
+    cache: Dict[str, Dict[str, Any]] = {}
+    seen_xrefs: set = set()
+
+    for page in doc:
+        for f in page.get_fonts():
+            xref = f[0]
+            if xref in seen_xrefs or xref == 0:
+                continue
+            seen_xrefs.add(xref)
+
+            basefont = f[3]  # e.g. "ABCDEF+Calibri-Bold"
+            try:
+                _, font_ext, _, buffer = doc.extract_font(xref)
+            except Exception:
+                continue
+
+            if font_ext == "n/a" or not buffer:
+                continue
+
+            # Create a Font object for glyph validation and text measurement
+            try:
+                font_obj = fitz.Font(fontbuffer=buffer)
+            except Exception:
+                continue
+
+            num_glyphs = len(font_obj.valid_codepoints())
+            entry = {
+                "xref": xref,
+                "buffer": buffer,
+                "ext": font_ext,
+                "font_obj": font_obj,
+                "num_glyphs": num_glyphs,
+            }
+
+            # Store by clean name (without subset prefix like "ABCDEF+")
+            # When duplicate names exist, keep the subset with more glyphs
+            clean = basefont.split("+", 1)[-1] if "+" in basefont else basefont
+            existing = cache.get(clean)
+            if not existing or num_glyphs > existing.get("num_glyphs", 0):
+                cache[clean] = entry
+            # Also store by full basefont name
+            if basefont != clean:
+                cache[basefont] = entry
+
+    logger.info(f"[FONTS] Extracted {len(seen_xrefs)} font xrefs, {len(cache)} cache entries: {list(cache.keys())}")
+    return cache
+
+
+def _resolve_font(
+    original_font_name: str,
+    new_text: str,
+    font_cache: Dict[str, Dict[str, Any]],
+) -> Tuple[str, Optional[bytes], Optional[Any]]:
+    """Try to reuse the original embedded font. Falls back to Base14.
+
+    Returns (fontname_for_insert, font_buffer_or_None, font_obj_or_None).
+    When font_buffer is not None, the caller must call page.insert_font() before insert_text().
+    """
+    # Try exact match
+    info = font_cache.get(original_font_name)
+
+    # Try without subset prefix
+    if not info and "+" in original_font_name:
+        clean = original_font_name.split("+", 1)[-1]
+        info = font_cache.get(clean)
+
+    # Try partial match (e.g. span says "Calibri" but cache has "Calibri-Bold")
+    if not info:
+        name_lower = original_font_name.lower()
+        for cached_name, cached_info in font_cache.items():
+            if name_lower in cached_name.lower() or cached_name.lower() in name_lower:
+                info = cached_info
+                break
+
+    if info and info.get("num_glyphs", 0) > 0:
+        try:
+            font_obj = info["font_obj"]
+            # Validate every non-whitespace character is present in the subset font
+            missing = [c for c in new_text if not c.isspace() and not font_obj.has_glyph(ord(c))]
+            if not missing:
+                ref_name = f"f{info['xref']}"
+                return ref_name, info["buffer"], font_obj
+            else:
+                logger.info(
+                    f"[FONTS] Font '{original_font_name}' missing {len(missing)} glyphs "
+                    f"({set(missing) if len(set(missing)) <= 5 else '...'}), falling back to Base14"
+                )
+        except Exception as e:
+            logger.warning(f"[FONTS] Glyph check failed for '{original_font_name}': {e}")
+
+    # Fallback to Base14
+    return _map_to_base14(original_font_name), None, None
+
+
+def _map_to_base14(font_name: str) -> str:
+    """Map an original font name to a PyMuPDF Base14 font (fallback only)."""
     name_lower = font_name.lower()
 
     if "times" in name_lower or "serif" in name_lower:
@@ -975,13 +1093,25 @@ def _map_to_usable_font(font_name: str) -> str:
     return "tiro"
 
 
-def _fit_text(text: str, font: str, size: float, max_width: float) -> Tuple[str, float]:
+def _fit_text(
+    text: str,
+    font: str,
+    size: float,
+    max_width: float,
+    font_obj: Optional[Any] = None,
+) -> Tuple[str, float]:
     """
     Fit text to available width. Returns (text, font_size).
+    Uses font_obj.text_length() for extracted fonts, fitz.get_text_length() for Base14.
     Tries reducing font size first, truncates at word boundary as last resort.
     """
+    def measure(txt: str, sz: float) -> float:
+        if font_obj:
+            return font_obj.text_length(txt, fontsize=sz)
+        return fitz.get_text_length(txt, fontname=font, fontsize=sz)
+
     try:
-        text_width = fitz.get_text_length(text, fontname=font, fontsize=size)
+        text_width = measure(text, size)
         if text_width <= max_width:
             return text, size
 
@@ -990,8 +1120,7 @@ def _fit_text(text: str, font: str, size: float, max_width: float) -> Tuple[str,
             smaller = size - reduction
             if smaller < 6:
                 break
-            w = fitz.get_text_length(text, fontname=font, fontsize=smaller)
-            if w <= max_width:
+            if measure(text, smaller) <= max_width:
                 return text, smaller
 
         # Last resort: truncate at word boundary using smallest tried size
@@ -1000,8 +1129,7 @@ def _fit_text(text: str, font: str, size: float, max_width: float) -> Tuple[str,
         result = ""
         for word in words:
             test = result + (" " if result else "") + word
-            w = fitz.get_text_length(test, fontname=font, fontsize=min_size)
-            if w > max_width:
+            if measure(test, min_size) > max_width:
                 break
             result = test
 
