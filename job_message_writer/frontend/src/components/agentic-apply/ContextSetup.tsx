@@ -8,6 +8,8 @@ import {
   Mail,
   FileText,
   ChevronDown,
+  Check,
+  Plus,
 } from "lucide-react";
 import type { ChatContext } from "@/lib/api/chat";
 import {
@@ -15,6 +17,7 @@ import {
   uploadJdPdf,
   type JdExtractedFields,
 } from "@/lib/api/applications";
+import { uploadResume } from "@/lib/api/resumes";
 import api from "@/lib/api";
 
 interface ResumeOption {
@@ -29,6 +32,7 @@ interface Props {
   resumes: ResumeOption[];
   sendMessage: (text?: string) => void;
   sending: boolean;
+  onResumesChanged?: () => void;
 }
 
 const MESSAGE_TYPES = [
@@ -46,6 +50,7 @@ export default function ContextSetup({
   resumes,
   sendMessage,
   sending,
+  onResumesChanged,
 }: Props) {
   // ── Field state ──
   const [jd, setJd] = useState(context.job_description || "");
@@ -53,8 +58,8 @@ export default function ContextSetup({
   const [resumeId, setResumeId] = useState<number | undefined>(
     context.resume_id
   );
-  const [messageType, setMessageType] = useState(
-    context.message_type || "email_detailed"
+  const [selectedMessageTypes, setSelectedMessageTypes] = useState<Set<string>>(
+    new Set([context.message_type || "email_detailed"])
   );
   const [positionTitle, setPositionTitle] = useState(
     context.position_title || ""
@@ -69,9 +74,15 @@ export default function ContextSetup({
     !!(context.position_title || context.recruiter_name || context.recipient_email)
   );
 
+  // ── Action selection state ──
+  const [selectedActions, setSelectedActions] = useState<Set<"generate" | "tailor">>(
+    new Set(["generate", "tailor"])
+  );
+
   // ── Extraction state ──
   const [fetchingUrl, setFetchingUrl] = useState(false);
   const [uploadingPdf, setUploadingPdf] = useState(false);
+  const [uploadingResume, setUploadingResume] = useState(false);
   const [analyzingJd, setAnalyzingJd] = useState(false);
   const [jdFields, setJdFields] = useState<JdExtractedFields | null>(null);
 
@@ -105,7 +116,6 @@ export default function ContextSetup({
         !userEditedRef.current.has("recipientEmail")
       )
         setRecipientEmail(fields.recipient_email);
-      // Auto-show details section if we extracted anything
       if (fields.position_title || fields.recruiter_name || fields.recipient_email) {
         setShowDetails(true);
       }
@@ -171,7 +181,7 @@ export default function ContextSetup({
     setJd(val);
   }
 
-  // ── PDF upload ──
+  // ── JD PDF upload ──
   async function handlePdfUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -183,6 +193,24 @@ export default function ContextSetup({
       // silent
     } finally {
       setUploadingPdf(false);
+      e.target.value = "";
+    }
+  }
+
+  // ── Resume upload ──
+  async function handleResumeUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadingResume(true);
+    try {
+      const title = file.name.replace(/\.pdf$/i, "");
+      const newResume = await uploadResume(file, title, true);
+      setResumeId(newResume.id);
+      onResumesChanged?.();
+    } catch {
+      // silent
+    } finally {
+      setUploadingResume(false);
       e.target.value = "";
     }
   }
@@ -199,30 +227,72 @@ export default function ContextSetup({
     return jdFields[key as keyof JdExtractedFields] === value;
   }
 
-  // ── Action handler ──
-  function handleAction(action: "generate" | "tailor") {
+  // ── Toggle helpers ──
+  function toggleMessageType(value: string) {
+    setSelectedMessageTypes((prev) => {
+      const next = new Set(prev);
+      if (next.has(value)) {
+        if (next.size > 1) next.delete(value);
+      } else {
+        next.add(value);
+      }
+      return next;
+    });
+  }
+
+  function toggleAction(action: "generate" | "tailor") {
+    setSelectedActions((prev) => {
+      const next = new Set(prev);
+      if (next.has(action)) {
+        next.delete(action);
+      } else {
+        next.add(action);
+      }
+      return next;
+    });
+  }
+
+  // ── Go handler — builds compound prompt ──
+  function handleGo() {
     const ctx: ChatContext = {
       job_description: jd || undefined,
       job_url: jobUrl || undefined,
       resume_id: resumeId,
-      message_type: messageType,
+      message_type: Array.from(selectedMessageTypes)[0],
       position_title: positionTitle || undefined,
       recruiter_name: recruiterName || undefined,
       recipient_email: recipientEmail || undefined,
     };
     onSetContext(ctx);
 
-    if (action === "generate") {
-      const typeLabel =
-        MESSAGE_TYPES.find((t) => t.value === messageType)?.label || "message";
-      sendMessage(`Generate a ${typeLabel.toLowerCase()} for this role`);
-    } else {
-      sendMessage("Tailor my resume to match this job description");
+    const parts: string[] = [];
+
+    if (selectedActions.has("generate")) {
+      const types = Array.from(selectedMessageTypes);
+      const labels = types.map(
+        (t) => MESSAGE_TYPES.find((mt) => mt.value === t)?.label?.toLowerCase() || t
+      );
+      if (labels.length === 1) {
+        parts.push(`generate a ${labels[0]}`);
+      } else {
+        const last = labels.pop();
+        parts.push(`generate a ${labels.join(", a ")} and a ${last}`);
+      }
     }
+
+    if (selectedActions.has("tailor")) {
+      parts.push("tailor my resume to match this job description");
+    }
+
+    const prompt = parts.join(", and ") + " for this role";
+    if (parts.length > 0) sendMessage(prompt);
   }
 
-  const canGenerate = !!jd.trim();
-  const canTailor = !!jd.trim() && !!resumeId;
+  const hasJd = !!jd.trim();
+  const canGo =
+    hasJd &&
+    selectedActions.size > 0 &&
+    (!selectedActions.has("tailor") || !!resumeId);
 
   return (
     <div className="w-full max-w-xl px-6 py-10">
@@ -307,44 +377,72 @@ export default function ContextSetup({
             <label className="block text-[12px] font-medium text-[#777] uppercase tracking-[0.05em] mb-2">
               Resume
             </label>
-            <div className="relative">
-              <select
-                value={resumeId ?? ""}
-                onChange={(e) =>
-                  setResumeId(
-                    e.target.value ? Number(e.target.value) : undefined
-                  )
-                }
-                className="w-full px-3.5 py-2.5 rounded-lg bg-[#0a0a0a] border border-[#1a1a1a] text-[13px] text-[#ededed] focus:outline-none focus:border-[#333] transition-colors appearance-none pr-8"
+            <div className="flex gap-2">
+              <div className="relative flex-1">
+                <select
+                  value={resumeId ?? ""}
+                  onChange={(e) =>
+                    setResumeId(
+                      e.target.value ? Number(e.target.value) : undefined
+                    )
+                  }
+                  className="w-full px-3.5 py-2.5 rounded-lg bg-[#0a0a0a] border border-[#1a1a1a] text-[13px] text-[#ededed] focus:outline-none focus:border-[#333] transition-colors appearance-none pr-8"
+                >
+                  <option value="">Select resume...</option>
+                  {resumes.map((r) => (
+                    <option key={r.id} value={r.id}>
+                      {r.title}
+                      {r.is_active ? " (Active)" : ""}
+                    </option>
+                  ))}
+                </select>
+                <ChevronDown
+                  size={12}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-[#555] pointer-events-none"
+                />
+              </div>
+              <label
+                className={`shrink-0 w-10 h-[38px] rounded-lg border flex items-center justify-center cursor-pointer transition-colors ${
+                  uploadingResume
+                    ? "border-[#333] bg-[#111]"
+                    : "border-[#1a1a1a] bg-[#0a0a0a] hover:border-[#333]"
+                }`}
+                title="Upload new resume"
               >
-                <option value="">Select resume...</option>
-                {resumes.map((r) => (
-                  <option key={r.id} value={r.id}>
-                    {r.title}
-                    {r.is_active ? " (Active)" : ""}
-                  </option>
-                ))}
-              </select>
-              <ChevronDown
-                size={12}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-[#555] pointer-events-none"
-              />
+                {uploadingResume ? (
+                  <Loader2 size={14} className="animate-spin text-[#555]" />
+                ) : (
+                  <Plus size={14} className="text-[#666]" />
+                )}
+                <input
+                  type="file"
+                  accept=".pdf"
+                  className="hidden"
+                  onChange={handleResumeUpload}
+                  disabled={uploadingResume}
+                />
+              </label>
             </div>
           </div>
         </div>
 
-        {/* ── Message Type ── */}
+        {/* ── Message Type (multi-select) ── */}
         <div>
           <label className="block text-[12px] font-medium text-[#777] uppercase tracking-[0.05em] mb-2">
             Message Type
+            {selectedMessageTypes.size > 1 && (
+              <span className="ml-1.5 text-[10px] text-[#555] font-normal normal-case tracking-normal">
+                {selectedMessageTypes.size} selected
+              </span>
+            )}
           </label>
           <div className="flex flex-wrap gap-1.5">
             {MESSAGE_TYPES.map((mt) => (
               <button
                 key={mt.value}
-                onClick={() => setMessageType(mt.value)}
+                onClick={() => toggleMessageType(mt.value)}
                 className={`px-3 py-1.5 rounded-md text-[12px] font-medium transition-all duration-150 ${
-                  messageType === mt.value
+                  selectedMessageTypes.has(mt.value)
                     ? "bg-[#ededed] text-[#0a0a0a] shadow-[0_0_12px_rgba(237,237,237,0.08)]"
                     : "bg-[#0a0a0a] text-[#666] border border-[#1a1a1a] hover:border-[#333] hover:text-[#999]"
                 }`}
@@ -440,57 +538,84 @@ export default function ContextSetup({
         {/* ── Divider ── */}
         <div className="border-t border-[#111] my-1" />
 
-        {/* ── Action Cards ── */}
-        <div className="grid grid-cols-2 gap-3">
-          {/* Generate Message */}
-          <button
-            onClick={() => handleAction("generate")}
-            disabled={!canGenerate || sending}
-            className="group relative p-5 rounded-xl border border-[#1a1a1a] bg-[#0a0a0a] text-left transition-all duration-200 hover:border-[#2a2a2a] hover:shadow-[0_0_30px_rgba(80,227,194,0.04)] disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:border-[#1a1a1a] disabled:hover:shadow-none"
-          >
-            <div className="w-9 h-9 rounded-lg bg-[#111] border border-[#1a1a1a] flex items-center justify-center mb-3.5 group-hover:border-[#333] transition-colors">
-              <Mail size={16} className="text-[#ededed]" />
-            </div>
-            <h3 className="text-[14px] font-semibold text-[#ededed] mb-1">
-              Generate Message
-            </h3>
-            <p className="text-[11px] text-[#555] leading-relaxed">
-              Create a tailored message for this role
-            </p>
-            {sending && canGenerate && (
-              <div className="absolute top-4 right-4">
-                <Loader2 size={14} className="animate-spin text-[#555]" />
+        {/* ── Action Selection (checkboxes) ── */}
+        <div>
+          <label className="block text-[12px] font-medium text-[#777] uppercase tracking-[0.05em] mb-2">
+            Actions
+          </label>
+          <div className="flex gap-3">
+            {/* Generate Message */}
+            <button
+              onClick={() => toggleAction("generate")}
+              disabled={!hasJd}
+              className={`flex-1 flex items-center gap-3 p-4 rounded-xl border transition-all duration-150 text-left ${
+                selectedActions.has("generate")
+                  ? "border-[#333] bg-[#111]"
+                  : "border-[#1a1a1a] bg-[#0a0a0a] hover:border-[#2a2a2a]"
+              } ${!hasJd ? "opacity-30 cursor-not-allowed" : ""}`}
+            >
+              <div
+                className={`w-4 h-4 rounded border flex items-center justify-center shrink-0 transition-colors ${
+                  selectedActions.has("generate")
+                    ? "bg-[#ededed] border-[#ededed]"
+                    : "border-[#444]"
+                }`}
+              >
+                {selectedActions.has("generate") && (
+                  <Check size={10} className="text-black" />
+                )}
               </div>
-            )}
-          </button>
+              <div className="flex items-center gap-2">
+                <Mail size={14} className="text-[#888] shrink-0" />
+                <span className="text-[13px] font-medium text-[#ededed]">
+                  Generate Message
+                </span>
+              </div>
+            </button>
 
-          {/* Tailor Resume */}
-          <button
-            onClick={() => handleAction("tailor")}
-            disabled={!canTailor || sending}
-            className="group relative p-5 rounded-xl border border-[#1a1a1a] bg-[#0a0a0a] text-left transition-all duration-200 hover:border-[#2a2a2a] hover:shadow-[0_0_30px_rgba(80,227,194,0.04)] disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:border-[#1a1a1a] disabled:hover:shadow-none"
-          >
-            <div className="w-9 h-9 rounded-lg bg-[#111] border border-[#1a1a1a] flex items-center justify-center mb-3.5 group-hover:border-[#333] transition-colors">
-              <FileText size={16} className="text-[#ededed]" />
-            </div>
-            <h3 className="text-[14px] font-semibold text-[#ededed] mb-1">
-              Tailor Resume
-            </h3>
-            <p className="text-[11px] text-[#555] leading-relaxed">
-              Optimize your resume to match this JD
-            </p>
-            {!resumeId && jd.trim() && (
-              <p className="text-[10px] text-[#444] mt-2">
-                Select a resume first
-              </p>
-            )}
-            {sending && canTailor && (
-              <div className="absolute top-4 right-4">
-                <Loader2 size={14} className="animate-spin text-[#555]" />
+            {/* Tailor Resume */}
+            <button
+              onClick={() => toggleAction("tailor")}
+              disabled={!hasJd || !resumeId}
+              className={`flex-1 flex items-center gap-3 p-4 rounded-xl border transition-all duration-150 text-left ${
+                selectedActions.has("tailor")
+                  ? "border-[#333] bg-[#111]"
+                  : "border-[#1a1a1a] bg-[#0a0a0a] hover:border-[#2a2a2a]"
+              } ${!hasJd || !resumeId ? "opacity-30 cursor-not-allowed" : ""}`}
+            >
+              <div
+                className={`w-4 h-4 rounded border flex items-center justify-center shrink-0 transition-colors ${
+                  selectedActions.has("tailor")
+                    ? "bg-[#ededed] border-[#ededed]"
+                    : "border-[#444]"
+                }`}
+              >
+                {selectedActions.has("tailor") && (
+                  <Check size={10} className="text-black" />
+                )}
               </div>
-            )}
-          </button>
+              <div className="flex items-center gap-2">
+                <FileText size={14} className="text-[#888] shrink-0" />
+                <span className="text-[13px] font-medium text-[#ededed]">
+                  Tailor Resume
+                </span>
+              </div>
+            </button>
+          </div>
         </div>
+
+        {/* ── Go Button ── */}
+        <button
+          onClick={handleGo}
+          disabled={!canGo || sending}
+          className="w-full py-3 rounded-xl bg-[#ededed] text-black text-[14px] font-semibold hover:bg-white transition-all duration-150 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-[#ededed]"
+        >
+          {sending ? (
+            <Loader2 size={16} className="animate-spin mx-auto" />
+          ) : (
+            "Go"
+          )}
+        </button>
       </div>
     </div>
   );

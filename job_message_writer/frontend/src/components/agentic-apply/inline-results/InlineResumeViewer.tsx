@@ -5,6 +5,7 @@ import { Download, ArrowRight, Loader2 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 
 interface TailorData {
+  resume_id?: number;
   resume_title?: string;
   download_id?: string;
   diff_download_id?: string;
@@ -18,18 +19,22 @@ interface Props {
   data: TailorData;
 }
 
+async function getAuthToken(): Promise<string | null> {
+  if (process.env.NEXT_PUBLIC_DEV_MODE === "true") return null;
+  try {
+    const supabase = createClient();
+    const { data: { session } } = await supabase.auth.getSession();
+    return session?.access_token ?? null;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchPdfBlob(downloadId: string): Promise<string | null> {
   try {
     const baseUrl =
       process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
-    let token: string | null = null;
-    if (process.env.NEXT_PUBLIC_DEV_MODE !== "true") {
-      const supabase = createClient();
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
-      token = session?.access_token ?? null;
-    }
+    const token = await getAuthToken();
     const res = await fetch(
       `${baseUrl}/resume-tailor/download/${downloadId}`,
       { headers: token ? { Authorization: `Bearer ${token}` } : {} }
@@ -42,8 +47,26 @@ async function fetchPdfBlob(downloadId: string): Promise<string | null> {
   }
 }
 
+async function fetchOriginalPdfBlob(resumeId: number): Promise<string | null> {
+  try {
+    const baseUrl =
+      process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+    const token = await getAuthToken();
+    const res = await fetch(
+      `${baseUrl}/resumes/${resumeId}/pdf`,
+      { headers: token ? { Authorization: `Bearer ${token}` } : {} }
+    );
+    if (!res.ok) return null;
+    const blob = await res.blob();
+    return URL.createObjectURL(blob);
+  } catch {
+    return null;
+  }
+}
+
 export default function InlineResumeViewer({ data }: Props) {
-  const [pdfView, setPdfView] = useState<"tailored" | "diff">("tailored");
+  const [pdfView, setPdfView] = useState<"original" | "tailored" | "diff">("tailored");
+  const [originalUrl, setOriginalUrl] = useState<string | null>(null);
   const [tailoredUrl, setTailoredUrl] = useState<string | null>(null);
   const [diffUrl, setDiffUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -75,13 +98,24 @@ export default function InlineResumeViewer({ data }: Props) {
       );
     }
 
+    if (data.resume_id) {
+      loads.push(
+        fetchOriginalPdfBlob(data.resume_id).then((url) => {
+          if (url) {
+            urlsRef.current.push(url);
+            setOriginalUrl(url);
+          }
+        })
+      );
+    }
+
     Promise.all(loads).finally(() => setLoading(false));
 
     return () => {
       urlsRef.current.forEach((u) => URL.revokeObjectURL(u));
       urlsRef.current = [];
     };
-  }, [data.download_id, data.diff_download_id]);
+  }, [data.download_id, data.diff_download_id, data.resume_id]);
 
   const scoreDelta =
     data.ats_score_after != null && data.ats_score_before != null
@@ -89,29 +123,39 @@ export default function InlineResumeViewer({ data }: Props) {
       : null;
 
   const changeCount = data.changes?.length ?? 0;
-  const activeUrl = pdfView === "diff" ? diffUrl : tailoredUrl;
+  const activeUrl =
+    pdfView === "original" ? originalUrl :
+    pdfView === "diff" ? diffUrl :
+    tailoredUrl;
 
   return (
     <div className="flex flex-col h-full">
       {/* Sub-nav: view toggle + ATS score + download */}
       <div className="flex items-center justify-between px-4 py-2 border-b border-[#222] shrink-0">
         <div className="flex items-center gap-1">
-          {(["tailored", "diff"] as const).map((view) => (
-            <button
-              key={view}
-              onClick={() => setPdfView(view)}
-              disabled={view === "diff" && !diffUrl}
-              className={`px-2.5 py-1 text-[11px] rounded-md transition-colors ${
-                pdfView === view
-                  ? "bg-[#1a1a1a] text-[#ededed] font-medium"
-                  : "text-[#666] hover:text-[#888]"
-              } ${view === "diff" && !diffUrl ? "opacity-40 cursor-not-allowed" : ""}`}
-            >
-              {view === "tailored"
-                ? "Tailored"
-                : `Diff${changeCount > 0 ? ` (${changeCount})` : ""}`}
-            </button>
-          ))}
+          {(["original", "tailored", "diff"] as const).map((view) => {
+            const disabled =
+              (view === "diff" && !diffUrl) ||
+              (view === "original" && !originalUrl);
+            return (
+              <button
+                key={view}
+                onClick={() => setPdfView(view)}
+                disabled={disabled}
+                className={`px-2.5 py-1 text-[11px] rounded-md transition-colors ${
+                  pdfView === view
+                    ? "bg-[#1a1a1a] text-[#ededed] font-medium"
+                    : "text-[#666] hover:text-[#888]"
+                } ${disabled ? "opacity-40 cursor-not-allowed" : ""}`}
+              >
+                {view === "original"
+                  ? "Original"
+                  : view === "tailored"
+                    ? "Tailored"
+                    : `Diff${changeCount > 0 ? ` (${changeCount})` : ""}`}
+              </button>
+            );
+          })}
         </div>
 
         <div className="flex items-center gap-3">
@@ -163,9 +207,11 @@ export default function InlineResumeViewer({ data }: Props) {
             src={activeUrl}
             className="absolute inset-0 w-full h-full border-0"
             title={
-              pdfView === "diff"
-                ? "Resume Diff"
-                : "Tailored Resume"
+              pdfView === "original"
+                ? "Original Resume"
+                : pdfView === "diff"
+                  ? "Resume Diff"
+                  : "Tailored Resume"
             }
           />
         ) : (

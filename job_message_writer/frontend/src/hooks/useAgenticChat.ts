@@ -338,6 +338,9 @@ export function useAgenticChat(searchParams?: URLSearchParams) {
     // Scroll
     messagesEndRef,
     handleScroll,
+
+    // Actions
+    refreshResumes: loadResumes,
   };
 }
 

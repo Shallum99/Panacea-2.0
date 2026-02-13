@@ -555,6 +555,7 @@ async def _tool_tailor_resume(args: Dict, user: models.User, db: Session) -> Tup
     optimized_score = await calculate_match_score(optimized_text, jd)
 
     return {
+        "resume_id": resume.id,
         "resume_title": resume.title,
         "download_id": download_id,
         "diff_download_id": diff_download_id,

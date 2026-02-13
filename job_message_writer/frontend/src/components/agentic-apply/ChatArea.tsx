@@ -27,6 +27,7 @@ interface Props {
   activeArtifactMessageId?: string | null;
   resumes: ResumeOption[];
   onSetContext: (ctx: ChatContext) => void;
+  onResumesChanged?: () => void;
 }
 
 const TOOL_LABELS: Record<string, string> = {
@@ -57,6 +58,7 @@ export default function ChatArea({
   activeArtifactMessageId,
   resumes,
   onSetContext,
+  onResumesChanged,
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -89,6 +91,7 @@ export default function ChatArea({
               resumes={resumes}
               sendMessage={sendMessage}
               sending={sending}
+              onResumesChanged={onResumesChanged}
             />
           </div>
         ) : (

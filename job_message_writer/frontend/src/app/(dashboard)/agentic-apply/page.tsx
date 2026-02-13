@@ -163,6 +163,7 @@ function AgenticApplyInner() {
             activeArtifactMessageId={activeArtifact?.messageId || null}
             resumes={state.resumes}
             onSetContext={state.setContext}
+            onResumesChanged={state.refreshResumes}
           />
         </div>
 
