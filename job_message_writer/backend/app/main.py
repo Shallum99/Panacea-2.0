@@ -121,6 +121,9 @@ def migrate_db():
             conn.execute(text(
                 "CREATE INDEX IF NOT EXISTS ix_chat_conversations_user_id ON chat_conversations (user_id)"
             ))
+            conn.execute(text(
+                "ALTER TABLE chat_conversations ADD COLUMN IF NOT EXISTS application_id INTEGER REFERENCES applications(id)"
+            ))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS chat_messages (
                     id SERIAL PRIMARY KEY,
