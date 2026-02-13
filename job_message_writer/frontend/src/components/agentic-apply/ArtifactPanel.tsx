@@ -57,8 +57,14 @@ export default function ArtifactPanel({
         </div>
       )}
 
-      {/* Content */}
-      <div className="flex-1 overflow-y-auto p-4">
+      {/* Content — resume gets full height with no padding */}
+      <div
+        className={`flex-1 min-h-0 ${
+          artifact.type === "resume_tailored"
+            ? ""
+            : "overflow-y-auto p-4"
+        }`}
+      >
         <ArtifactContent
           artifact={artifact}
           onSendMessage={onSendMessage}

@@ -423,6 +423,7 @@ async def _tool_tailor_resume(args: Dict, user: models.User, db: Session) -> Tup
     import os
     import uuid
     import tempfile
+    import difflib
     import fitz
     from app.services.pdf_format_preserver import optimize_pdf
     from app.services.storage import (
@@ -449,6 +450,7 @@ async def _tool_tailor_resume(args: Dict, user: models.User, db: Session) -> Tup
         return {"error": "Resume has no PDF file."}, "error"
 
     download_id = uuid.uuid4().hex
+    diff_download_id = uuid.uuid4().hex
 
     # Calculate original ATS score
     original_score = await calculate_match_score(
@@ -474,6 +476,67 @@ async def _tool_tailor_resume(args: Dict, user: models.User, db: Session) -> Tup
                 output_bytes = f.read()
             tailored_path = f"{user.id}/{download_id}.pdf"
             await upload_file(TAILORED_BUCKET, tailored_path, output_bytes)
+
+            # Generate diff PDF with green highlights on changed words
+            try:
+                orig_doc = fitz.open(input_path)
+                diff_doc = fitz.open(stream=output_bytes, filetype="pdf")
+                green = fitz.utils.getColor("green")
+
+                def _group_words_by_line(words, y_tolerance=3):
+                    lines = {}
+                    for w in words:
+                        y_key = round(w[1] / y_tolerance) * y_tolerance
+                        if y_key not in lines:
+                            lines[y_key] = []
+                        lines[y_key].append(w)
+                    for y_key in lines:
+                        lines[y_key].sort(key=lambda w: w[0])
+                    return lines
+
+                for page_idx in range(min(len(diff_doc), len(orig_doc))):
+                    orig_page = orig_doc[page_idx]
+                    diff_page = diff_doc[page_idx]
+                    orig_words = orig_page.get_text("words")
+                    opt_words = diff_page.get_text("words")
+                    orig_lines = _group_words_by_line(orig_words)
+                    opt_lines = _group_words_by_line(opt_words)
+                    orig_y_keys = sorted(orig_lines.keys())
+
+                    for y_key, opt_line_words in opt_lines.items():
+                        closest_y = min(orig_y_keys, key=lambda oy: abs(oy - y_key)) if orig_y_keys else None
+                        if closest_y is None or abs(closest_y - y_key) > 6:
+                            for w in opt_line_words:
+                                rect = fitz.Rect(w[0], w[1], w[2], w[3])
+                                annot = diff_page.add_highlight_annot(rect)
+                                annot.set_colors(stroke=green)
+                                annot.set_opacity(0.35)
+                                annot.update()
+                            continue
+                        orig_line_words = orig_lines[closest_y]
+                        orig_texts = [w[4] for w in orig_line_words]
+                        opt_texts = [w[4] for w in opt_line_words]
+                        if orig_texts == opt_texts:
+                            continue
+                        matcher = difflib.SequenceMatcher(None, orig_texts, opt_texts)
+                        for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+                            if tag in ("replace", "insert"):
+                                for wi in range(j1, j2):
+                                    w = opt_line_words[wi]
+                                    rect = fitz.Rect(w[0], w[1], w[2], w[3])
+                                    annot = diff_page.add_highlight_annot(rect)
+                                    annot.set_colors(stroke=green)
+                                    annot.set_opacity(0.35)
+                                    annot.update()
+
+                orig_doc.close()
+                diff_bytes = diff_doc.tobytes()
+                diff_doc.close()
+                diff_path = f"{user.id}/{diff_download_id}.pdf"
+                await upload_file(TAILORED_BUCKET, diff_path, diff_bytes)
+            except Exception as e:
+                logger.warning(f"Failed to generate diff PDF: {e}")
+
             return result, optimized_text
         finally:
             try:
@@ -494,7 +557,9 @@ async def _tool_tailor_resume(args: Dict, user: models.User, db: Session) -> Tup
     return {
         "resume_title": resume.title,
         "download_id": download_id,
+        "diff_download_id": diff_download_id,
         "sections_optimized": result.get("sections_optimized", []),
+        "changes": result.get("changes", []),
         "ats_score_before": original_score,
         "ats_score_after": optimized_score,
     }, "resume_tailored"
