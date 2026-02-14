@@ -2912,9 +2912,46 @@ def _patch_content_stream(
                 total += widths_map.get(cid, default_w)
             return total
 
+        def _trim_text_to_fit(
+            text: str, orig_hex: str, font_tag: str, font_size: float,
+        ) -> str:
+            """Trim words from text end if too wide for Tc to compensate.
+
+            When replacement text is significantly wider than original,
+            Tc clamp can't prevent overflow. Removes trailing words until
+            the text fits within the width budget.
+            """
+            if not text or not orig_hex:
+                return text
+            full_hex, _ = cmap_mgr.encode_text(font_tag, text)
+            if not full_hex:
+                return text
+            orig_w = _calc_hex_width(orig_hex)
+            new_w = _calc_hex_width(full_hex)
+            n = max(1, len(full_hex) // hex_per_char)
+            if orig_w <= 0:
+                return text
+            tc_needed = font_size * (orig_w - new_w) / (1000.0 * n)
+            tc_limit = 0.05 * font_size
+            if tc_needed >= -tc_limit:
+                return text  # Fits fine
+            words = text.split()
+            while len(words) > 1:
+                words.pop()
+                trimmed = " ".join(words)
+                trimmed_hex, _ = cmap_mgr.encode_text(font_tag, trimmed)
+                if not trimmed_hex:
+                    continue
+                trimmed_w = _calc_hex_width(trimmed_hex)
+                n_t = max(1, len(trimmed_hex) // hex_per_char)
+                tc_check = font_size * (orig_w - trimmed_w) / (1000.0 * n_t)
+                if tc_check >= -tc_limit:
+                    return trimmed
+            return text
+
         def _inject_width_adjustment(
             op: TextOp, xref: int, orig_hex: str, new_hex: str,
-            content_bytes: bytes,
+            content_bytes: bytes, font_size: float = 10.0,
         ) -> bytes:
             """Inject Tc (character spacing) to match replacement width to original.
 
@@ -2922,9 +2959,9 @@ def _patch_content_stream(
             than Tz (horizontal scaling) because character shapes are preserved —
             only the inter-character spacing changes.
 
-            Formula: Tc = (orig_width - new_width) / (1000 * num_chars)
-            This gives the per-character text-space adjustment needed to make the
-            total rendered width match the original.
+            PDF displacement formula (ISO 32000 Table 105):
+              tx = (w0/1000 * Tfs + Tc) * Th
+            Formula: Tc = Tfs * (orig_width - new_width) / (1000 * num_chars)
             """
             if not orig_hex or not new_hex:
                 adj_bytes = b" 0 Tc "
@@ -2936,11 +2973,12 @@ def _patch_content_stream(
                 if orig_w <= 0 or abs(new_w - orig_w) < orig_w * 0.01:
                     adj_bytes = b" 0 Tc "  # <1% difference, no adjustment
                 else:
-                    # Tc = (orig_width - new_width) / (1000 * num_chars)
-                    tc_val = (orig_w - new_w) / (1000.0 * num_new_chars)
-                    # Clamp to reasonable range: ±0.15 text-space units
-                    # At 10pt, ±0.15 = ±1.5pt per char, beyond this is visible
-                    tc_val = max(-0.15, min(0.15, tc_val))
+                    # Tc = Tfs * (orig_width - new_width) / (1000 * num_chars)
+                    # font_size (Tfs) multiplier is critical per ISO 32000.
+                    tc_val = font_size * (orig_w - new_w) / (1000.0 * num_new_chars)
+                    # Dynamic clamp: ±0.05 * font_size (±0.5 at 10pt, ±0.6 at 12pt)
+                    tc_limit = 0.05 * font_size
+                    tc_val = max(-tc_limit, min(tc_limit, tc_val))
                     adj_bytes = f" {tc_val:.4f} Tc ".encode("latin-1")
             if op.operator == "TJ" and op.tj_array_start >= 0:
                 queue_patch(xref, op.tj_array_start, 0, adj_bytes)
@@ -3016,17 +3054,25 @@ def _patch_content_stream(
                                         op.byte_length, empty_bytes)
                     continue
 
-                # Encode this line's text separately
-                line_hex, line_missing = cmap_mgr.encode_text(actual_font, line_text)
-                if not line_hex:
-                    continue
-
-                # Collect original hex for this y-group (for Tz calculation)
+                # Collect original hex for this y-group FIRST (needed for trim)
                 line_orig_hex = ""
                 for bi in group_blocks:
                     block = all_content_blocks[bi]
                     for op in block.text_ops:
                         line_orig_hex += op.hex_string
+
+                # Trim text if too wide for Tc clamp
+                first_bi = group_blocks[0]
+                first_blk = all_content_blocks[first_bi]
+                fs_line = first_blk.font_size if first_blk.text_ops else 10.0
+                line_text = _trim_text_to_fit(
+                    line_text, line_orig_hex, actual_font, fs_line,
+                )
+
+                # Encode this line's text separately
+                line_hex, line_missing = cmap_mgr.encode_text(actual_font, line_text)
+                if not line_hex:
+                    continue
 
                 # Build content bytes for this line
                 if uses_literal:
@@ -3035,14 +3081,13 @@ def _patch_content_stream(
                 else:
                     line_content = f"<{line_hex}>".encode("latin-1")
 
-                # Put in first (leftmost) block, Tz scale, zero the rest
-                first_bi = group_blocks[0]
-                first_blk = all_content_blocks[first_bi]
+                # Put in first (leftmost) block, Tc adjust, zero the rest
                 if first_blk.text_ops:
                     first_op = first_blk.text_ops[0]
                     line_content = _inject_width_adjustment(
                         first_op, first_blk.stream_xref,
-                        line_orig_hex, line_hex, line_content
+                        line_orig_hex, line_hex, line_content,
+                        font_size=fs_line,
                     )
                     queue_patch(first_blk.stream_xref, first_op.byte_offset,
                                 first_op.byte_length, line_content)
@@ -3066,24 +3111,34 @@ def _patch_content_stream(
             first_bi = sorted_blocks[0]
             first_blk = all_content_blocks[first_bi]
 
-            if uses_literal:
-                # Use TJ kerning for word spacing (Type1 fonts)
-                new_content_bytes = _build_literal_content(new_text, actual_font)
-            else:
-                new_content_bytes = f"<{hex_encoded}>".encode("latin-1")
-
-            # Calculate original total hex from all blocks for Tz
+            # Calculate original total hex from all blocks FIRST (needed for trim)
             all_orig_hex = ""
             for bi in sorted_blocks:
                 block = all_content_blocks[bi]
                 for op in block.text_ops:
                     all_orig_hex += op.hex_string
 
+            # Trim text if too wide for Tc clamp
+            fs_single = first_blk.font_size if first_blk.text_ops else 10.0
+            trimmed_text = _trim_text_to_fit(
+                new_text, all_orig_hex, actual_font, fs_single,
+            )
+            if trimmed_text != new_text:
+                hex_encoded, _ = cmap_mgr.encode_text(actual_font, trimmed_text)
+                new_text = trimmed_text
+
+            if uses_literal:
+                # Use TJ kerning for word spacing (Type1 fonts)
+                new_content_bytes = _build_literal_content(new_text, actual_font)
+            else:
+                new_content_bytes = f"<{hex_encoded}>".encode("latin-1")
+
             if first_blk.text_ops:
                 first_op = first_blk.text_ops[0]
                 new_content_bytes = _inject_width_adjustment(
                     first_op, first_blk.stream_xref,
-                    all_orig_hex, hex_encoded, new_content_bytes
+                    all_orig_hex, hex_encoded, new_content_bytes,
+                    font_size=fs_single,
                 )
                 queue_patch(first_blk.stream_xref, first_op.byte_offset,
                             first_op.byte_length, new_content_bytes)
