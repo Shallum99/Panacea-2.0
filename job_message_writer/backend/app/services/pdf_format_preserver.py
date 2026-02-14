@@ -2776,9 +2776,9 @@ def _patch_content_stream(
         # grab adjacent blocks at the same y-position and font.
         match_font = all_content_blocks[block_indices[0]].font_tag
         matched_set = set(block_indices)
-        last_bi_per_y: Dict[int, int] = {}
+        last_bi_per_y: Dict[float, int] = {}
         for bi in block_indices:
-            y_key = round(all_content_blocks[bi].y)
+            y_key = round(all_content_blocks[bi].y, 1)
             if y_key not in last_bi_per_y or bi > last_bi_per_y[y_key]:
                 last_bi_per_y[y_key] = bi
 
@@ -2790,7 +2790,7 @@ def _patch_content_stream(
                 bk = all_content_blocks[k]
                 if not bk.text_ops:
                     continue  # Skip empty blocks (positioning-only)
-                if abs(round(bk.y) - y_key) > 3:
+                if abs(round(bk.y, 1) - y_key) > 3:
                     break  # Different visual line — stop
                 if bk.font_tag != match_font:
                     break  # Different font (section header, etc.) — stop
@@ -2899,10 +2899,10 @@ def _patch_content_stream(
         # For multi-line matches: split replacement by WORDS (not chars) per line.
         # For single-line matches: put all text in leftmost block.
         # In all cases: zero remaining blocks, apply Tz scaling if wider.
-        y_groups: Dict[int, List[int]] = {}  # rounded_y → [block_index, ...]
+        y_groups: Dict[float, List[int]] = {}  # rounded_y → [block_index, ...]
         for bi in block_indices:
             block = all_content_blocks[bi]
-            y_key = round(block.y)
+            y_key = round(block.y, 1)
             if y_key not in y_groups:
                 y_groups[y_key] = []
             y_groups[y_key].append(bi)
@@ -2912,9 +2912,9 @@ def _patch_content_stream(
         # (flipped text matrix). block_indices follows the text reading order
         # since _find_blocks_for_text matches sequentially from the text start.
         seen_y_set: set = set()
-        sorted_y_keys: List[int] = []
+        sorted_y_keys: List[float] = []
         for bi in block_indices:
-            y_key = round(all_content_blocks[bi].y)
+            y_key = round(all_content_blocks[bi].y, 1)
             if y_key not in seen_y_set:
                 sorted_y_keys.append(y_key)
                 seen_y_set.add(y_key)
