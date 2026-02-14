@@ -630,11 +630,17 @@ def group_bullet_points(
                     content_spans.append(span)
 
             if content_spans:
-                skills.append(SkillLine(
-                    label_spans=label_spans,
-                    content_spans=content_spans,
-                    section_name=current_section,
-                ))
+                if not label_spans and skills:
+                    # Continuation of previous skill line (wrapped text, no bold label).
+                    # Merge into parent skill to keep indices aligned with Claude's
+                    # per-category replacements.
+                    skills[-1].content_spans.extend(content_spans)
+                else:
+                    skills.append(SkillLine(
+                        label_spans=label_spans,
+                        content_spans=content_spans,
+                        section_name=current_section,
+                    ))
 
         else:
             # Non-bullet/skill line — finalize any pending bullet
