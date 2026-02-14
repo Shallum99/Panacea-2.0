@@ -2763,6 +2763,39 @@ def _patch_content_stream(
             )
             return False
 
+        # ── Extend to capture tail-end fragments on same visual lines ──
+        # The matcher stops at 95% threshold, leaving tail-end blocks with
+        # original text ("product", "compliance", etc.) as visible leftovers.
+        # Fix: scan forward from the last matched block on each y-line and
+        # grab adjacent blocks at the same y-position and font.
+        match_font = all_content_blocks[block_indices[0]].font_tag
+        matched_set = set(block_indices)
+        last_bi_per_y: Dict[int, int] = {}
+        for bi in block_indices:
+            y_key = round(all_content_blocks[bi].y)
+            if y_key not in last_bi_per_y or bi > last_bi_per_y[y_key]:
+                last_bi_per_y[y_key] = bi
+
+        extension = []
+        for y_key, last_bi in last_bi_per_y.items():
+            for k in range(last_bi + 1, min(last_bi + 20, len(all_content_blocks))):
+                if k in used_block_indices or k in matched_set:
+                    break  # Hit another replacement's territory
+                bk = all_content_blocks[k]
+                if not bk.text_ops:
+                    continue  # Skip empty blocks (positioning-only)
+                if abs(round(bk.y) - y_key) > 3:
+                    break  # Different visual line — stop
+                if bk.font_tag != match_font:
+                    break  # Different font (section header, etc.) — stop
+                extension.append(k)
+
+        if extension:
+            logger.info(
+                f"[PATCH] {label}: extended by {len(extension)} tail-end blocks"
+            )
+            block_indices.extend(extension)
+
         # Mark blocks as used
         used_block_indices.update(block_indices)
 
@@ -2834,15 +2867,21 @@ def _patch_content_stream(
             op: TextOp, xref: int, orig_hex: str, new_hex: str,
             content_bytes: bytes,
         ) -> bytes:
-            """Inject per-block Tz if new_hex is wider than orig_hex."""
+            """Inject Tz scaling. Always resets to 100 Tz first to prevent
+            leaking from previous replacements, then applies compression
+            only if new text is >3% wider (capped at 90% = max 10% squeeze)."""
+            # Always inject Tz to reset any leaked state from prior patches.
+            # Tz persists across BT/ET blocks in the PDF graphics state.
             if not orig_hex or not new_hex:
-                return content_bytes
-            orig_w = _calc_hex_width(orig_hex)
-            new_w = _calc_hex_width(new_hex)
-            if orig_w <= 0 or new_w <= orig_w * 1.01:
-                return content_bytes  # No scaling needed
-            tz = max(70.0, (orig_w / new_w) * 100.0)
-            tz_bytes = f" {tz:.1f} Tz ".encode("latin-1")
+                tz_bytes = b" 100 Tz "
+            else:
+                orig_w = _calc_hex_width(orig_hex)
+                new_w = _calc_hex_width(new_hex)
+                if orig_w <= 0 or new_w <= orig_w * 1.03:
+                    tz_bytes = b" 100 Tz "  # No compression needed
+                else:
+                    tz = max(90.0, (orig_w / new_w) * 100.0)
+                    tz_bytes = f" {tz:.1f} Tz ".encode("latin-1")
             if op.operator == "TJ" and op.tj_array_start >= 0:
                 queue_patch(xref, op.tj_array_start, 0, tz_bytes)
                 return content_bytes
