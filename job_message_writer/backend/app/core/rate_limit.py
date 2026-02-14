@@ -14,6 +14,9 @@ from app.core.supabase_auth import get_current_user
 
 logger = logging.getLogger(__name__)
 
+# Admin emails — completely bypass all rate limits
+ADMIN_EMAILS = {"shallumisrael@gmail.com"}
+
 # Tier limits (lifetime)
 FREE_MESSAGE_LIMIT = 5
 FREE_TAILOR_LIMIT = 5
@@ -71,6 +74,10 @@ def require_quota(action_type: str):
     ) -> models.User:
         # Skip in dev mode
         if os.environ.get("DEV_MODE", "").lower() == "true":
+            return current_user
+
+        # Admin bypass
+        if current_user.email in ADMIN_EMAILS:
             return current_user
 
         limit = _get_limit(current_user, action_type)

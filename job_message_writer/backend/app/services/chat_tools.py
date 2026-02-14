@@ -12,7 +12,7 @@ from typing import Any, Dict, Tuple, Optional
 from sqlalchemy.orm import Session
 
 from app.db import models
-from app.core.rate_limit import _get_limit, _get_usage_count, log_usage
+from app.core.rate_limit import _get_limit, _get_usage_count, log_usage, ADMIN_EMAILS
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,10 @@ def _check_tool_quota(
 ) -> Optional[Dict[str, Any]]:
     """Tool-level quota check for agentic flows that bypass FastAPI dependencies."""
     if os.environ.get("DEV_MODE", "").lower() == "true":
+        return None
+
+    # Admin bypass
+    if user.email in ADMIN_EMAILS:
         return None
 
     limit = _get_limit(user, action_type)
