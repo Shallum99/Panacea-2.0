@@ -2891,9 +2891,11 @@ def _patch_content_stream(
                     parts.append(b" -333 ")
             return b"".join(parts) if parts else b"()"
 
-        # ── Width-aware scaling ──
-        # Per-block Tz injection: when replacement chars in a block are wider
-        # than the originals, insert Tz (horizontal scaling) to compress to fit.
+        # ── Width-aware adjustment ──
+        # Use Tc (character spacing) instead of Tz (horizontal scaling).
+        # Tc distributes width difference as micro-adjustments between character
+        # gaps, preserving character shapes. Tz distorts character shapes, which
+        # is visually obvious even at 95%. Tc is invisible at typical levels.
         font_data = cmap_mgr.font_cmaps.get(actual_font, {})
         byte_width = font_data.get("byte_width", 2)
         hex_per_char = byte_width * 2
@@ -2910,30 +2912,41 @@ def _patch_content_stream(
                 total += widths_map.get(cid, default_w)
             return total
 
-        def _inject_per_block_tz(
+        def _inject_width_adjustment(
             op: TextOp, xref: int, orig_hex: str, new_hex: str,
             content_bytes: bytes,
         ) -> bytes:
-            """Inject Tz scaling. Always resets to 100 Tz first to prevent
-            leaking from previous replacements, then applies compression
-            only if new text is >3% wider (capped at 90% = max 10% squeeze)."""
-            # Always inject Tz to reset any leaked state from prior patches.
-            # Tz persists across BT/ET blocks in the PDF graphics state.
+            """Inject Tc (character spacing) to match replacement width to original.
+
+            Tc adjusts gaps between characters uniformly. This is far less visible
+            than Tz (horizontal scaling) because character shapes are preserved —
+            only the inter-character spacing changes.
+
+            Formula: Tc = (orig_width - new_width) / (1000 * num_chars)
+            This gives the per-character text-space adjustment needed to make the
+            total rendered width match the original.
+            """
             if not orig_hex or not new_hex:
-                tz_bytes = b" 100 Tz "
+                adj_bytes = b" 0 Tc "
             else:
                 orig_w = _calc_hex_width(orig_hex)
                 new_w = _calc_hex_width(new_hex)
-                if orig_w <= 0 or new_w <= orig_w * 1.03:
-                    tz_bytes = b" 100 Tz "  # No compression needed
+                num_new_chars = max(1, len(new_hex) // hex_per_char)
+
+                if orig_w <= 0 or abs(new_w - orig_w) < orig_w * 0.01:
+                    adj_bytes = b" 0 Tc "  # <1% difference, no adjustment
                 else:
-                    tz = max(90.0, (orig_w / new_w) * 100.0)
-                    tz_bytes = f" {tz:.1f} Tz ".encode("latin-1")
+                    # Tc = (orig_width - new_width) / (1000 * num_chars)
+                    tc_val = (orig_w - new_w) / (1000.0 * num_new_chars)
+                    # Clamp to reasonable range: ±0.15 text-space units
+                    # At 10pt, ±0.15 = ±1.5pt per char, beyond this is visible
+                    tc_val = max(-0.15, min(0.15, tc_val))
+                    adj_bytes = f" {tc_val:.4f} Tc ".encode("latin-1")
             if op.operator == "TJ" and op.tj_array_start >= 0:
-                queue_patch(xref, op.tj_array_start, 0, tz_bytes)
+                queue_patch(xref, op.tj_array_start, 0, adj_bytes)
                 return content_bytes
             else:
-                return tz_bytes + content_bytes
+                return adj_bytes + content_bytes
 
         # ── Unified distribution: all-in-first-block per y-group ──
         # Group blocks by y-position, sort each group by x (left-to-right).
@@ -3027,7 +3040,7 @@ def _patch_content_stream(
                 first_blk = all_content_blocks[first_bi]
                 if first_blk.text_ops:
                     first_op = first_blk.text_ops[0]
-                    line_content = _inject_per_block_tz(
+                    line_content = _inject_width_adjustment(
                         first_op, first_blk.stream_xref,
                         line_orig_hex, line_hex, line_content
                     )
@@ -3068,7 +3081,7 @@ def _patch_content_stream(
 
             if first_blk.text_ops:
                 first_op = first_blk.text_ops[0]
-                new_content_bytes = _inject_per_block_tz(
+                new_content_bytes = _inject_width_adjustment(
                     first_op, first_blk.stream_xref,
                     all_orig_hex, hex_encoded, new_content_bytes
                 )
@@ -3084,10 +3097,10 @@ def _patch_content_stream(
                     queue_patch(block.stream_xref, op.byte_offset,
                                 op.byte_length, empty_bytes)
 
-        # ── Inject 100 Tz reset after last patched op to prevent Tz leak ──
-        # Tz persists across text ops within the same BT/ET block.
+        # ── Inject Tc/Tz reset after last patched op within BT/ET block ──
+        # Tc and Tz persist across text ops within the same BT/ET block.
         # Without reset, subsequent unpatched ops (section headers etc.)
-        # inherit any non-100 Tz from our replacement.
+        # inherit non-default Tc/Tz from our replacement.
         try:
             last_op = None
             last_xref = None
@@ -3119,7 +3132,7 @@ def _patch_content_stream(
                                 after_pos = i + 2
                                 break
                     if after_pos > 0:
-                        queue_patch(last_xref, after_pos, 0, b" 100 Tz ")
+                        queue_patch(last_xref, after_pos, 0, b" 0 Tc 100 Tz ")
         except Exception:
             pass  # Non-critical, skip on error
 
@@ -3227,6 +3240,19 @@ def _patch_content_stream(
                     continue
                 new_text_str = new_bytes.decode("latin-1")
                 stream_text = stream_text[:offset] + new_text_str + stream_text[offset + old_len:]
+
+            # ── Reset Tc and Tz at the start of every BT text object ──
+            # Both Tc (character spacing) and Tz (horizontal scaling) persist
+            # across BT/ET blocks in the PDF graphics state. Without resets,
+            # any Tc/Tz injected for a replacement leaks to ALL subsequent
+            # text objects on the page (headers, titles, dates, etc.).
+            # Insert "0 Tc 100 Tz" after every BT keyword to ensure every
+            # text object starts with clean default state.
+            stream_text = re.sub(
+                r'((?:^|\s)BT)(?=\s)',
+                r'\1\n0 Tc 100 Tz',
+                stream_text,
+            )
 
             doc.update_stream(xref, stream_text.encode("latin-1"))
         except Exception as e:
