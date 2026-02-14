@@ -2842,15 +2842,18 @@ def _patch_content_stream(
             if orig_w <= 0 or new_w <= orig_w * 1.01:
                 return content_bytes  # No scaling needed
             tz = max(70.0, (orig_w / new_w) * 100.0)
-            tz_bytes = f"{tz:.1f} Tz ".encode("latin-1")
+            tz_bytes = f" {tz:.1f} Tz ".encode("latin-1")
             if op.operator == "TJ" and op.tj_array_start >= 0:
                 queue_patch(xref, op.tj_array_start, 0, tz_bytes)
                 return content_bytes
             else:
                 return tz_bytes + content_bytes
 
-        # ── Decide distribution strategy ──
-        # Group blocks by y-position to detect multi-line matches.
+        # ── Unified distribution: all-in-first-block per y-group ──
+        # Group blocks by y-position, sort each group by x (left-to-right).
+        # For multi-line matches: split replacement by WORDS (not chars) per line.
+        # For single-line matches: put all text in leftmost block.
+        # In all cases: zero remaining blocks, apply Tz scaling if wider.
         y_groups: Dict[int, List[int]] = {}  # rounded_y → [block_index, ...]
         for bi in block_indices:
             block = all_content_blocks[bi]
@@ -2859,55 +2862,26 @@ def _patch_content_stream(
                 y_groups[y_key] = []
             y_groups[y_key].append(bi)
 
-        # Strategy 1: Many blocks (>10) — proportional distribution per-op
-        if len(block_indices) > 10:
-            # Split hex_encoded into individual character hex values
-            new_hex_chars = []
-            i = 0
-            while i < len(hex_encoded):
-                new_hex_chars.append(hex_encoded[i:i + hex_per_char])
-                i += hex_per_char
+        # Order y-groups by first appearance in block_indices (reading order).
+        # We can't sort by raw y-value because some PDFs use negative y-coords
+        # (flipped text matrix). block_indices follows the text reading order
+        # since _find_blocks_for_text matches sequentially from the text start.
+        seen_y_set: set = set()
+        sorted_y_keys: List[int] = []
+        for bi in block_indices:
+            y_key = round(all_content_blocks[bi].y)
+            if y_key not in seen_y_set:
+                sorted_y_keys.append(y_key)
+                seen_y_set.add(y_key)
+        # Sort blocks within each group by x ascending (left-to-right).
+        for y_key in sorted_y_keys:
+            y_groups[y_key].sort(key=lambda bi: all_content_blocks[bi].x)
 
-            # Collect all text ops with their original decoded char count
-            all_ops: List[Tuple[int, TextOp, int]] = []
-            for bi in block_indices:
-                block = all_content_blocks[bi]
-                for op in block.text_ops:
-                    orig_char_count = len(op.decoded_text)
-                    all_ops.append((block.stream_xref, op, orig_char_count))
+        empty_bytes = b"()" if uses_literal else b"<>"
 
-            # Distribute proportionally: each op gets as many chars as it
-            # originally had (preserves block size and positioning)
-            char_idx = 0
-            for xref, op, orig_count in all_ops:
-                chars_to_take = max(orig_count, 1)
-                end_idx = min(char_idx + chars_to_take, len(new_hex_chars))
-                if char_idx < end_idx:
-                    combined_hex = "".join(new_hex_chars[char_idx:end_idx])
-                    if op.is_literal:
-                        lit_bytes = _hex_to_literal(combined_hex)
-                        new_bytes = b"(" + lit_bytes + b")"
-                    else:
-                        new_bytes = f"<{combined_hex}>".encode("latin-1")
-                    # Per-block width scaling
-                    new_bytes = _inject_per_block_tz(
-                        op, xref, op.hex_string, combined_hex, new_bytes
-                    )
-                    queue_patch(xref, op.byte_offset, op.byte_length, new_bytes)
-                    char_idx = end_idx
-                else:
-                    # No more characters — empty this op
-                    empty = b"()" if op.is_literal else b"<>"
-                    queue_patch(xref, op.byte_offset, op.byte_length, empty)
-
-        elif len(y_groups) > 1:
-            # Strategy 2: Multi-line distribution — blocks span multiple y-positions.
-            # Split replacement text proportionally across y-groups so each visual
-            # line gets its share of text, preventing all text from being crammed
-            # into the first line's horizontal space.
-
-            # Calculate original character count per y-group
-            sorted_y_keys = sorted(y_groups.keys())
+        if len(sorted_y_keys) > 1:
+            # Multi-line: distribute WORDS proportionally across y-groups.
+            # This avoids mid-word splits that character-level distribution causes.
             y_group_chars: Dict[int, int] = {}
             for y_key in sorted_y_keys:
                 total_chars = 0
@@ -2915,79 +2889,68 @@ def _patch_content_stream(
                     block = all_content_blocks[bi]
                     total_chars += sum(len(op.decoded_text) for op in block.text_ops)
                 y_group_chars[y_key] = max(total_chars, 1)
-
             total_orig_chars = sum(y_group_chars.values())
 
-            # Split hex_encoded into individual character hex values
-            new_hex_chars = []
-            i = 0
-            while i < len(hex_encoded):
-                new_hex_chars.append(hex_encoded[i:i + hex_per_char])
-                i += hex_per_char
-
-            # Distribute characters to y-groups proportionally
-            char_idx = 0
+            # Split new text into words and distribute by proportion
+            words = new_text.split()
+            word_idx = 0
             for yi, y_key in enumerate(sorted_y_keys):
                 group_blocks = y_groups[y_key]
                 orig_count = y_group_chars[y_key]
 
-                # Last y-group gets all remaining chars
+                # Last y-group gets all remaining words
                 if yi == len(sorted_y_keys) - 1:
-                    group_chars = new_hex_chars[char_idx:]
+                    line_words = words[word_idx:]
                 else:
-                    # Proportional allocation
                     proportion = orig_count / total_orig_chars
-                    alloc = max(1, round(len(new_hex_chars) * proportion))
-                    group_chars = new_hex_chars[char_idx:char_idx + alloc]
-                    char_idx += alloc
+                    alloc_words = max(1, round(len(words) * proportion))
+                    line_words = words[word_idx:word_idx + alloc_words]
+                    word_idx += alloc_words
 
-                if not group_chars:
-                    # No chars for this group — empty all ops
+                line_text = " ".join(line_words) if line_words else ""
+
+                if not line_text:
                     for bi in group_blocks:
                         block = all_content_blocks[bi]
                         for op in block.text_ops:
-                            empty = b"()" if op.is_literal else b"<>"
                             queue_patch(block.stream_xref, op.byte_offset,
-                                        op.byte_length, empty)
+                                        op.byte_length, empty_bytes)
                     continue
 
-                group_hex = "".join(group_chars)
+                # Encode this line's text separately
+                line_hex, line_missing = cmap_mgr.encode_text(actual_font, line_text)
+                if not line_hex:
+                    continue
 
-                # Put this y-group's text into the first block's first op
-                first_bi = group_blocks[0]
-                first_blk = all_content_blocks[first_bi]
-
-                if uses_literal:
-                    lit_bytes = _hex_to_literal(group_hex)
-                    group_content = b"(" + lit_bytes + b")"
-                    empty_bytes = b"()"
-                else:
-                    group_content = f"<{group_hex}>".encode("latin-1")
-                    empty_bytes = b"<>"
-
-                # Apply per-line Tz width scaling
+                # Collect original hex for this y-group (for Tz calculation)
                 line_orig_hex = ""
                 for bi in group_blocks:
                     block = all_content_blocks[bi]
                     for op in block.text_ops:
                         line_orig_hex += op.hex_string
 
-                if first_blk.text_ops:
-                    first_op = first_blk.text_ops[0]
-                    group_content = _inject_per_block_tz(
-                        first_op, first_blk.stream_xref,
-                        line_orig_hex, group_hex, group_content
-                    )
+                # Build content bytes for this line
+                if uses_literal:
+                    lit_bytes = _hex_to_literal(line_hex)
+                    line_content = b"(" + lit_bytes + b")"
+                else:
+                    line_content = f"<{line_hex}>".encode("latin-1")
 
+                # Put in first (leftmost) block, Tz scale, zero the rest
+                first_bi = group_blocks[0]
+                first_blk = all_content_blocks[first_bi]
                 if first_blk.text_ops:
                     first_op = first_blk.text_ops[0]
+                    line_content = _inject_per_block_tz(
+                        first_op, first_blk.stream_xref,
+                        line_orig_hex, line_hex, line_content
+                    )
                     queue_patch(first_blk.stream_xref, first_op.byte_offset,
-                                first_op.byte_length, group_content)
+                                first_op.byte_length, line_content)
                     for op in first_blk.text_ops[1:]:
                         queue_patch(first_blk.stream_xref, op.byte_offset,
                                     op.byte_length, empty_bytes)
 
-                # Empty remaining blocks in this y-group
                 for bi in group_blocks[1:]:
                     block = all_content_blocks[bi]
                     for op in block.text_ops:
@@ -2995,36 +2958,45 @@ def _patch_content_stream(
                                     op.byte_length, empty_bytes)
 
         else:
-            # Strategy 3: Normal mode — single y-line, put all text in first block
+            # Single y-line (any number of blocks): all text in leftmost block.
+            # Sort already done above, so block_indices[0] may not be leftmost.
+            # Use the first entry in the sorted y-group instead.
+            sole_y = sorted_y_keys[0]
+            sorted_blocks = y_groups[sole_y]
+
+            first_bi = sorted_blocks[0]
+            first_blk = all_content_blocks[first_bi]
+
             if uses_literal:
                 literal_bytes = _hex_to_literal(hex_encoded)
                 new_content_bytes = b"(" + literal_bytes + b")"
-                empty_bytes = b"()"
             else:
                 new_content_bytes = f"<{hex_encoded}>".encode("latin-1")
-                empty_bytes = b"<>"
 
-            if first_block.text_ops:
-                first_op = first_block.text_ops[0]
-                # Per-block Tz: calculate original total hex from all blocks
-                all_orig_hex = ""
-                for bi in block_indices:
-                    block = all_content_blocks[bi]
-                    for op in block.text_ops:
-                        all_orig_hex += op.hex_string
-                new_content_bytes = _inject_per_block_tz(
-                    first_op, first_block.stream_xref,
-                    all_orig_hex, hex_encoded, new_content_bytes
-                )
-                queue_patch(first_block.stream_xref, first_op.byte_offset,
-                            first_op.byte_length, new_content_bytes)
-                for op in first_block.text_ops[1:]:
-                    queue_patch(first_block.stream_xref, op.byte_offset, op.byte_length, empty_bytes)
-
-            for bi in block_indices[1:]:
+            # Calculate original total hex from all blocks for Tz
+            all_orig_hex = ""
+            for bi in sorted_blocks:
                 block = all_content_blocks[bi]
                 for op in block.text_ops:
-                    queue_patch(block.stream_xref, op.byte_offset, op.byte_length, empty_bytes)
+                    all_orig_hex += op.hex_string
+
+            if first_blk.text_ops:
+                first_op = first_blk.text_ops[0]
+                new_content_bytes = _inject_per_block_tz(
+                    first_op, first_blk.stream_xref,
+                    all_orig_hex, hex_encoded, new_content_bytes
+                )
+                queue_patch(first_blk.stream_xref, first_op.byte_offset,
+                            first_op.byte_length, new_content_bytes)
+                for op in first_blk.text_ops[1:]:
+                    queue_patch(first_blk.stream_xref, op.byte_offset,
+                                op.byte_length, empty_bytes)
+
+            for bi in sorted_blocks[1:]:
+                block = all_content_blocks[bi]
+                for op in block.text_ops:
+                    queue_patch(block.stream_xref, op.byte_offset,
+                                op.byte_length, empty_bytes)
 
         logger.info(
             f"[PATCH] {label}: '{original_text[:40]}' → '{new_text[:40]}' "
