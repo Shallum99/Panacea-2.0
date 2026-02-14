@@ -1919,7 +1919,7 @@ class _WidthCalculator:
             self._extract_type0_widths(doc, font_xref, font_tag)
 
     def _extract_truetype_widths(self, doc, font_xref: int, font_tag: str):
-        """Extract widths from a TrueType font (uses /Widths array + /FirstChar)."""
+        """Extract widths from a TrueType or Type1 font (/Widths array + /FirstChar)."""
         # Get FirstChar
         first_char_val = doc.xref_get_key(font_xref, "FirstChar")
         if first_char_val[0] == "null":
@@ -1931,8 +1931,18 @@ class _WidthCalculator:
         if widths_val[0] == "null" or not widths_val[1]:
             return
 
-        # Parse the widths array: [w0 w1 w2 ...]
+        # Resolve indirect reference: "31 0 R" → fetch actual array
         w_text = widths_val[1].strip()
+        if widths_val[0] == "xref":
+            ref_m = re.match(r'(\d+)\s+0\s+R', w_text)
+            if ref_m:
+                w_xref = int(ref_m.group(1))
+                try:
+                    w_text = doc.xref_object(w_xref).strip()
+                except Exception:
+                    return
+
+        # Parse the widths array: [w0 w1 w2 ...]
         if w_text.startswith("["):
             w_text = w_text[1:]
         if w_text.endswith("]"):
@@ -1947,7 +1957,7 @@ class _WidthCalculator:
 
         self.font_widths[font_tag] = widths
         self._default_widths[font_tag] = 500.0
-        logger.info(f"[WIDTH] Font {font_tag} (TrueType): {len(widths)} width entries")
+        logger.info(f"[WIDTH] Font {font_tag} (TrueType/Type1): {len(widths)} width entries")
 
     def _extract_type0_widths(self, doc, font_xref: int, font_tag: str):
         """Extract W array and DW from a Type0/CID font."""
@@ -2850,6 +2860,37 @@ def _patch_content_stream(
         first_block = all_content_blocks[block_indices[0]]
         uses_literal = first_block.text_ops[0].is_literal if first_block.text_ops else False
 
+        def _build_literal_content(text: str, font_tag: str) -> bytes:
+            """Build literal string content with TJ kerning for word spacing.
+
+            For Type1/literal fonts, spaces between words must be created by
+            TJ kerning values (negative numbers between literal strings), NOT
+            by space glyphs — Type1 fonts often have space outside /Widths range.
+
+            Returns bytes like: (word1) -333 (word2) -333 (word3)
+            This goes inside the existing [...] TJ array, replacing a single
+            (literal) element.
+            """
+            words = text.split()
+            if not words:
+                return b"()"
+            if len(words) == 1:
+                w_hex, _ = cmap_mgr.encode_text(font_tag, words[0])
+                if not w_hex:
+                    return b"()"
+                return b"(" + _hex_to_literal(w_hex) + b")"
+
+            # Build TJ-style kerned output: (word1) -333 (word2) -333 (word3)
+            parts = []
+            for wi, word in enumerate(words):
+                w_hex, _ = cmap_mgr.encode_text(font_tag, word)
+                if not w_hex:
+                    continue
+                parts.append(b"(" + _hex_to_literal(w_hex) + b")")
+                if wi < len(words) - 1:
+                    parts.append(b" -333 ")
+            return b"".join(parts) if parts else b"()"
+
         # ── Width-aware scaling ──
         # Per-block Tz injection: when replacement chars in a block are wider
         # than the originals, insert Tz (horizontal scaling) to compress to fit.
@@ -2976,8 +3017,8 @@ def _patch_content_stream(
 
                 # Build content bytes for this line
                 if uses_literal:
-                    lit_bytes = _hex_to_literal(line_hex)
-                    line_content = b"(" + lit_bytes + b")"
+                    # Use TJ kerning for word spacing (Type1 fonts)
+                    line_content = _build_literal_content(line_text, actual_font)
                 else:
                     line_content = f"<{line_hex}>".encode("latin-1")
 
@@ -3013,8 +3054,8 @@ def _patch_content_stream(
             first_blk = all_content_blocks[first_bi]
 
             if uses_literal:
-                literal_bytes = _hex_to_literal(hex_encoded)
-                new_content_bytes = b"(" + literal_bytes + b")"
+                # Use TJ kerning for word spacing (Type1 fonts)
+                new_content_bytes = _build_literal_content(new_text, actual_font)
             else:
                 new_content_bytes = f"<{hex_encoded}>".encode("latin-1")
 
@@ -3042,6 +3083,45 @@ def _patch_content_stream(
                 for op in block.text_ops:
                     queue_patch(block.stream_xref, op.byte_offset,
                                 op.byte_length, empty_bytes)
+
+        # ── Inject 100 Tz reset after last patched op to prevent Tz leak ──
+        # Tz persists across text ops within the same BT/ET block.
+        # Without reset, subsequent unpatched ops (section headers etc.)
+        # inherit any non-100 Tz from our replacement.
+        try:
+            last_op = None
+            last_xref = None
+            highest_offset = -1
+            for bi in block_indices:
+                block = all_content_blocks[bi]
+                for op in block.text_ops:
+                    if op.byte_offset > highest_offset:
+                        highest_offset = op.byte_offset
+                        last_op = op
+                        last_xref = block.stream_xref
+            if last_op and last_xref is not None:
+                stream = doc.xref_stream(last_xref)
+                if stream:
+                    hex_end = last_op.byte_offset + last_op.byte_length
+                    after_pos = -1
+                    if last_op.operator == "TJ":
+                        # For TJ arrays, find "]" then "TJ" after it
+                        for i in range(hex_end, min(hex_end + 500, len(stream))):
+                            if stream[i:i+1] == b']':
+                                for j in range(i + 1, min(i + 20, len(stream))):
+                                    if stream[j:j+2] == b'TJ':
+                                        after_pos = j + 2
+                                        break
+                                break
+                    else:  # Tj
+                        for i in range(hex_end, min(hex_end + 30, len(stream))):
+                            if stream[i:i+2] == b'Tj':
+                                after_pos = i + 2
+                                break
+                    if after_pos > 0:
+                        queue_patch(last_xref, after_pos, 0, b" 100 Tz ")
+        except Exception:
+            pass  # Non-critical, skip on error
 
         logger.info(
             f"[PATCH] {label}: '{original_text[:40]}' → '{new_text[:40]}' "
