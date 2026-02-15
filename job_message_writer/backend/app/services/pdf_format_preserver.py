@@ -448,17 +448,17 @@ def validate_replacements_by_width(
             validated_bullets[idx] = new_lines
             continue
 
-        # Check each line's rendered width
-        avail_w = detector.get_available_width(x_start, page_num, all_blocks)
+        # Check each line's rendered width against original line width
         overflow = False
         for li, new_line in enumerate(new_lines):
+            orig_line = original_lines[li] if li < len(original_lines) else ""
+            orig_w = detector.measure_text_width(orig_line, font_tag, font_size) if orig_line else 0
             text_w = detector.measure_text_width(new_line, font_tag, font_size)
-            # Allow Tc compression to absorb up to MAX_TC * num_chars
             max_tc_savings = _OverflowDetector.MAX_TC * len(new_line)
-            if text_w - max_tc_savings > avail_w:
+            if orig_w > 0 and text_w - max_tc_savings > orig_w:
                 logger.warning(
                     f"[WIDTH-CHECK] Bullet {idx} line {li}: rendered width {text_w:.1f}pt "
-                    f"exceeds available {avail_w:.1f}pt (even with Tc), dropping bullet"
+                    f"exceeds original {orig_w:.1f}pt (even with Tc), dropping bullet"
                 )
                 overflow = True
                 break
@@ -490,13 +490,14 @@ def validate_replacements_by_width(
             validated_skills[idx] = new_content
             continue
 
-        avail_w = detector.get_available_width(x_start, page_num, all_blocks)
+        orig_content = sk.content_text if hasattr(sk, 'content_text') else " ".join(s.text for s in sk.content_spans)
+        orig_w = detector.measure_text_width(orig_content, font_tag, font_size)
         text_w = detector.measure_text_width(new_content, font_tag, font_size)
         max_tc_savings = _OverflowDetector.MAX_TC * len(new_content)
-        if text_w - max_tc_savings > avail_w:
+        if orig_w > 0 and text_w - max_tc_savings > orig_w:
             logger.warning(
                 f"[WIDTH-CHECK] Skill {idx}: rendered width {text_w:.1f}pt "
-                f"exceeds available {avail_w:.1f}pt, dropping"
+                f"exceeds original {orig_w:.1f}pt, dropping"
             )
         else:
             validated_skills[idx] = new_content
@@ -527,13 +528,14 @@ def validate_replacements_by_width(
                 continue
 
             full_new = f"{ts.title_part} ({new_skills_part})"
-            avail_w = detector.get_available_width(x_start, page_num, all_blocks)
+            full_orig = f"{ts.title_part} ({ts.skills_part})"
+            orig_w = detector.measure_text_width(full_orig, font_tag, font_size)
             text_w = detector.measure_text_width(full_new, font_tag, font_size)
             max_tc_savings = _OverflowDetector.MAX_TC * len(full_new)
-            if text_w - max_tc_savings > avail_w:
+            if orig_w > 0 and text_w - max_tc_savings > orig_w:
                 logger.warning(
                     f"[WIDTH-CHECK] Title {idx}: rendered width {text_w:.1f}pt "
-                    f"exceeds available {avail_w:.1f}pt, dropping"
+                    f"exceeds original {orig_w:.1f}pt, dropping"
                 )
             else:
                 validated_titles[idx] = new_skills_part
@@ -553,6 +555,484 @@ def validate_replacements_by_width(
 
     doc.close()
     return validated_bullets, validated_skills, validated_titles
+
+
+# ─── Boundary Detection (Date/Contact Protection) ──────────────────────────
+
+class _BoundaryDetector:
+    """Detect semantic boundaries within content blocks to protect dates,
+    contact info, and other immutable content from being overwritten.
+
+    The #1 production bug was dates being wiped because the extension logic
+    in _do_replacement() grabbed date blocks at the same Y-position as the
+    title being replaced. This class provides pattern matching to identify
+    and protect such blocks.
+    """
+
+    # Full date patterns (for complete date strings)
+    DATE_PATTERNS = [
+        # "March 2025", "Jan 2020", "December 2019"
+        r'\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*\.?\s*\d{4}\b',
+        # "2020 - 2024", "2020 – Present", "2020—Current"
+        r'\b\d{4}\s*[-–—]\s*(?:\d{4}|Present|Current|Now)\b',
+        # "Jan 2020 -" or "March 2025 –" (start of a date range)
+        r'\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*\.?\s*\d{4}\s*[-–—]',
+        # Full date range: "Jan 2020 – Dec 2024"
+        r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4}\s*[-–—]\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4}\b',
+        # Standalone "Present" or "Current" (common end of date ranges)
+        r'^(?:Present|Current|Now)$',
+        # MM/YYYY format: "01/2020 - 12/2024"
+        r'\b\d{1,2}/\d{4}\b',
+    ]
+
+    # Fragment patterns — for split-across-blocks dates in content streams.
+    # PDFs often split "March 2025 – Oct 2025" into blocks like:
+    #   "March" | "2025-Oct" | "2025"
+    # These fragments must also be detected and protected.
+    DATE_FRAGMENT_PATTERNS = [
+        # Standalone month names: "Jan", "March", "Nov", "September"
+        r'^(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?$',
+        # Standalone 4-digit year in resume range (2015-2030)
+        r'^20[12]\d$',
+        # Year-dash-month fragments: "2025-Oct", "2021–Jun", "2019—Dec"
+        r'^20[12]\d\s*[-–—]\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*$',
+        # Month-dash fragments: "Oct-", "Jun–"
+        r'^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s*[-–—]$',
+    ]
+
+    _date_re = [re.compile(p, re.IGNORECASE) for p in DATE_PATTERNS]
+    _date_fragment_re = [re.compile(p, re.IGNORECASE) for p in DATE_FRAGMENT_PATTERNS]
+
+    LOCATION_PATTERNS = [
+        # "City, State" or "City, ST" or "City, Country"
+        r'^[A-Z][a-z]+(?:\s[A-Z][a-z]+)*,\s*[A-Z]{2}$',
+        # "Remote" standalone
+        r'^Remote$',
+    ]
+
+    _location_re = [re.compile(p, re.IGNORECASE) for p in LOCATION_PATTERNS]
+
+    @classmethod
+    def is_date_text(cls, text: str) -> bool:
+        """Check if text contains date patterns (employment dates, etc.)."""
+        clean = text.strip()
+        if not clean:
+            return False
+        for pattern in cls._date_re:
+            if pattern.search(clean):
+                return True
+        return False
+
+    @classmethod
+    def is_date_fragment(cls, text: str) -> bool:
+        """Check if text is a date fragment (month name, year, or partial date range).
+
+        Content stream blocks often split dates across multiple blocks.
+        This catches fragments like "Nov", "2025", "2025-Oct" that are parts
+        of larger date strings.
+        """
+        clean = text.strip()
+        if not clean:
+            return False
+        for pattern in cls._date_fragment_re:
+            if pattern.search(clean):
+                return True
+        return False
+
+    @classmethod
+    def is_location_text(cls, text: str) -> bool:
+        """Check if text looks like a location (City, State)."""
+        clean = text.strip()
+        if not clean:
+            return False
+        for pattern in cls._location_re:
+            if pattern.search(clean):
+                return True
+        return False
+
+    @classmethod
+    def is_protected(cls, text: str) -> bool:
+        """Check if a content block's text should be protected from replacement.
+
+        Protected content includes:
+        - Employment/education dates (full or fragments)
+        - Locations (City, State)
+        """
+        return cls.is_date_text(text) or cls.is_date_fragment(text) or cls.is_location_text(text)
+
+    @classmethod
+    def filter_extension_blocks(
+        cls,
+        all_blocks: List['ContentBlock'],
+        extension_candidates: List[int],
+        matched_block_indices: Optional[List[int]] = None,
+    ) -> List[int]:
+        """Filter extension candidates, removing blocks with protected content.
+
+        Called during the tail-end extension in _do_replacement() to prevent
+        date/location blocks from being zeroed out.
+
+        Uses two strategies:
+        1. Text pattern matching (dates, locations)
+        2. X-position gap detection: if the extension block is >200pt to the
+           right of the matched content, it's likely a right-aligned date
+        """
+        # Calculate the max X of the matched blocks (for gap detection)
+        matched_max_x = 0.0
+        if matched_block_indices:
+            for mi in matched_block_indices:
+                b = all_blocks[mi]
+                matched_max_x = max(matched_max_x, b.x)
+
+        filtered = []
+        for bi in extension_candidates:
+            block = all_blocks[bi]
+            text = block.full_text.strip()
+
+            # Strategy 1: Text pattern matching
+            if text and cls.is_protected(text):
+                logger.info(
+                    f"[BOUNDARY] Protected block (text pattern) at "
+                    f"x={block.x:.1f} y={block.y:.1f}: '{text[:60]}'"
+                )
+                continue
+
+            # Strategy 2: X-position gap detection
+            # If this extension block is far to the right of the matched content,
+            # it's likely a right-aligned date/location even if text patterns
+            # don't match (e.g., company name at right side)
+            if matched_max_x > 0 and block.x - matched_max_x > 200:
+                logger.info(
+                    f"[BOUNDARY] Protected block (x-gap {block.x - matched_max_x:.0f}pt) at "
+                    f"x={block.x:.1f} y={block.y:.1f}: '{text[:60]}'"
+                )
+                continue
+
+            filtered.append(bi)
+        return filtered
+
+    @classmethod
+    def filter_matched_blocks(
+        cls,
+        all_blocks: List['ContentBlock'],
+        block_indices: List[int],
+        original_text: str,
+    ) -> List[int]:
+        """Filter matched blocks, removing any that contain ONLY date/protected text.
+
+        This handles cases where _find_blocks_for_text matched too aggressively
+        and included date blocks in the match. We keep blocks whose text is part
+        of the original replacement target, but remove blocks that are purely
+        date content that was swept in by the matching algorithm.
+        """
+        if not block_indices:
+            return block_indices
+
+        orig_clean = original_text.replace("\u200b", "").strip().lower()
+        filtered = []
+
+        for bi in block_indices:
+            block = all_blocks[bi]
+            block_text = block.full_text.strip()
+            if not block_text:
+                filtered.append(bi)
+                continue
+
+            # If block text appears in the original text, it's part of the target
+            block_text_lower = block_text.lower().strip()
+            if block_text_lower in orig_clean:
+                filtered.append(bi)
+                continue
+
+            # If block text is protected AND not in the original, skip it
+            if cls.is_protected(block_text):
+                logger.info(
+                    f"[BOUNDARY] Removed matched block with protected text: "
+                    f"'{block_text[:60]}'"
+                )
+                continue
+
+            # Keep non-protected blocks that may be fragments
+            filtered.append(bi)
+
+        return filtered
+
+
+# ─── Font Analysis (Character Availability) ────────────────────────────────
+
+class FontAnalyzer:
+    """Analyze PDF fonts and build character availability maps.
+
+    Used to:
+    1. Determine which characters are available in each font BEFORE LLM generation
+    2. Include character constraints in the LLM prompt
+    3. Validate replacement text against font capabilities
+    4. Avoid triggering FontAugmentor (which causes garbled text bugs)
+    """
+
+    def __init__(self, cmap_mgr: '_CMapManager'):
+        self._cmap = cmap_mgr
+
+    def get_available_chars(self, font_tag: str) -> set:
+        """Get the set of Unicode characters available in a font."""
+        font_data = self._cmap.font_cmaps.get(font_tag, {})
+        fwd = font_data.get("fwd", {})
+        chars = set()
+        for cid, char_str in fwd.items():
+            for ch in char_str:
+                chars.add(ch)
+        return chars
+
+    def get_all_available_chars(self) -> set:
+        """Get union of available characters across ALL fonts."""
+        all_chars = set()
+        for font_tag in self._cmap.font_cmaps:
+            all_chars.update(self.get_available_chars(font_tag))
+        return all_chars
+
+    def get_unavailable_standard_chars(self, font_tag: str) -> List[str]:
+        """Get standard ASCII chars that are NOT available in a font.
+
+        Returns list of missing chars from the printable ASCII set (a-z, A-Z, 0-9, common punctuation).
+        Used to tell the LLM which characters to avoid for this font.
+        """
+        available = self.get_available_chars(font_tag)
+        if not available:
+            return []
+        standard = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,;:!?-/()&%+')
+        missing = sorted(ch for ch in standard if ch not in available)
+        return missing
+
+    def check_text(self, text: str, font_tag: str) -> List[str]:
+        """Check which characters in text are NOT available in the font.
+
+        Returns list of unavailable characters (empty = all available).
+        """
+        available = self.get_available_chars(font_tag)
+        if not available:
+            return []  # Can't check, assume all available
+        missing = []
+        seen = set()
+        for ch in text:
+            if ch not in available and ch not in seen and ch != ' ':
+                # Space is almost always available but sometimes missing from CMap
+                missing.append(ch)
+                seen.add(ch)
+        return missing
+
+    def build_char_constraint_string(self) -> str:
+        """Build a human-readable summary of available characters for LLM prompt.
+
+        Uses the intersection of text font character sets (fonts with 10+ chars).
+        Excludes symbol/bullet fonts that only have a few glyphs.
+        """
+        if not self._cmap.font_cmaps:
+            return ""
+
+        # Use the LARGEST text font (body font) as the basis for constraints.
+        # Intersection of multiple fonts is too restrictive — e.g., bold font
+        # may lack commas/periods that the body font has.
+        # Per-font checking in _do_replacement handles specific font limitations.
+        largest_set = set()
+        for ft in self._cmap.font_cmaps:
+            chars = self.get_available_chars(ft)
+            if len(chars) > len(largest_set):
+                largest_set = chars
+
+        if not largest_set or len(largest_set) < 30:
+            return ""
+
+        common = largest_set
+
+        # Check if standard ASCII is mostly covered
+        ascii_letters = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ')
+        ascii_digits = set('0123456789')
+        common_punct = set('.,;:!?()-/&@#$%+\'"')
+
+        missing_letters = ascii_letters - common
+        missing_digits = ascii_digits - common
+        missing_punct = common_punct - common
+
+        if not missing_letters and not missing_digits:
+            # Full ASCII coverage — just note any missing punctuation
+            if missing_punct:
+                return f"AVOID these characters (not in font): {' '.join(sorted(missing_punct))}"
+            return ""  # No constraint needed
+
+        # Some letters/digits are missing — tell LLM to avoid them
+        all_missing = sorted(missing_letters | missing_digits | missing_punct)
+        if len(all_missing) <= 30:
+            # Reasonable number of missing chars — use AVOID list
+            avoid_desc = []
+            if missing_letters:
+                avoid_desc.append(f"letters: {' '.join(sorted(missing_letters))}")
+            if missing_digits:
+                avoid_desc.append(f"digits: {' '.join(sorted(missing_digits))}")
+            if missing_punct:
+                avoid_desc.append(f"punctuation: {' '.join(sorted(missing_punct))}")
+            return f"AVOID these characters (not in font): {'; '.join(avoid_desc)}"
+
+        # Too many missing chars — build explicit ONLY-use list
+        avail_printable = sorted(c for c in common if c.isprintable() and c != ' ')
+        if len(avail_printable) > 80:
+            return ""  # Too many to list, probably fine
+
+        return f"ONLY use these characters: {''.join(avail_printable)} and space"
+
+    def get_font_summary(self) -> str:
+        """Get a summary of all fonts and their character coverage."""
+        lines = []
+        for font_tag in sorted(self._cmap.font_cmaps.keys()):
+            font_name = self._cmap.font_names.get(font_tag, "unknown")
+            chars = self.get_available_chars(font_tag)
+            ascii_count = sum(1 for c in chars if c.isascii() and c.isprintable())
+            lines.append(
+                f"  {font_tag} ({font_name}): {len(chars)} chars "
+                f"({ascii_count} ASCII)"
+            )
+        return "\n".join(lines)
+
+
+# ─── Width Budget Calculator ──────────────────────────────────────────────
+
+def calculate_width_budgets(
+    pdf_path: str,
+    bullets: List['BulletPoint'],
+    skills: List['SkillLine'],
+    title_skills: Optional[List['TitleSkillLine']] = None,
+) -> Dict[str, Any]:
+    """Calculate per-item max character counts based on rendered font widths.
+
+    For each bullet line, skill, and title, computes the maximum number of
+    characters that fit within the available width. This is used as a hard
+    constraint in the LLM prompt, replacing the generic "±15%" rule.
+
+    Returns:
+        {
+            "bullet_budgets": {idx: [max_chars_line1, max_chars_line2, ...]},
+            "skill_budgets": {idx: max_chars},
+            "title_budgets": {idx: max_chars_for_skills_part},
+        }
+    """
+    doc = fitz.open(pdf_path)
+    cmap_mgr = _CMapManager(doc)
+    width_calc = _WidthCalculator(doc)
+    detector = _OverflowDetector(doc, cmap_mgr, width_calc)
+
+    # Parse content blocks for margin inference
+    all_blocks: List['ContentBlock'] = []
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        for xref in page.get_contents():
+            try:
+                stream = doc.xref_stream(xref)
+                blocks = _parse_content_stream(stream, cmap_mgr, page_num, xref)
+                all_blocks.extend(blocks)
+            except Exception:
+                pass
+
+    def _avg_char_width(text: str, font_tag: str, font_size: float) -> float:
+        """Get average character width in points for the given text and font."""
+        if not text.strip():
+            return font_size * 0.5
+        w = detector.measure_text_width(text, font_tag, font_size)
+        if w > 0 and len(text.strip()) > 0:
+            return w / len(text.strip())
+        return font_size * 0.5
+
+    def _resolve_font_tag(font_name: str) -> Optional[str]:
+        for tag, name in cmap_mgr.font_names.items():
+            if name == font_name or font_name in name:
+                return tag
+        return None
+
+    bullet_budgets: Dict[int, List[int]] = {}
+    skill_budgets: Dict[int, int] = {}
+    title_budgets: Dict[int, int] = {}
+
+    # ── Bullet budgets ──
+    for idx, bp in enumerate(bullets):
+        text_spans = [
+            s for tl in bp.text_lines for s in tl.spans
+            if not s.is_bullet_char and not s.is_zwsp_only and s.text.strip()
+        ]
+        if not text_spans:
+            continue
+
+        font_tag = _resolve_font_tag(text_spans[0].font_name)
+        if not font_tag:
+            continue
+
+        font_size = text_spans[0].font_size
+
+        line_budgets = []
+        for lt in bp.line_texts:
+            # Use original line width as budget basis (avoids CTM coordinate issues)
+            orig_line_w = detector.measure_text_width(lt, font_tag, font_size)
+            tc_headroom = detector.MAX_TC * max(len(lt), 1)
+            effective_w = orig_line_w + tc_headroom
+
+            avg_cw = _avg_char_width(lt, font_tag, font_size)
+            max_chars = int(effective_w / avg_cw) if avg_cw > 0 else len(lt)
+            # Floor at original length (never budget LESS than current text)
+            max_chars = max(max_chars, len(lt))
+            line_budgets.append(max_chars)
+
+        bullet_budgets[idx] = line_budgets
+
+    # ── Skill budgets ──
+    for idx, sk in enumerate(skills):
+        if not sk.content_spans:
+            continue
+        font_tag = _resolve_font_tag(sk.content_spans[0].font_name)
+        if not font_tag:
+            continue
+
+        font_size = sk.content_spans[0].font_size
+
+        content = sk.content_text if hasattr(sk, 'content_text') else " ".join(s.text for s in sk.content_spans)
+        orig_w = detector.measure_text_width(content, font_tag, font_size)
+        tc_headroom = detector.MAX_TC * max(len(content), 1)
+        effective_w = orig_w + tc_headroom
+
+        avg_cw = _avg_char_width(content, font_tag, font_size)
+        max_chars = int(effective_w / avg_cw) if avg_cw > 0 else len(content)
+        max_chars = max(max_chars, len(content))
+        skill_budgets[idx] = max_chars
+
+    # ── Title budgets ──
+    if title_skills:
+        for idx, ts in enumerate(title_skills):
+            if not ts.full_spans:
+                continue
+            font_tag = _resolve_font_tag(ts.full_spans[0].font_name)
+            if not font_tag:
+                continue
+
+            font_size = ts.full_spans[0].font_size
+
+            # Use original skills_part width as budget basis
+            orig_skills_w = detector.measure_text_width(ts.skills_part, font_tag, font_size)
+            tc_headroom = detector.MAX_TC * max(len(ts.skills_part), 1)
+            effective_skills_w = orig_skills_w + tc_headroom
+
+            avg_cw = _avg_char_width(ts.skills_part, font_tag, font_size)
+            max_chars = int(effective_skills_w / avg_cw) if avg_cw > 0 else len(ts.skills_part)
+            max_chars = max(max_chars, len(ts.skills_part))
+            title_budgets[idx] = max_chars
+
+    doc.close()
+
+    budget_info = {
+        "bullet_budgets": bullet_budgets,
+        "skill_budgets": skill_budgets,
+        "title_budgets": title_budgets,
+    }
+
+    total_items = len(bullet_budgets) + len(skill_budgets) + len(title_budgets)
+    logger.info(f"[BUDGET] Calculated width budgets for {total_items} items")
+
+    return budget_info
 
 
 # ─── Step 1: Extract spans ─────────────────────────────────────────────────
@@ -1018,9 +1498,19 @@ async def generate_optimized_content(
     skills: List[SkillLine],
     job_description: str,
     title_skills: Optional[List[TitleSkillLine]] = None,
+    char_constraint: str = "",
+    width_budgets: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[int, List[str]], Dict[int, str], Dict[int, str]]:
     """
     Send bullet points, skills, and title tech stacks to Claude for optimization.
+
+    Args:
+        char_constraint: Optional character constraint string from FontAnalyzer.
+            If provided, appended to each LLM prompt to prevent generating
+            characters that the PDF font cannot render.
+        width_budgets: Optional per-item max character counts from calculate_width_budgets().
+            If provided, per-item constraints are included in the LLM prompt.
+
     Returns:
         bullet_replacements: {bullet_index: [line1_text, line2_text, ...]}
         skill_replacements: {skill_index: "new content text"}
@@ -1044,13 +1534,19 @@ async def generate_optimized_content(
             return replacements
 
         # Build bullet texts with ORIGINAL indices preserved
+        bullet_budgets = (width_budgets or {}).get("bullet_budgets", {})
         bullet_texts = []
         for i, bp in enumerate(bullets):
             if bp.section_name.upper().strip() in SKIP_SECTIONS:
                 continue
             lines_info = []
+            budgets = bullet_budgets.get(i, [])
             for j, lt in enumerate(bp.line_texts):
-                lines_info.append(f"    Line {j+1} ({len(lt)} chars): {lt}")
+                max_chars = budgets[j] if j < len(budgets) else None
+                if max_chars:
+                    lines_info.append(f"    Line {j+1} ({len(lt)} chars, max {max_chars}): {lt}")
+                else:
+                    lines_info.append(f"    Line {j+1} ({len(lt)} chars): {lt}")
             bullet_texts.append(f"  BULLET {i+1} ({bp.section_name}):\n" + "\n".join(lines_info))
 
         if not bullet_texts:
@@ -1067,6 +1563,7 @@ async def generate_optimized_content(
         async def _process_bullet_batch(batch_texts: List[str], batch_max_tokens: int) -> Dict[int, List[str]]:
             """Process a batch of bullets — same prompt, same parsing, same rules."""
             batch_result: Dict[int, List[str]] = {}
+            char_rule = f"\n9. {char_constraint}" if char_constraint else ""
             usr_prompt = f"""Rewrite these resume bullet points to be strongly tailored for the job description below.
 
 RULES:
@@ -1075,9 +1572,9 @@ RULES:
 3. Use action verbs and terminology that mirror the job posting's language
 4. PRESERVE: company names, metrics, percentages, dates, and factual claims — do NOT fabricate
 5. Each bullet must have EXACTLY the same number of lines as the original
-6. Each line should be SIMILAR length to the original (±15% character count) to fit the PDF layout
+6. Each line MUST NOT exceed its max character count (shown as "max N"). Stay close to the original length but NEVER go over the max
 7. Every bullet MUST be modified — do not return any bullet unchanged
-8. Focus on what the job description specifically asks for and weave those themes into each bullet
+8. Focus on what the job description specifically asks for and weave those themes into each bullet{char_rule}
 
 JOB DESCRIPTION:
 {job_description[:3000]}
@@ -1140,15 +1637,21 @@ IMPORTANT: Make each bullet clearly targeted to THIS specific job. A reader shou
         if not skills:
             return replacements
 
+        s_budgets = (width_budgets or {}).get("skill_budgets", {})
         skill_texts = []
         for i, sk in enumerate(skills):
-            skill_texts.append(f"  {i+1}. {sk.label_text} {sk.content_text}")
+            max_c = s_budgets.get(i)
+            if max_c:
+                skill_texts.append(f"  {i+1}. [{len(sk.content_text)} chars, max {max_c}] {sk.label_text} {sk.content_text}")
+            else:
+                skill_texts.append(f"  {i+1}. {sk.label_text} {sk.content_text}")
 
         sys_prompt = (
             "You are an expert resume skills optimizer. You reorder, substitute, and emphasize "
             "skills to strongly match a specific job description."
         )
 
+        char_rule = f"\n9. {char_constraint}" if char_constraint else ""
         usr_prompt = f"""Optimize these skill lines to best match the job description below.
 
 RULES:
@@ -1157,9 +1660,9 @@ RULES:
 3. You may add 1-2 closely related skills if they appear in the JD and the candidate likely has them based on their other skills
 4. You may remove less relevant skills to make room for more relevant ones
 5. Keep the SAME comma-separated format
-6. Each line should be SIMILAR length to the original (±15% character count)
+6. Each line MUST NOT exceed its max character count (shown as "max N" in brackets). Stay close to original but NEVER go over the max
 7. Return ONLY the values after the label (e.g., for "Languages: Python, R, SQL" return "Python, R, SQL" — NOT "Languages: Python, R, SQL")
-8. The ordering should CLEARLY reflect what this specific job prioritizes
+8. The ordering should CLEARLY reflect what this specific job prioritizes{char_rule}
 
 JOB DESCRIPTION:
 {job_description[:3000]}
@@ -1199,22 +1702,28 @@ OUTPUT FORMAT — Return ONLY this JSON:
         if not title_skills:
             return replacements
 
+        t_budgets = (width_budgets or {}).get("title_budgets", {})
         title_texts = []
         for i, ts in enumerate(title_skills):
-            title_texts.append(f"  {i+1}. {ts.title_part} ({ts.skills_part})")
+            max_c = t_budgets.get(i)
+            if max_c:
+                title_texts.append(f"  {i+1}. [{len(ts.skills_part)} chars, max {max_c}] {ts.title_part} ({ts.skills_part})")
+            else:
+                title_texts.append(f"  {i+1}. {ts.title_part} ({ts.skills_part})")
 
         sys_prompt = (
             "You are a resume title optimizer. You replace the tech stack in job title "
             "parentheses to match a target job description's technology requirements."
         )
 
+        char_rule = f"\n5. {char_constraint}" if char_constraint else ""
         usr_prompt = f"""Replace the tech stacks in these job title parentheses to match the job description.
 
 RULES:
 1. ONLY change the technologies inside the parentheses — do NOT change the job title itself
 2. Use technologies from the JD that the candidate actually knows (based on their current tech stacks)
 3. Keep the SAME number of technologies (same comma-separated count)
-4. Return ONLY the parenthesized content (e.g., "Node, Express, MongoDB, PostgreSQL, GCP")
+4. The skills text MUST NOT exceed the max character count shown in brackets. Stay close to original length but NEVER go over the max{char_rule}
 
 JOB DESCRIPTION:
 {job_description[:3000]}
@@ -1848,11 +2357,15 @@ def _parse_content_stream_inner(
     text_ops: List[TextOp] = []
     bt_offset = 0
 
-    # CTM transform tracking (cm operator)
-    # CTM is a 6-element matrix [a, b, c, d, e, f] — we only track translation (e, f)
-    ctm_tx, ctm_ty = 0.0, 0.0
+    # CTM (Current Transformation Matrix) tracking — full 6-element [a, b, c, d, e, f]
+    # Maps text-space coordinates to absolute page coordinates via:
+    #   abs_x = ctm_a * tx + ctm_c * ty + ctm_e
+    #   abs_y = ctm_b * tx + ctm_d * ty + ctm_f
+    # This prevents blocks at different visual locations from sharing the same (x, y)
+    # when the PDF uses cm operators with scaling + translation (common in resume PDFs).
+    ctm_a, ctm_b, ctm_c, ctm_d, ctm_e, ctm_f = 1.0, 0.0, 0.0, 1.0, 0.0, 0.0
     # Graphics state stack for q/Q save/restore
-    gstate_stack: List[Tuple[float, float]] = []
+    gstate_stack: List[Tuple[float, float, float, float, float, float]] = []
 
     # We need to track positions in the original byte stream for patching
     pos = 0
@@ -1867,14 +2380,14 @@ def _parse_content_stream_inner(
 
         # Check for q (save graphics state)
         if not in_bt and text[pos] == "q" and (pos + 1 >= length or text[pos + 1] in " \t\r\n"):
-            gstate_stack.append((ctm_tx, ctm_ty))
+            gstate_stack.append((ctm_a, ctm_b, ctm_c, ctm_d, ctm_e, ctm_f))
             pos += 1
             continue
 
         # Check for Q (restore graphics state)
         if not in_bt and text[pos] == "Q" and (pos + 1 >= length or text[pos + 1] in " \t\r\n"):
             if gstate_stack:
-                ctm_tx, ctm_ty = gstate_stack.pop()
+                ctm_a, ctm_b, ctm_c, ctm_d, ctm_e, ctm_f = gstate_stack.pop()
             pos += 1
             continue
 
@@ -1892,11 +2405,14 @@ def _parse_content_stream_inner(
         # Check for ET (end text)
         if text[pos:pos + 2] == "ET" and (pos + 2 >= length or text[pos + 2] in " \t\r\n"):
             if in_bt and text_ops and current_font:
+                # Transform text-space (tx, ty) to absolute page coordinates via CTM
+                abs_x = ctm_a * tx + ctm_c * ty + ctm_e
+                abs_y = ctm_b * tx + ctm_d * ty + ctm_f
                 blocks.append(ContentBlock(
                     font_tag=current_font,
                     font_size=current_size,
-                    x=tx,
-                    y=ty,
+                    x=abs_x,
+                    y=abs_y,
                     text_ops=list(text_ops),
                     stream_xref=stream_xref,
                     page_num=page_num,
@@ -1906,7 +2422,48 @@ def _parse_content_stream_inner(
             continue
 
         if not in_bt:
-            # Skip to next token
+            # Outside BT/ET — we need to parse cm operators for CTM tracking.
+            # cm is preceded by 6 numbers: "1 0 0 -1 0 792 cm"
+            if text[pos] in "-0123456789.":
+                # Collect numbers (potential cm operands)
+                _nums: List[float] = []
+                _scan = pos
+                while _scan < length:
+                    while _scan < length and text[_scan] in " \t\r\n":
+                        _scan += 1
+                    if _scan >= length or text[_scan] not in "-0123456789.":
+                        break
+                    num_start = _scan
+                    if text[_scan] == "-":
+                        _scan += 1
+                    while _scan < length and text[_scan] in "0123456789.":
+                        _scan += 1
+                    try:
+                        _nums.append(float(text[num_start:_scan]))
+                    except ValueError:
+                        break
+                    if _scan >= length:
+                        break
+                    if text[_scan] not in " \t\r\n" and text[_scan] not in "-0123456789.":
+                        break
+                # Check if cm follows
+                while _scan < length and text[_scan] in " \t\r\n":
+                    _scan += 1
+                if len(_nums) >= 6 and _scan + 1 < length and text[_scan:_scan + 2] == "cm":
+                    ma, mb, mc, md, me, mf = _nums[-6], _nums[-5], _nums[-4], _nums[-3], _nums[-2], _nums[-1]
+                    new_a = ctm_a * ma + ctm_b * mc
+                    new_b = ctm_a * mb + ctm_b * md
+                    new_c = ctm_c * ma + ctm_d * mc
+                    new_d = ctm_c * mb + ctm_d * md
+                    new_e = ctm_e * ma + ctm_f * mc + me
+                    new_f = ctm_e * mb + ctm_f * md + mf
+                    ctm_a, ctm_b, ctm_c, ctm_d, ctm_e, ctm_f = new_a, new_b, new_c, new_d, new_e, new_f
+                    pos = _scan + 2
+                    continue
+                # Not a cm operator — skip past the numbers
+                pos = _scan if _scan > pos else pos + 1
+                continue
+            # Skip non-numeric tokens outside BT
             pos += 1
             continue
 
@@ -2167,11 +2724,13 @@ def _parse_content_stream_inner(
                 if len(nums) >= 6 and scan_pos + 1 < length and text[scan_pos:scan_pos + 2] == "Tm":
                     # Flush current block before position change
                     if text_ops and current_font:
+                        abs_x = ctm_a * tx + ctm_c * ty + ctm_e
+                        abs_y = ctm_b * tx + ctm_d * ty + ctm_f
                         blocks.append(ContentBlock(
                             font_tag=current_font,
                             font_size=current_size,
-                            x=tx,
-                            y=ty,
+                            x=abs_x,
+                            y=abs_y,
                             text_ops=list(text_ops),
                             stream_xref=stream_xref,
                             page_num=page_num,
@@ -2186,11 +2745,13 @@ def _parse_content_stream_inner(
                 elif len(nums) >= 2 and scan_pos + 1 < length and text[scan_pos:scan_pos + 2] == "Td":
                     # Flush current block before position change
                     if text_ops and current_font:
+                        abs_x = ctm_a * tx + ctm_c * ty + ctm_e
+                        abs_y = ctm_b * tx + ctm_d * ty + ctm_f
                         blocks.append(ContentBlock(
                             font_tag=current_font,
                             font_size=current_size,
-                            x=tx,
-                            y=ty,
+                            x=abs_x,
+                            y=abs_y,
                             text_ops=list(text_ops),
                             stream_xref=stream_xref,
                             page_num=page_num,
@@ -2203,11 +2764,13 @@ def _parse_content_stream_inner(
                 # Check for TD (2 numbers, like Td but also sets leading)
                 elif len(nums) >= 2 and scan_pos + 1 < length and text[scan_pos:scan_pos + 2] == "TD":
                     if text_ops and current_font:
+                        abs_x = ctm_a * tx + ctm_c * ty + ctm_e
+                        abs_y = ctm_b * tx + ctm_d * ty + ctm_f
                         blocks.append(ContentBlock(
                             font_tag=current_font,
                             font_size=current_size,
-                            x=tx,
-                            y=ty,
+                            x=abs_x,
+                            y=abs_y,
                             text_ops=list(text_ops),
                             stream_xref=stream_xref,
                             page_num=page_num,
@@ -2217,14 +2780,7 @@ def _parse_content_stream_inner(
                     ty += nums[1]
                     pos = scan_pos + 2
                     continue
-                # Check for cm (coordinate transform, 6 numbers) — outside BT/ET
-                elif not in_bt and len(nums) >= 6 and scan_pos + 1 < length and text[scan_pos:scan_pos + 2] == "cm":
-                    # cm concatenates a matrix to the CTM: [a b c d e f]
-                    # We track translation (e, f) to adjust text positions
-                    ctm_tx += nums[4]
-                    ctm_ty += nums[5]
-                    pos = scan_pos + 2
-                    continue
+                # (cm is now handled outside BT/ET in the not-in_bt section above)
 
             # Not a recognized pattern, skip ahead
             pos = scan_pos if scan_pos > pos else pos + 1
@@ -2694,6 +3250,72 @@ class _FontAugmentor:
             return None
 
 
+def _update_truetype_widths(doc, font_xref: int, new_widths: Dict[int, float]) -> None:
+    """
+    Update /Widths, /FirstChar, /LastChar for a simple TrueType font.
+
+    Simple TrueType fonts store widths as:
+        /FirstChar N  /LastChar M  /Widths [w0 w1 ... w(M-N)]
+    where /Widths[i] is the width for CID (FirstChar + i).
+
+    To add new CIDs beyond LastChar, we extend the array with zeros for gaps
+    and set the new widths at the correct positions.
+    """
+    if not new_widths:
+        return
+
+    try:
+        fc_val = doc.xref_get_key(font_xref, "FirstChar")
+        lc_val = doc.xref_get_key(font_xref, "LastChar")
+        w_val = doc.xref_get_key(font_xref, "Widths")
+
+        if fc_val[0] == "null" or lc_val[0] == "null" or w_val[0] == "null":
+            logger.debug("[FONT_AUG] TrueType font missing FirstChar/LastChar/Widths")
+            return
+
+        first_char = int(fc_val[1].strip())
+        last_char = int(lc_val[1].strip())
+
+        # Parse existing widths array
+        w_text = w_val[1].strip()
+        # Resolve indirect reference
+        if w_val[0] == "xref":
+            ref_m = re.match(r'(\d+)\s+0\s+R', w_text)
+            if ref_m:
+                w_indirect_xref = int(ref_m.group(1))
+                w_text = doc.xref_object(w_indirect_xref).strip()
+
+        # Parse the array: "[w0 w1 w2 ...]"
+        inner = w_text.strip("[]").strip()
+        existing_widths = [float(x) for x in inner.split()] if inner else []
+
+        # Find new max CID
+        max_new_cid = max(new_widths.keys())
+        new_last_char = max(last_char, max_new_cid)
+
+        # Extend widths array to cover all CIDs up to new_last_char
+        needed_len = new_last_char - first_char + 1
+        while len(existing_widths) < needed_len:
+            existing_widths.append(0)
+
+        # Set new widths
+        for cid, width in new_widths.items():
+            idx = cid - first_char
+            if 0 <= idx < len(existing_widths):
+                existing_widths[idx] = width
+
+        # Write back
+        new_w_text = "[" + " ".join(f"{w:.5f}" if w != int(w) else str(int(w)) for w in existing_widths) + "]"
+        doc.xref_set_key(font_xref, "Widths", new_w_text)
+        doc.xref_set_key(font_xref, "LastChar", str(new_last_char))
+        logger.info(
+            f"[FONT_AUG] Updated TrueType /Widths: LastChar {last_char} → {new_last_char}, "
+            f"{len(new_widths)} new entries"
+        )
+    except Exception as e:
+        logger.warning(f"[FONT_AUG] Failed to update TrueType widths: {e}")
+
+
 def _update_pdf_font_structures(
     doc,
     page,
@@ -2742,10 +3364,11 @@ def _update_pdf_font_structures(
     except Exception as e:
         logger.warning(f"[FONT_AUG] Failed to update ToUnicode CMap: {e}")
 
-    # 2. Update W array in CIDFont (skip on error — renders with default width)
+    # 2. Update width arrays (CIDFont /W or simple TrueType /Widths)
     try:
         desc_val = doc.xref_get_key(font_xref, "DescendantFonts")
         if desc_val[0] != "null" and desc_val[1]:
+            # ── Type0/CID font path: update /W array on DescendantFont ──
             desc_text = desc_val[1].strip().strip("[]").strip()
             ref_match = re.match(r'(\d+)\s+0\s+R', desc_text)
             if ref_match:
@@ -2771,8 +3394,11 @@ def _update_pdf_font_structures(
                         w_text += " " + " ".join(new_w_entries) + "]"
                         doc.xref_set_key(cidfont_xref, "W", w_text)
                         logger.info(f"[FONT_AUG] Updated W array with {len(new_w_entries)} new entries")
+        else:
+            # ── Simple TrueType font path: update /Widths, /FirstChar, /LastChar ──
+            _update_truetype_widths(doc, font_xref, new_widths)
     except Exception as e:
-        logger.debug(f"[FONT_AUG] W array update skipped (non-critical): {e}")
+        logger.debug(f"[FONT_AUG] Width array update skipped (non-critical): {e}")
 
     # 3. Update the font's FontFile2 with augmented subset
     try:
@@ -2785,34 +3411,60 @@ def _augment_font_file(doc, font_xref: int, font_tag: str, new_mappings: Dict[st
     """
     Augment the embedded font's FontFile2 with glyphs from the system font.
     This ensures new CIDs actually render correctly.
+
+    Handles two font structure paths:
+    - Type0/CID: font_xref → DescendantFonts → CIDFont → FontDescriptor → FontFile2
+    - Simple TrueType: font_xref → FontDescriptor → FontFile2
     """
     try:
         from fontTools.ttLib import TTFont
         from io import BytesIO
 
-        # Get the DescendantFont to find FontFile2
+        # ── Locate FontDescriptor and BaseFont name ──
+        fd_xref = None
+        basefont_name = ""
+
+        # Path 1: Type0/CID font (has DescendantFonts)
         desc_val = doc.xref_get_key(font_xref, "DescendantFonts")
-        if desc_val[0] == "null":
+        if desc_val[0] != "null" and desc_val[1]:
+            desc_text = desc_val[1].strip().strip("[]").strip()
+            ref_match = re.match(r'(\d+)\s+0\s+R', desc_text)
+            if ref_match:
+                cidfont_xref = int(ref_match.group(1))
+                fd_val = doc.xref_get_key(cidfont_xref, "FontDescriptor")
+                if fd_val[0] != "null" and fd_val[1]:
+                    fd_match = re.match(r'(\d+)\s+0\s+R', fd_val[1].strip())
+                    if fd_match:
+                        fd_xref = int(fd_match.group(1))
+                # Get BaseFont from CIDFont
+                bf_val = doc.xref_get_key(cidfont_xref, "BaseFont")
+                if bf_val[0] != "null" and bf_val[1]:
+                    basefont_name = bf_val[1].strip().lstrip("/")
+
+        # Path 2: Simple TrueType font (FontDescriptor directly on font dict)
+        if fd_xref is None:
+            fd_val = doc.xref_get_key(font_xref, "FontDescriptor")
+            if fd_val[0] != "null" and fd_val[1]:
+                fd_match = re.match(r'(\d+)\s+0\s+R', fd_val[1].strip())
+                if fd_match:
+                    fd_xref = int(fd_match.group(1))
+            # Get BaseFont from font dict
+            bf_val = doc.xref_get_key(font_xref, "BaseFont")
+            if bf_val[0] != "null" and bf_val[1]:
+                basefont_name = bf_val[1].strip().lstrip("/")
+
+        if fd_xref is None:
+            logger.debug(f"[FONT_AUG] No FontDescriptor found for {font_tag}")
             return
 
-        desc_text = desc_val[1].strip().strip("[]").strip()
-        ref_match = re.match(r'(\d+)\s+0\s+R', desc_text)
-        if not ref_match:
-            return
-        cidfont_xref = int(ref_match.group(1))
+        # Strip subset prefix (e.g. "BAAAAA+TimesNewRomanPSMT" → "TimesNewRomanPSMT")
+        if "+" in basefont_name:
+            basefont_name = basefont_name.split("+", 1)[1]
 
-        # Get FontDescriptor
-        fd_val = doc.xref_get_key(cidfont_xref, "FontDescriptor")
-        if fd_val[0] == "null":
-            return
-        fd_match = re.match(r'(\d+)\s+0\s+R', fd_val[1].strip())
-        if not fd_match:
-            return
-        fd_xref = int(fd_match.group(1))
-
-        # Get FontFile2
+        # ── Get FontFile2 ──
         ff2_val = doc.xref_get_key(fd_xref, "FontFile2")
         if ff2_val[0] == "null":
+            logger.debug(f"[FONT_AUG] No FontFile2 for {font_tag}")
             return
         ff2_match = re.match(r'(\d+)\s+0\s+R', ff2_val[1].strip())
         if not ff2_match:
@@ -2823,14 +3475,7 @@ def _augment_font_file(doc, font_xref: int, font_tag: str, new_mappings: Dict[st
         font_bytes = doc.xref_stream(ff2_xref)
         embedded_font = TTFont(BytesIO(font_bytes))
 
-        # Get basefont name to find matching system font
-        basefont_val = doc.xref_get_key(cidfont_xref, "BaseFont")
-        basefont_name = ""
-        if basefont_val[0] != "null":
-            basefont_name = basefont_val[1].strip().lstrip("/")
-            if "+" in basefont_name:
-                basefont_name = basefont_name.split("+", 1)[1]
-
+        # Load matching system font
         augmentor = _FontAugmentor()
         system_font = augmentor._load_system_font(basefont_name)
         if not system_font:
@@ -2850,8 +3495,6 @@ def _augment_font_file(doc, font_xref: int, font_tag: str, new_mappings: Dict[st
         sys_glyph_order = system_font.getGlyphOrder()
         emb_glyph_order = list(embedded_font.getGlyphOrder())
 
-        sys_name_to_gid = {name: idx for idx, name in enumerate(sys_glyph_order)}
-
         for char, cid in new_mappings.items():
             code_point = ord(char)
             sys_glyph_name = sys_cmap.get(code_point)
@@ -2859,11 +3502,13 @@ def _augment_font_file(doc, font_xref: int, font_tag: str, new_mappings: Dict[st
                 continue
 
             # Target glyph name in embedded font (by CID/GID)
-            target_name = f"gid{cid:05d}" if cid >= len(emb_glyph_order) else emb_glyph_order[cid] if cid < len(emb_glyph_order) else f"gid{cid:05d}"
+            if cid < len(emb_glyph_order):
+                target_name = emb_glyph_order[cid]
+            else:
+                target_name = f"gid{cid:05d}"
 
             # Ensure target slot exists
             if target_name not in emb_glyph_order:
-                # Extend glyph order
                 while len(emb_glyph_order) <= cid:
                     placeholder = f"gid{len(emb_glyph_order):05d}"
                     emb_glyph_order.append(placeholder)
@@ -2985,11 +3630,16 @@ def _find_blocks_for_text(
                     # Otherwise use 95% to avoid overreaching into next bullet.
                     avg_chars = raw_len / max(len(block_indices), 1)
                     threshold = 1.0 if avg_chars < 3 else 0.95
-                    if raw_len >= target_len * threshold:
+                    # Use concat_len (max of spaced/raw) for threshold check.
+                    # Raw text lacks inter-block spaces, so comparing raw_len
+                    # to a target that HAS spaces causes false extension into
+                    # date/location blocks to make up the character deficit.
+                    if concat_len >= target_len * threshold:
                         return block_indices
-                    # Extend: keep collecting blocks until raw covers the target
+                    # Extend: keep collecting blocks until concat covers target.
+                    # Skip blocks with protected content (dates, locations).
                     for k in range(j + 1, min(start + 300, len(content_blocks))):
-                        if raw_len >= target_len * threshold:
+                        if concat_len >= target_len * threshold:
                             break
                         if k in used_block_indices:
                             continue
@@ -2999,9 +3649,13 @@ def _find_blocks_for_text(
                         tk = bk.full_text
                         if not tk:
                             continue
+                        # Don't extend into protected blocks (dates, locations)
+                        if _BoundaryDetector.is_protected(tk.strip()):
+                            break
                         concat_raw += tk
                         block_indices.append(k)
-                        raw_len = len(" ".join(concat_raw.replace("\u200b", "").split()).strip())
+                        raw_clean = " ".join(concat_raw.replace("\u200b", "").split()).strip()
+                        concat_len = max(len(raw_clean), concat_len)
                     return block_indices
 
             # If we've gone well past the target length, stop
@@ -3162,11 +3816,34 @@ def _patch_content_stream(
                     break  # Different font (section header, etc.) — stop
                 extension.append(k)
 
+        # ── Boundary protection: filter out date/location blocks ──
+        # The extension logic above grabs ALL blocks at the same Y-position,
+        # which includes right-aligned dates like "March 2025 – Oct 2025".
+        # Filter these out to prevent date wiping (Bug #1).
+        if extension:
+            extension = _BoundaryDetector.filter_extension_blocks(
+                all_content_blocks, extension,
+                matched_block_indices=block_indices,
+            )
+
         if extension:
             logger.info(
                 f"[PATCH] {label}: extended by {len(extension)} tail-end blocks"
             )
             block_indices.extend(extension)
+
+        # ── Also check matched blocks for accidental date inclusion ──
+        # If the text matching algorithm was too aggressive and included
+        # date blocks in the initial match, remove them.
+        block_indices = _BoundaryDetector.filter_matched_blocks(
+            all_content_blocks, block_indices, original_text
+        )
+        if not block_indices:
+            logger.warning(
+                f"[PATCH] All blocks filtered as protected for {label}: "
+                f"'{original_text[:50]}'"
+            )
+            return False
 
         # Mark blocks as used
         used_block_indices.update(block_indices)
@@ -3178,36 +3855,16 @@ def _patch_content_stream(
         # Encode new text to hex CIDs
         hex_encoded, missing_chars = cmap_mgr.encode_text(actual_font, new_text)
 
-        # Handle missing characters via font augmentation
+        # Handle missing characters — skip replacement to avoid garbled text.
+        # Font augmentation for TrueType subset fonts is unreliable (internal cmap
+        # table not updated → PDF viewers render .notdef boxes). The validation
+        # system should have caught this; if it didn't, skip rather than garble.
         if missing_chars:
-            font_name = cmap_mgr.font_names.get(actual_font, "")
-            logger.info(
-                f"[PATCH] Font {actual_font} ({font_name}) missing {len(missing_chars)} chars "
-                f"for {label}"
+            logger.warning(
+                f"[PATCH] Font {actual_font} missing chars {missing_chars[:5]} "
+                f"for {label} — skipping to preserve original text"
             )
-            resolved = font_aug.resolve_missing_chars(
-                doc, page, actual_font, font_name, missing_chars,
-                cmap_mgr, width_calc,
-            )
-            if resolved:
-                hex_encoded, still_missing = cmap_mgr.encode_text(actual_font, new_text)
-                if still_missing:
-                    logger.warning(f"[PATCH] Still missing chars after augmentation, skipping")
-                    return False
-                # Update PDF font structures
-                new_mappings = {
-                    ch: cmap_mgr.font_cmaps[actual_font]["rev"][ch]
-                    for ch in missing_chars
-                    if ch in cmap_mgr.font_cmaps.get(actual_font, {}).get("rev", {})
-                }
-                new_widths = {
-                    cid: width_calc.font_widths.get(actual_font, {}).get(cid, 500.0)
-                    for cid in new_mappings.values()
-                }
-                _update_pdf_font_structures(doc, page, actual_font, new_mappings, new_widths)
-            else:
-                logger.warning(f"[PATCH] Font augmentation failed, skipping {label}")
-                return False
+            return False
 
         if not hex_encoded:
             return False
@@ -3270,7 +3927,7 @@ def _patch_content_stream(
 
         def _inject_width_adjustment(
             op: TextOp, xref: int, orig_hex: str, new_hex: str,
-            content_bytes: bytes,
+            content_bytes: bytes, font_size: float = 1.0,
         ) -> bytes:
             """Inject Tc (character spacing) to match replacement width to original.
 
@@ -3278,9 +3935,10 @@ def _patch_content_stream(
             than Tz (horizontal scaling) because character shapes are preserved —
             only the inter-character spacing changes.
 
-            Formula: Tc = (orig_width - new_width) / (1000 * num_chars)
-            This gives the per-character text-space adjustment needed to make the
-            total rendered width match the original.
+            _calc_hex_width returns raw font units (1/1000 text space).
+            PDF displacement: tx = (w0 * Tfs + Tc) * Th
+            To match widths: Tc = (orig_w - new_w) * Tfs / (1000 * num_chars)
+            where Tfs = font_size from the Tf operator.
             """
             if not orig_hex or not new_hex:
                 adj_bytes = b" 0 Tc "
@@ -3292,10 +3950,10 @@ def _patch_content_stream(
                 if orig_w <= 0 or abs(new_w - orig_w) < orig_w * 0.01:
                     adj_bytes = b" 0 Tc "  # <1% difference, no adjustment
                 else:
-                    # Tc = (orig_width - new_width) / (1000 * num_chars)
-                    tc_val = (orig_w - new_w) / (1000.0 * num_new_chars)
-                    # Clamp to reasonable range: ±0.15 text-space units
-                    # At 10pt, ±0.15 = ±1.5pt per char, beyond this is visible
+                    # Tc = (orig_w - new_w) * font_size / (1000 * num_chars)
+                    # font_size converts raw font units to user-space points
+                    tc_val = (orig_w - new_w) * font_size / (1000.0 * num_new_chars)
+                    # Clamp to ±0.15pt per character — beyond this is visible
                     tc_val = max(-0.15, min(0.15, tc_val))
                     adj_bytes = f" {tc_val:.4f} Tc ".encode("latin-1")
             if op.operator == "TJ" and op.tj_array_start >= 0:
@@ -3372,33 +4030,64 @@ def _patch_content_stream(
                                         op.byte_length, empty_bytes)
                     continue
 
-                # Encode this line's text separately
-                line_hex, line_missing = cmap_mgr.encode_text(actual_font, line_text)
+                # Determine font for this y-group's first block.
+                # Different y-groups may use different fonts (e.g. regular vs bold).
+                # Encoding text with the wrong font's CMap produces garbled output.
+                first_bi = group_blocks[0]
+                first_blk = all_content_blocks[first_bi]
+                group_font = first_blk.font_tag
+
+                # Encode this line's text using the correct font for this group
+                line_hex, line_missing = cmap_mgr.encode_text(group_font, line_text)
+
+                # Skip if this group's font is missing characters
+                if line_missing:
+                    logger.warning(
+                        f"[PATCH] Font {group_font} missing chars {line_missing[:5]} "
+                        f"for {label} (y-group {yi}) — zeroing this line"
+                    )
+                    line_hex = ""  # Will be caught by 'if not line_hex' below
+
                 if not line_hex:
                     continue
 
-                # Collect original hex for this y-group (for Tz calculation)
+                # Collect original hex for this y-group (for Tc calculation)
                 line_orig_hex = ""
                 for bi in group_blocks:
                     block = all_content_blocks[bi]
                     for op in block.text_ops:
                         line_orig_hex += op.hex_string
 
+                # Use group font's width data for width calculations
+                group_font_data = cmap_mgr.font_cmaps.get(group_font, {})
+                group_byte_width = group_font_data.get("byte_width", 2)
+                group_hex_per_char = group_byte_width * 2
+                group_widths_map = width_calc.font_widths.get(group_font, {})
+                group_default_w = width_calc._default_widths.get(group_font, 1000.0)
+
+                def _calc_group_hex_width(hex_str: str) -> float:
+                    total = 0.0
+                    for ci in range(0, len(hex_str), group_hex_per_char):
+                        if ci + group_hex_per_char > len(hex_str):
+                            break
+                        cid = int(hex_str[ci:ci + group_hex_per_char], 16)
+                        total += group_widths_map.get(cid, group_default_w)
+                    return total
+
                 # Build content bytes for this line
                 if uses_literal:
                     # Use TJ kerning for word spacing (Type1 fonts)
-                    line_content = _build_literal_content(line_text, actual_font)
+                    line_content = _build_literal_content(line_text, group_font)
                 else:
                     line_content = f"<{line_hex}>".encode("latin-1")
 
-                # Put in first (leftmost) block, Tz scale, zero the rest
-                first_bi = group_blocks[0]
-                first_blk = all_content_blocks[first_bi]
+                # Put in first (leftmost) block, Tc adjust, zero the rest
                 if first_blk.text_ops:
                     first_op = first_blk.text_ops[0]
                     line_content = _inject_width_adjustment(
                         first_op, first_blk.stream_xref,
-                        line_orig_hex, line_hex, line_content
+                        line_orig_hex, line_hex, line_content,
+                        font_size=first_blk.font_size,
                     )
                     queue_patch(first_blk.stream_xref, first_op.byte_offset,
                                 first_op.byte_length, line_content)
@@ -3422,9 +4111,22 @@ def _patch_content_stream(
             first_bi = sorted_blocks[0]
             first_blk = all_content_blocks[first_bi]
 
+            # Re-encode if leftmost block uses a different font than actual_font
+            group_font = first_blk.font_tag
+            if group_font != actual_font:
+                hex_encoded, line_missing = cmap_mgr.encode_text(group_font, new_text)
+                if line_missing:
+                    logger.warning(
+                        f"[PATCH] Font {group_font} missing chars {line_missing[:5]} "
+                        f"for {label} — skipping to preserve original text"
+                    )
+                    return False
+                if not hex_encoded:
+                    return False
+
             if uses_literal:
                 # Use TJ kerning for word spacing (Type1 fonts)
-                new_content_bytes = _build_literal_content(new_text, actual_font)
+                new_content_bytes = _build_literal_content(new_text, group_font)
             else:
                 new_content_bytes = f"<{hex_encoded}>".encode("latin-1")
 
@@ -3439,7 +4141,8 @@ def _patch_content_stream(
                 first_op = first_blk.text_ops[0]
                 new_content_bytes = _inject_width_adjustment(
                     first_op, first_blk.stream_xref,
-                    all_orig_hex, hex_encoded, new_content_bytes
+                    all_orig_hex, hex_encoded, new_content_bytes,
+                    font_size=first_blk.font_size,
                 )
                 queue_patch(first_blk.stream_xref, first_op.byte_offset,
                             first_op.byte_length, new_content_bytes)
@@ -3566,7 +4269,8 @@ def _patch_content_stream(
                 # Only process title skills on this page
                 if ts.full_spans and ts.full_spans[0].page_num != page_num:
                     continue
-                orig_text = ts.full_text
+                # Use title+skills only (NOT full_text which includes dates)
+                orig_text = f"{ts.title_part} ({ts.skills_part})"
                 new_text = f"{ts.title_part} ({new_skills_part})"
                 font = ts.full_spans[0].font_name if ts.full_spans else ""
                 if _do_replacement(orig_text, new_text, font, f"title {t_idx}"):
@@ -3743,6 +4447,922 @@ def build_section_map(pdf_path: str) -> Dict[str, Any]:
     }
 
 
+async def _validate_and_retry(
+    pdf_path: str,
+    bullets: List[BulletPoint],
+    skills: List[SkillLine],
+    title_skills: Optional[List[TitleSkillLine]],
+    bullet_replacements: Dict[int, List[str]],
+    skill_replacements: Dict[int, str],
+    title_replacements: Dict[int, str],
+    job_description: str,
+    char_constraint: str = "",
+    width_budgets: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[int, List[str]], Dict[int, str], Dict[int, str]]:
+    """Validate replacements and retry failed items with tighter constraints.
+
+    Pass 1: Check character availability + rendered width for all replacements.
+    Pass 2: For items that fail, re-prompt Claude with explicit max char counts.
+    Fallback: If retry also fails, drop the replacement (keep original text).
+    """
+    from app.llm.claude_client import ClaudeClient
+
+    # ── Pass 1: Validate all replacements ──
+    doc = fitz.open(pdf_path)
+    cmap_mgr = _CMapManager(doc)
+    width_calc = _WidthCalculator(doc)
+    detector = _OverflowDetector(doc, cmap_mgr, width_calc)
+    fa = FontAnalyzer(cmap_mgr)
+
+    # Parse content blocks for width validation
+    all_blocks: List[ContentBlock] = []
+    for pn in range(len(doc)):
+        page = doc[pn]
+        for xref in page.get_contents():
+            try:
+                stream = doc.xref_stream(xref)
+                blks = _parse_content_stream(stream, cmap_mgr, pn, xref)
+                all_blocks.extend(blks)
+            except Exception:
+                pass
+
+    def _resolve_tag(font_name: str) -> Optional[str]:
+        for tag, name in cmap_mgr.font_names.items():
+            if name == font_name or font_name in name:
+                return tag
+        return None
+
+    # Track failures for retry
+    failed_bullets: Dict[int, str] = {}  # idx -> reason
+    failed_skills: Dict[int, str] = {}
+    failed_titles: Dict[int, str] = {}
+
+    valid_bullets: Dict[int, List[str]] = {}
+    valid_skills: Dict[int, str] = {}
+    valid_titles: Dict[int, str] = {}
+
+    # ── Validate bullets ──
+    for idx, new_lines in bullet_replacements.items():
+        if idx >= len(bullets):
+            continue
+        bp = bullets[idx]
+        text_spans = [
+            s for tl in bp.text_lines for s in tl.spans
+            if not s.is_bullet_char and not s.is_zwsp_only and s.text.strip()
+        ]
+        if not text_spans:
+            valid_bullets[idx] = new_lines
+            continue
+
+        font_tag = _resolve_tag(text_spans[0].font_name)
+        font_size = text_spans[0].font_size
+        x_start = text_spans[0].bbox[0]
+        page_num = text_spans[0].page_num
+
+        if not font_tag:
+            valid_bullets[idx] = new_lines
+            continue
+
+        # Check character availability
+        full_text = " ".join(new_lines)
+        missing = fa.check_text(full_text, font_tag)
+        if missing:
+            failed_bullets[idx] = f"unavailable chars: {missing[:5]}"
+            continue
+
+        # Check rendered width — compare against original line width
+        # Using original width avoids coordinate system issues with CTM
+        overflow = False
+        for li, new_line in enumerate(new_lines):
+            orig_line = bp.line_texts[li] if li < len(bp.line_texts) else ""
+            orig_w = detector.measure_text_width(orig_line, font_tag, font_size) if orig_line else 0
+            text_w = detector.measure_text_width(new_line, font_tag, font_size)
+            max_tc = detector.MAX_TC * len(new_line)
+            if orig_w > 0 and text_w - max_tc > orig_w:
+                failed_bullets[idx] = f"line {li} overflow: {text_w:.0f}pt > {orig_w:.0f}pt"
+                overflow = True
+                break
+
+        if not overflow:
+            valid_bullets[idx] = new_lines
+
+    # ── Validate skills ──
+    for idx, new_content in skill_replacements.items():
+        if idx >= len(skills):
+            continue
+        sk = skills[idx]
+        if not sk.content_spans:
+            valid_skills[idx] = new_content
+            continue
+
+        font_tag = _resolve_tag(sk.content_spans[0].font_name)
+        font_size = sk.content_spans[0].font_size
+        x_start = sk.content_spans[0].bbox[0]
+        page_num = sk.content_spans[0].page_num
+
+        if not font_tag:
+            valid_skills[idx] = new_content
+            continue
+
+        missing = fa.check_text(new_content, font_tag)
+        if missing:
+            failed_skills[idx] = f"unavailable chars: {missing[:5]}"
+            continue
+
+        orig_content = sk.content_text if hasattr(sk, 'content_text') else " ".join(s.text for s in sk.content_spans)
+        orig_w = detector.measure_text_width(orig_content, font_tag, font_size)
+        text_w = detector.measure_text_width(new_content, font_tag, font_size)
+        max_tc = detector.MAX_TC * len(new_content)
+        if orig_w > 0 and text_w - max_tc > orig_w:
+            failed_skills[idx] = f"overflow: {text_w:.0f}pt > {orig_w:.0f}pt"
+        else:
+            valid_skills[idx] = new_content
+
+    # ── Validate titles ──
+    if title_skills and title_replacements:
+        for idx, new_skills_part in title_replacements.items():
+            if idx >= len(title_skills):
+                continue
+            ts = title_skills[idx]
+            if not ts.full_spans:
+                valid_titles[idx] = new_skills_part
+                continue
+
+            font_tag = _resolve_tag(ts.full_spans[0].font_name)
+            font_size = ts.full_spans[0].font_size
+            x_start = ts.full_spans[0].bbox[0]
+            page_num = ts.full_spans[0].page_num
+
+            if not font_tag:
+                valid_titles[idx] = new_skills_part
+                continue
+
+            full_new = f"{ts.title_part} ({new_skills_part})"
+            missing = fa.check_text(full_new, font_tag)
+            if missing:
+                failed_titles[idx] = f"unavailable chars: {missing[:5]}"
+                continue
+
+            full_orig = f"{ts.title_part} ({ts.skills_part})"
+            orig_w = detector.measure_text_width(full_orig, font_tag, font_size)
+            text_w = detector.measure_text_width(full_new, font_tag, font_size)
+            max_tc = detector.MAX_TC * len(full_new)
+            if orig_w > 0 and text_w - max_tc > orig_w:
+                failed_titles[idx] = f"overflow: {text_w:.0f}pt > {orig_w:.0f}pt"
+            else:
+                valid_titles[idx] = new_skills_part
+    elif title_replacements:
+        valid_titles = dict(title_replacements)
+
+    doc.close()
+
+    total_failed = len(failed_bullets) + len(failed_skills) + len(failed_titles)
+    if total_failed == 0:
+        logger.info("[VALIDATE] All replacements passed validation on first pass")
+        return valid_bullets, valid_skills, valid_titles
+
+    logger.info(
+        f"[VALIDATE] Pass 1: {len(failed_bullets)} bullets, {len(failed_skills)} skills, "
+        f"{len(failed_titles)} titles failed validation — retrying with tighter constraints"
+    )
+    for idx, reason in failed_bullets.items():
+        logger.info(f"  Bullet {idx} failed: {reason}")
+    for idx, reason in failed_skills.items():
+        logger.info(f"  Skill {idx} failed: {reason}")
+    for idx, reason in failed_titles.items():
+        logger.info(f"  Title {idx} failed: {reason}")
+
+    # ── Pass 2: Retry failed items with explicit hard constraints ──
+    claude = ClaudeClient()
+    budgets = width_budgets or {}
+    bullet_budgets = budgets.get("bullet_budgets", {})
+    skill_budgets = budgets.get("skill_budgets", {})
+    title_budgets = budgets.get("title_budgets", {})
+
+    # Retry bullets
+    for idx in list(failed_bullets.keys()):
+        bp = bullets[idx]
+        # Resolve font tag for character availability checking
+        text_spans = []
+        for cl in bp.text_lines:
+            text_spans.extend(cl.spans)
+        font_tag = _resolve_tag(text_spans[0].font_name) if text_spans else None
+
+        line_maxes = bullet_budgets.get(idx, [])
+        lines_desc = []
+        for j, lt in enumerate(bp.line_texts):
+            mc = line_maxes[j] if j < len(line_maxes) else len(lt)
+            # Tighter constraint on retry: use 90% of budget
+            mc_tight = int(mc * 0.90)
+            lines_desc.append(f"  Line {j+1} ({len(lt)} chars, HARD MAX {mc_tight} chars): {lt}")
+
+        # Build char constraint including per-font restrictions
+        char_rule = f"\n- {char_constraint}" if char_constraint else ""
+        if font_tag:
+            unavail = fa.get_unavailable_standard_chars(font_tag)
+            if unavail:
+                char_rule += f"\n- Do NOT use these characters: {' '.join(repr(c) for c in unavail)}"
+        retry_prompt = f"""Rewrite this bullet point to match the job description.
+CRITICAL: Each line MUST be shorter than its HARD MAX character count. This is a strict limit.{char_rule}
+
+JOB DESCRIPTION (summary):
+{job_description[:1500]}
+
+BULLET ({bp.section_name}):
+{chr(10).join(lines_desc)}
+
+Return ONLY JSON: {{"lines": ["line 1 text", "line 2 text"]}}"""
+
+        try:
+            response = await claude._send_request(
+                "You are a resume optimizer. You MUST respect character limits exactly.",
+                retry_prompt,
+            )
+            parsed = _parse_json_response(response)
+            if parsed and "lines" in parsed:
+                new_lines = parsed["lines"]
+                if len(new_lines) == len(bp.line_texts):
+                    # Verify length constraints
+                    fits = True
+                    for j, nl in enumerate(new_lines):
+                        mc = line_maxes[j] if j < len(line_maxes) else len(bp.line_texts[j])
+                        if len(nl) > mc:
+                            fits = False
+                            break
+                    # Also re-check character availability
+                    if fits and font_tag:
+                        retry_missing = fa.check_text(" ".join(new_lines), font_tag)
+                        if retry_missing:
+                            fits = False
+                            logger.warning(
+                                f"[RETRY] Bullet {idx} still has unavailable chars "
+                                f"{retry_missing[:5]} — dropping"
+                            )
+                    if fits:
+                        valid_bullets[idx] = new_lines
+                        logger.info(f"[RETRY] Bullet {idx} succeeded on retry")
+                    else:
+                        logger.warning(f"[RETRY] Bullet {idx} still exceeds limits after retry — dropping")
+                else:
+                    logger.warning(f"[RETRY] Bullet {idx} wrong line count — dropping")
+        except Exception as e:
+            logger.warning(f"[RETRY] Bullet {idx} retry failed: {e}")
+
+    # Retry skills
+    for idx in list(failed_skills.keys()):
+        sk = skills[idx]
+        mc = skill_budgets.get(idx, len(sk.content_text))
+        mc_tight = int(mc * 0.90)
+        char_rule = f"\n- {char_constraint}" if char_constraint else ""
+
+        retry_prompt = f"""Rewrite this skill line to match the job description.
+CRITICAL: The output MUST be {mc_tight} characters or fewer.{char_rule}
+
+JOB DESCRIPTION (summary):
+{job_description[:1500]}
+
+SKILL LINE: {sk.label_text} {sk.content_text}
+
+Return ONLY the skill values (not the label). Return ONLY JSON: {{"content": "skill1, skill2, skill3"}}"""
+
+        try:
+            response = await claude._send_request(
+                "You are a resume skills optimizer. You MUST respect character limits exactly.",
+                retry_prompt,
+            )
+            parsed = _parse_json_response(response)
+            if parsed and "content" in parsed:
+                content = parsed["content"]
+                label = sk.label_text.strip()
+                if label and content.startswith(label):
+                    content = content[len(label):].strip()
+                label_base = label.rstrip(": ").strip()
+                if label_base and content.startswith(label_base):
+                    content = content[len(label_base):].lstrip(": ").strip()
+                if len(content) <= mc:
+                    # Re-check character availability
+                    sk_font_tag = _resolve_tag(sk.content_spans[0].font_name) if sk.content_spans else None
+                    if sk_font_tag:
+                        retry_missing = fa.check_text(content, sk_font_tag)
+                        if retry_missing:
+                            logger.warning(
+                                f"[RETRY] Skill {idx} still has unavailable chars "
+                                f"{retry_missing[:5]} — dropping"
+                            )
+                            continue
+                    valid_skills[idx] = content
+                    logger.info(f"[RETRY] Skill {idx} succeeded on retry")
+                else:
+                    logger.warning(f"[RETRY] Skill {idx} still too long ({len(content)} > {mc}) — dropping")
+        except Exception as e:
+            logger.warning(f"[RETRY] Skill {idx} retry failed: {e}")
+
+    # Retry titles
+    for idx in list(failed_titles.keys()):
+        ts = title_skills[idx]
+        mc = title_budgets.get(idx, len(ts.skills_part))
+        mc_tight = int(mc * 0.90)
+        char_rule = f"\n- {char_constraint}" if char_constraint else ""
+
+        retry_prompt = f"""Replace the tech stack in this job title to match the job description.
+CRITICAL: The skills text MUST be {mc_tight} characters or fewer.{char_rule}
+
+JOB DESCRIPTION (summary):
+{job_description[:1500]}
+
+TITLE: {ts.title_part} ({ts.skills_part})
+
+Return ONLY the skills part (not the title or parentheses). Return ONLY JSON: {{"skills": "Tech1, Tech2, Tech3"}}"""
+
+        try:
+            response = await claude._send_request(
+                "You are a resume optimizer. You MUST respect character limits exactly.",
+                retry_prompt,
+            )
+            parsed = _parse_json_response(response)
+            if parsed and "skills" in parsed:
+                new_skills = parsed["skills"]
+                if len(new_skills) <= mc:
+                    # Re-check character availability
+                    ts_font_tag = _resolve_tag(ts.content_spans[0].font_name) if ts.content_spans else None
+                    if ts_font_tag:
+                        retry_missing = fa.check_text(new_skills, ts_font_tag)
+                        if retry_missing:
+                            logger.warning(
+                                f"[RETRY] Title {idx} still has unavailable chars "
+                                f"{retry_missing[:5]} — dropping"
+                            )
+                            continue
+                    valid_titles[idx] = new_skills
+                    logger.info(f"[RETRY] Title {idx} succeeded on retry")
+                else:
+                    logger.warning(f"[RETRY] Title {idx} still too long — dropping")
+        except Exception as e:
+            logger.warning(f"[RETRY] Title {idx} retry failed: {e}")
+
+    final_dropped = total_failed - (
+        len(valid_bullets) - len(bullet_replacements) + len(failed_bullets)
+        + len(valid_skills) - len(skill_replacements) + len(failed_skills)
+        + len(valid_titles) - len(title_replacements or {}) + len(failed_titles)
+    )
+    retry_recovered = sum(1 for idx in failed_bullets if idx in valid_bullets) + \
+                      sum(1 for idx in failed_skills if idx in valid_skills) + \
+                      sum(1 for idx in failed_titles if idx in valid_titles)
+    final_dropped = total_failed - retry_recovered
+
+    logger.info(
+        f"[VALIDATE] Final: {retry_recovered}/{total_failed} recovered on retry, "
+        f"{final_dropped} dropped (original text preserved)"
+    )
+
+    return valid_bullets, valid_skills, valid_titles
+
+
+# ─── Post-Patch Verification ────────────────────────────────────────────────
+
+@dataclass
+class VerificationResult:
+    """Result of a single verification check."""
+    passed: bool
+    details: Dict[str, Any] = field(default_factory=dict)
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class VerificationReport:
+    """Complete verification report for a tailored PDF."""
+    text_extraction: VerificationResult
+    protected_content: VerificationResult
+    fonts: VerificationResult
+    visual: VerificationResult
+    garbled: VerificationResult
+    overflow: VerificationResult
+
+    @property
+    def passed(self) -> bool:
+        """Overall pass: all critical checks pass.
+        Visual is a warning (doesn't block) since content changes are expected.
+        """
+        return (
+            self.protected_content.passed
+            and self.fonts.passed
+            and self.garbled.passed
+            and self.overflow.passed
+        )
+
+    @property
+    def summary(self) -> str:
+        checks = [
+            ("text_extraction", self.text_extraction),
+            ("protected_content", self.protected_content),
+            ("fonts", self.fonts),
+            ("visual", self.visual),
+            ("garbled", self.garbled),
+            ("overflow", self.overflow),
+        ]
+        lines = []
+        for name, result in checks:
+            status = "PASS" if result.passed else "FAIL"
+            lines.append(f"  [{status}] {name}")
+            for w in result.warnings:
+                lines.append(f"    WARNING: {w}")
+        return "\n".join(lines)
+
+
+class PostPatchVerifier:
+    """Verify tailored PDF quality before returning to user.
+
+    Runs 6 verification layers:
+    1. Text extraction — replacement text is extractable
+    2. Protected content — dates, headers, contact info unchanged
+    3. Font integrity — same fonts, same count
+    4. Visual regression (SSIM) — overall + protected region similarity
+    5. Garbled character detection — no mid-word symbols or replacement chars
+    6. Text overflow detection — no text past page margins
+    """
+
+    # SSIM thresholds
+    OVERALL_SSIM_MIN = 0.75  # Content changes expected, so lower threshold
+    HEADER_SSIM_MIN = 0.95   # Header should be nearly identical
+    HEADER_REGION_RATIO = 0.12  # Top 12% of page is header
+
+    def verify(
+        self,
+        original_path: str,
+        tailored_path: str,
+        bullet_replacements: Optional[Dict[int, List[str]]] = None,
+        skill_replacements: Optional[Dict[int, str]] = None,
+        title_replacements: Optional[Dict[int, str]] = None,
+    ) -> VerificationReport:
+        """Run all verification checks and return a report."""
+        # Layer 1: Text extraction
+        text_result = self._check_text_extraction(
+            tailored_path,
+            bullet_replacements or {},
+            skill_replacements or {},
+            title_replacements or {},
+        )
+
+        # Layer 2: Protected content
+        protected_result = self._check_protected_content(
+            original_path, tailored_path
+        )
+
+        # Layer 3: Font integrity
+        font_result = self._check_fonts(original_path, tailored_path)
+
+        # Layer 4: Visual regression (SSIM)
+        visual_result = self._check_visual_similarity(
+            original_path, tailored_path
+        )
+
+        # Layer 5: Garbled characters
+        garbled_result = self._check_garbled_chars(tailored_path)
+
+        # Layer 6: Text overflow (relative to original)
+        overflow_result = self._check_overflow(tailored_path, original_path)
+
+        return VerificationReport(
+            text_extraction=text_result,
+            protected_content=protected_result,
+            fonts=font_result,
+            visual=visual_result,
+            garbled=garbled_result,
+            overflow=overflow_result,
+        )
+
+    def _check_text_extraction(
+        self,
+        tailored_path: str,
+        bullet_replacements: Dict[int, List[str]],
+        skill_replacements: Dict[int, str],
+        title_replacements: Dict[int, str],
+    ) -> VerificationResult:
+        """Verify replacement text is extractable from the tailored PDF."""
+        try:
+            doc = fitz.open(tailored_path)
+            full_text = ""
+            for page in doc:
+                full_text += page.get_text("text")
+            doc.close()
+
+            # Normalize whitespace for matching
+            full_norm = " ".join(full_text.split()).lower()
+
+            found = 0
+            total = 0
+            missing = []
+
+            # Check bullet replacements
+            for idx, lines in bullet_replacements.items():
+                for line in lines:
+                    total += 1
+                    # Check if significant words from the replacement appear
+                    words = [w for w in line.split() if len(w) > 3]
+                    if not words:
+                        found += 1
+                        continue
+                    # At least 60% of significant words should be found
+                    matched = sum(1 for w in words if w.lower() in full_norm)
+                    if matched >= len(words) * 0.6:
+                        found += 1
+                    else:
+                        missing.append(f"Bullet {idx}: '{line[:50]}...'")
+
+            # Check skill replacements
+            for idx, content in skill_replacements.items():
+                total += 1
+                words = [w.strip(",. ") for w in content.split() if len(w.strip(",. ")) > 2]
+                if not words:
+                    found += 1
+                    continue
+                matched = sum(1 for w in words if w.lower() in full_norm)
+                if matched >= len(words) * 0.5:
+                    found += 1
+                else:
+                    missing.append(f"Skill {idx}: '{content[:50]}...'")
+
+            # Check title replacements
+            for idx, skills_part in title_replacements.items():
+                total += 1
+                words = [w.strip(",. ") for w in skills_part.split(",") if len(w.strip()) > 1]
+                if not words:
+                    found += 1
+                    continue
+                matched = sum(1 for w in words if w.strip().lower() in full_norm)
+                if matched >= len(words) * 0.5:
+                    found += 1
+                else:
+                    missing.append(f"Title {idx}: '{skills_part[:50]}'")
+
+            rate = found / total if total > 0 else 1.0
+            warnings = missing[:5] if missing else []  # Cap at 5 warnings
+
+            return VerificationResult(
+                passed=rate >= 0.7,
+                details={"found": found, "total": total, "rate": rate},
+                warnings=warnings,
+            )
+        except Exception as e:
+            return VerificationResult(
+                passed=False,
+                details={"error": str(e)},
+                warnings=[f"Text extraction failed: {e}"],
+            )
+
+    def _check_protected_content(
+        self, original_path: str, tailored_path: str
+    ) -> VerificationResult:
+        """Verify dates, headers, contact info are unchanged."""
+        try:
+            orig_doc = fitz.open(original_path)
+            tail_doc = fitz.open(tailored_path)
+
+            orig_text = ""
+            tail_text = ""
+            for page in orig_doc:
+                orig_text += page.get_text("text")
+            for page in tail_doc:
+                tail_text += page.get_text("text")
+            orig_doc.close()
+            tail_doc.close()
+
+            # Extract dates from original
+            date_patterns = [
+                r'\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*\.?\s*\d{4}\b',
+                r'\b\d{4}\s*[-–—]\s*(?:\d{4}|Present|Current|Now)\b',
+                r'\b\d{1,2}/\d{4}\b',
+            ]
+
+            original_dates = set()
+            for pattern in date_patterns:
+                original_dates.update(re.findall(pattern, orig_text, re.IGNORECASE))
+
+            missing_dates = []
+            for date in original_dates:
+                if date not in tail_text:
+                    # Try normalized comparison (whitespace differences)
+                    date_norm = " ".join(date.split())
+                    tail_norm = " ".join(tail_text.split())
+                    if date_norm not in tail_norm:
+                        missing_dates.append(date)
+
+            # Check contact patterns (email, phone, LinkedIn)
+            email_re = re.compile(r'[\w.+-]+@[\w-]+\.[\w.-]+')
+            phone_re = re.compile(r'[\d\(\)\-\+\s]{7,15}')
+
+            orig_emails = set(email_re.findall(orig_text))
+            tail_emails = set(email_re.findall(tail_text))
+            missing_emails = orig_emails - tail_emails
+
+            warnings = []
+            if missing_dates:
+                warnings.extend([f"Missing date: {d}" for d in missing_dates[:5]])
+            if missing_emails:
+                warnings.extend([f"Missing email: {e}" for e in missing_emails])
+
+            return VerificationResult(
+                passed=len(missing_dates) == 0 and len(missing_emails) == 0,
+                details={
+                    "dates_found": len(original_dates),
+                    "dates_missing": len(missing_dates),
+                    "emails_found": len(orig_emails),
+                    "emails_missing": len(missing_emails),
+                },
+                warnings=warnings,
+            )
+        except Exception as e:
+            return VerificationResult(
+                passed=False,
+                details={"error": str(e)},
+                warnings=[f"Protected content check failed: {e}"],
+            )
+
+    def _check_fonts(
+        self, original_path: str, tailored_path: str
+    ) -> VerificationResult:
+        """Verify font integrity — same fonts, same count."""
+        try:
+            orig_doc = fitz.open(original_path)
+            tail_doc = fitz.open(tailored_path)
+
+            orig_fonts = set()
+            tail_fonts = set()
+
+            for page in orig_doc:
+                for f in page.get_fonts():
+                    orig_fonts.add(f[3])  # font name
+            for page in tail_doc:
+                for f in page.get_fonts():
+                    tail_fonts.add(f[3])
+
+            orig_doc.close()
+            tail_doc.close()
+
+            # Fonts should be identical (we don't add new fonts)
+            missing = orig_fonts - tail_fonts
+            extra = tail_fonts - orig_fonts
+
+            warnings = []
+            if missing:
+                warnings.append(f"Missing fonts: {missing}")
+            if extra:
+                warnings.append(f"Extra fonts: {extra}")
+
+            return VerificationResult(
+                passed=len(missing) == 0,
+                details={
+                    "original_count": len(orig_fonts),
+                    "tailored_count": len(tail_fonts),
+                    "missing": list(missing),
+                    "extra": list(extra),
+                },
+                warnings=warnings,
+            )
+        except Exception as e:
+            return VerificationResult(
+                passed=False,
+                details={"error": str(e)},
+                warnings=[f"Font check failed: {e}"],
+            )
+
+    def _check_visual_similarity(
+        self, original_path: str, tailored_path: str
+    ) -> VerificationResult:
+        """Render both PDFs and compare with SSIM."""
+        try:
+            import numpy as np
+            from skimage.metrics import structural_similarity
+
+            orig_doc = fitz.open(original_path)
+            tail_doc = fitz.open(tailored_path)
+
+            overall_ssims = []
+            header_ssims = []
+
+            for pn in range(min(len(orig_doc), len(tail_doc))):
+                # Render at 150 DPI (fast enough for comparison)
+                orig_pix = orig_doc[pn].get_pixmap(dpi=150)
+                tail_pix = tail_doc[pn].get_pixmap(dpi=150)
+
+                orig_arr = np.frombuffer(orig_pix.samples, dtype=np.uint8).reshape(
+                    orig_pix.h, orig_pix.w, orig_pix.n
+                )
+                tail_arr = np.frombuffer(tail_pix.samples, dtype=np.uint8).reshape(
+                    tail_pix.h, tail_pix.w, tail_pix.n
+                )
+
+                # Ensure same dimensions (crop to smaller)
+                h = min(orig_arr.shape[0], tail_arr.shape[0])
+                w = min(orig_arr.shape[1], tail_arr.shape[1])
+                c = min(orig_arr.shape[2], tail_arr.shape[2])
+                orig_crop = orig_arr[:h, :w, :c]
+                tail_crop = tail_arr[:h, :w, :c]
+
+                # Convert to grayscale for SSIM
+                if c >= 3:
+                    orig_gray = np.mean(orig_crop[:, :, :3], axis=2).astype(np.uint8)
+                    tail_gray = np.mean(tail_crop[:, :, :3], axis=2).astype(np.uint8)
+                else:
+                    orig_gray = orig_crop[:, :, 0]
+                    tail_gray = tail_crop[:, :, 0]
+
+                # Overall SSIM
+                overall = structural_similarity(orig_gray, tail_gray)
+                overall_ssims.append(overall)
+
+                # Header region SSIM (top 12%)
+                header_h = int(h * self.HEADER_REGION_RATIO)
+                if header_h > 10:
+                    header_ssim = structural_similarity(
+                        orig_gray[:header_h, :],
+                        tail_gray[:header_h, :],
+                    )
+                    header_ssims.append(header_ssim)
+
+            orig_doc.close()
+            tail_doc.close()
+
+            avg_overall = sum(overall_ssims) / len(overall_ssims) if overall_ssims else 0
+            avg_header = sum(header_ssims) / len(header_ssims) if header_ssims else 0
+
+            warnings = []
+            if avg_overall < self.OVERALL_SSIM_MIN:
+                warnings.append(
+                    f"Overall SSIM {avg_overall:.3f} below threshold {self.OVERALL_SSIM_MIN}"
+                )
+            if avg_header < self.HEADER_SSIM_MIN:
+                warnings.append(
+                    f"Header SSIM {avg_header:.3f} below threshold {self.HEADER_SSIM_MIN}"
+                )
+
+            return VerificationResult(
+                passed=avg_overall >= self.OVERALL_SSIM_MIN,
+                details={
+                    "overall_ssim": round(avg_overall, 4),
+                    "header_ssim": round(avg_header, 4),
+                    "pages_compared": len(overall_ssims),
+                },
+                warnings=warnings,
+            )
+        except ImportError:
+            return VerificationResult(
+                passed=True,
+                details={"skipped": "scikit-image not available"},
+                warnings=["SSIM check skipped — scikit-image not installed"],
+            )
+        except Exception as e:
+            return VerificationResult(
+                passed=True,  # Don't block on visual check failure
+                details={"error": str(e)},
+                warnings=[f"Visual check failed: {e}"],
+            )
+
+    def _check_garbled_chars(self, pdf_path: str) -> VerificationResult:
+        """Detect garbled or replacement characters in the PDF."""
+        try:
+            doc = fitz.open(pdf_path)
+            issues = []
+
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                text = page.get_text("text")
+
+                # Check for Unicode replacement character
+                if '\ufffd' in text:
+                    count = text.count('\ufffd')
+                    issues.append(
+                        f"Page {page_num}: {count} Unicode replacement character(s)"
+                    )
+
+                # Check for suspicious mid-word non-alpha characters
+                # e.g., "archite&cture" or "devel#opment"
+                # Allow: apostrophes, hyphens, slashes (min/max), plus (+),
+                # digits, underscores (var_names), periods (acronyms)
+                garbled_re = re.compile(
+                    r'[a-z][^a-zA-Z0-9\u2019\'\-/+_.][a-z]'
+                )
+                words = text.split()
+                for word in words:
+                    clean = word.strip(".,;:!?()[]{}\"'-/")
+                    if len(clean) > 4:
+                        match = garbled_re.search(clean)
+                        if match:
+                            # Exclude common patterns: URLs, emails, filenames
+                            if '@' in word or '://' in word:
+                                continue
+                            issues.append(
+                                f"Page {page_num}: Suspicious word '{clean}'"
+                            )
+
+            doc.close()
+
+            return VerificationResult(
+                passed=len(issues) == 0,
+                details={"issues_found": len(issues)},
+                warnings=issues[:10],  # Cap warnings
+            )
+        except Exception as e:
+            return VerificationResult(
+                passed=False,
+                details={"error": str(e)},
+                warnings=[f"Garbled char check failed: {e}"],
+            )
+
+    def _check_overflow(
+        self, pdf_path: str, original_path: Optional[str] = None
+    ) -> VerificationResult:
+        """Detect text extending past the original PDF's text boundaries.
+
+        Uses a relative approach: finds the max right-edge and bottom-edge
+        of text in the original PDF, then checks if the tailored PDF has
+        any text beyond those bounds (plus a small tolerance).
+        Falls back to absolute 10pt margin if no original is provided.
+        """
+        try:
+            doc = fitz.open(pdf_path)
+            overflow_issues = []
+
+            # Determine bounds from original PDF if available
+            orig_max_right = {}   # page_num -> max right x
+            orig_max_bottom = {}  # page_num -> max bottom y
+            tolerance = 5.0  # Small tolerance for font metrics rounding
+
+            if original_path:
+                orig_doc = fitz.open(original_path)
+                for pn in range(len(orig_doc)):
+                    page = orig_doc[pn]
+                    max_r = 0.0
+                    max_b = 0.0
+                    blocks = page.get_text(
+                        "dict", flags=fitz.TEXT_PRESERVE_WHITESPACE
+                    )["blocks"]
+                    for block in blocks:
+                        if block["type"] != 0:
+                            continue
+                        for line in block["lines"]:
+                            for span in line["spans"]:
+                                if span["text"].strip():
+                                    max_r = max(max_r, span["bbox"][2])
+                                    max_b = max(max_b, span["bbox"][3])
+                    orig_max_right[pn] = max_r
+                    orig_max_bottom[pn] = max_b
+                orig_doc.close()
+
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                page_w = page.rect.width
+                page_h = page.rect.height
+
+                # Use original bounds + tolerance, or absolute 10pt margin
+                right_limit = orig_max_right.get(
+                    page_num, page_w - 10.0
+                ) + tolerance
+                bottom_limit = orig_max_bottom.get(
+                    page_num, page_h - 10.0
+                ) + tolerance
+
+                blocks = page.get_text(
+                    "dict", flags=fitz.TEXT_PRESERVE_WHITESPACE
+                )["blocks"]
+                for block in blocks:
+                    if block["type"] != 0:
+                        continue
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            bbox = span["bbox"]
+                            text = span["text"].strip()
+                            if not text:
+                                continue
+
+                            if bbox[2] > right_limit:
+                                overflow_issues.append(
+                                    f"Page {page_num}: Right overflow at "
+                                    f"x={bbox[2]:.1f} (limit={right_limit:.1f})"
+                                    f": '{text[:30]}'"
+                                )
+                            if bbox[3] > bottom_limit:
+                                overflow_issues.append(
+                                    f"Page {page_num}: Bottom overflow at "
+                                    f"y={bbox[3]:.1f} (limit={bottom_limit:.1f})"
+                                    f": '{text[:30]}'"
+                                )
+
+            doc.close()
+
+            return VerificationResult(
+                passed=len(overflow_issues) == 0,
+                details={"overflow_count": len(overflow_issues)},
+                warnings=overflow_issues[:5],
+            )
+        except Exception as e:
+            return VerificationResult(
+                passed=True,  # Don't block on overflow check failure
+                details={"error": str(e)},
+                warnings=[f"Overflow check failed: {e}"],
+            )
+
+
 async def optimize_pdf(
     pdf_path: str,
     output_path: str,
@@ -3769,20 +5389,50 @@ async def optimize_pdf(
     bullets, skills, title_skills = group_bullet_points(classified)
     logger.info(f"Found {len(bullets)} bullet points, {len(skills)} skill lines, {len(title_skills)} title skill lines")
 
-    # Step 3: Optimize with Claude
+    # Step 2b: Font analysis — determine available characters BEFORE LLM generation
+    # This prevents generating characters the PDF font cannot render (garbled text bug)
+    char_constraint = ""
+    font_analyzer = None
+    try:
+        doc_for_analysis = fitz.open(pdf_path)
+        cmap_for_analysis = _CMapManager(doc_for_analysis)
+        font_analyzer = FontAnalyzer(cmap_for_analysis)
+        char_constraint = font_analyzer.build_char_constraint_string()
+        if char_constraint:
+            logger.info(f"[FONT] Character constraint: {char_constraint}")
+        else:
+            logger.info("[FONT] All standard characters available — no constraint needed")
+        logger.info(f"[FONT] Font summary:\n{font_analyzer.get_font_summary()}")
+        doc_for_analysis.close()
+    except Exception as e:
+        logger.warning(f"[FONT] Font analysis failed (continuing without constraints): {e}")
+
+    # Step 2c: Calculate per-item width budgets for LLM prompts
+    width_budgets = None
+    try:
+        width_budgets = calculate_width_budgets(pdf_path, bullets, skills, title_skills)
+    except Exception as e:
+        logger.warning(f"[BUDGET] Width budget calculation failed (continuing without budgets): {e}")
+
+    # Step 3: Optimize with Claude (with character constraints + width budgets)
     bullet_replacements, skill_replacements, title_replacements = await generate_optimized_content(
         bullets, skills, job_description, title_skills,
+        char_constraint=char_constraint,
+        width_budgets=width_budgets,
     )
     bullet_replacements = sanitize_bullet_replacements(
         bullets, bullet_replacements, length_tolerance=0.15
     )
     logger.info(f"Optimized {len(bullet_replacements)} bullets, {len(skill_replacements)} skills, {len(title_replacements)} title skills")
 
-    # Step 3b: Validate against rendered width (prevents visual overflow)
-    bullet_replacements, skill_replacements, title_replacements = validate_replacements_by_width(
-        pdf_path, bullets, skills,
-        bullet_replacements, skill_replacements,
-        title_skills, title_replacements,
+    # Step 3b: Validate + retry loop
+    # Validates character availability and rendered width for all replacements.
+    # Failed items get one retry with tighter constraints. If retry fails,
+    # the replacement is dropped (original text preserved).
+    bullet_replacements, skill_replacements, title_replacements = await _validate_and_retry(
+        pdf_path, bullets, skills, title_skills,
+        bullet_replacements, skill_replacements, title_replacements,
+        job_description, char_constraint, width_budgets,
     )
 
     # Step 4: Apply to PDF
@@ -3793,6 +5443,33 @@ async def optimize_pdf(
         title_skills, title_replacements,
     )
     logger.info(f"Saved optimized PDF to {output_path}")
+
+    # Step 5: Post-patch verification
+    try:
+        verifier = PostPatchVerifier()
+        report = verifier.verify(
+            pdf_path, output_path,
+            bullet_replacements, skill_replacements, title_replacements,
+        )
+        logger.info(f"[VERIFY] Post-patch verification:\n{report.summary}")
+
+        if not report.passed:
+            logger.warning(
+                "[VERIFY] Verification FAILED — returning original PDF to prevent corruption"
+            )
+            # Copy original to output path to prevent returning corrupted PDF
+            import shutil
+            shutil.copy2(pdf_path, output_path)
+            return {
+                "sections_found": ["Bullet Points", "Skills", "Title Tech Stacks"],
+                "sections_optimized": [],
+                "output_path": output_path,
+                "changes": [],
+                "verification_failed": True,
+                "verification_report": report.summary,
+            }
+    except Exception as e:
+        logger.warning(f"[VERIFY] Post-patch verification error (non-blocking): {e}")
 
     sections_optimized = []
     if bullet_replacements:
