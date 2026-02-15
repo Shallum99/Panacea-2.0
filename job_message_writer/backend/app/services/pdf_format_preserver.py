@@ -199,6 +199,362 @@ def sanitize_bullet_replacements(
     return sanitized
 
 
+# ─── Overflow Detection & Prevention ──────────────────────────────────────
+
+class _OverflowDetector:
+    """Detects and prevents text overflow by measuring rendered widths.
+
+    Works with the existing _WidthCalculator and _CMapManager to compute
+    exact rendered widths and determine if replacement text will overflow
+    the available line width in the PDF.
+    """
+
+    # Maximum Tc adjustment we allow (matches existing clamp in _inject_width_adjustment)
+    MAX_TC = 0.15
+
+    def __init__(self, doc, cmap_mgr: '_CMapManager', width_calc: '_WidthCalculator'):
+        self._doc = doc
+        self._cmap = cmap_mgr
+        self._wc = width_calc
+        # Cache page dimensions: page_num -> (width, height)
+        self._page_dims: Dict[int, Tuple[float, float]] = {}
+        # Cache inferred content bounds: page_num -> (left_x, right_x, top_y, bottom_y)
+        self._page_bounds: Dict[int, Tuple[float, float, float, float]] = {}
+
+    def _get_page_dims(self, page_num: int) -> Tuple[float, float]:
+        """Get page width and height in points."""
+        if page_num not in self._page_dims:
+            page = self._doc[page_num]
+            rect = page.rect
+            self._page_dims[page_num] = (rect.width, rect.height)
+        return self._page_dims[page_num]
+
+    def measure_text_width(self, text: str, font_tag: str, font_size: float) -> float:
+        """Measure the rendered width of text in points using font glyph widths."""
+        hex_encoded, _ = self._cmap.encode_text(font_tag, text)
+        if not hex_encoded:
+            # Fallback: estimate based on average char width
+            return len(text) * font_size * 0.5
+        byte_width = self._cmap.get_byte_width(font_tag)
+        return self._wc.text_width_from_hex(font_tag, hex_encoded, font_size, byte_width)
+
+    def measure_hex_width(self, hex_string: str, font_tag: str, font_size: float) -> float:
+        """Measure rendered width from hex-encoded text."""
+        if not hex_string:
+            return 0.0
+        byte_width = self._cmap.get_byte_width(font_tag)
+        return self._wc.text_width_from_hex(font_tag, hex_string, font_size, byte_width)
+
+    def get_available_width(
+        self, x_start: float, page_num: int,
+        all_blocks: Optional[List['ContentBlock']] = None,
+    ) -> float:
+        """Calculate available text width from x_start to the right margin.
+
+        Uses content analysis to infer the right boundary from existing text
+        positions on the page, falling back to page width minus standard margin.
+        """
+        page_w, _ = self._get_page_dims(page_num)
+
+        if page_num in self._page_bounds:
+            _, right_x, _, _ = self._page_bounds[page_num]
+            return right_x - x_start
+
+        # Infer right boundary from all content blocks on this page
+        if all_blocks:
+            page_blocks = [b for b in all_blocks if b.page_num == page_num and b.text_ops]
+            if page_blocks:
+                max_right = 0.0
+                for block in page_blocks:
+                    # Estimate right edge: x + rendered width of all text ops
+                    block_text = block.full_text
+                    if block_text and block.font_tag:
+                        block_w = self.measure_text_width(
+                            block_text, block.font_tag, block.font_size
+                        )
+                        max_right = max(max_right, block.x + block_w)
+
+                if max_right > x_start:
+                    # Add a small buffer (2pt) to avoid false overflow detection
+                    right_bound = max_right + 2.0
+                    left_x = min(b.x for b in page_blocks)
+                    self._page_bounds[page_num] = (left_x, right_bound, 0, 0)
+                    return right_bound - x_start
+
+        # Fallback: page width minus 0.5 inch right margin
+        return page_w - 36.0 - x_start
+
+    def would_overflow(
+        self, new_text: str, font_tag: str, font_size: float,
+        x_start: float, page_num: int,
+        all_blocks: Optional[List['ContentBlock']] = None,
+    ) -> Tuple[bool, float, float]:
+        """Check if rendering new_text would overflow the available line width.
+
+        Returns:
+            (overflows: bool, text_width: float, available_width: float)
+        """
+        text_w = self.measure_text_width(new_text, font_tag, font_size)
+        avail_w = self.get_available_width(x_start, page_num, all_blocks)
+
+        # Account for Tc compression: at max Tc clamp, we can shrink text by
+        # MAX_TC * num_chars * (Th=1.0) additional points
+        num_chars = len(new_text)
+        max_tc_savings = self.MAX_TC * num_chars
+        effective_width = text_w - max_tc_savings
+
+        return effective_width > avail_w, text_w, avail_w
+
+    def wrap_text(
+        self, text: str, max_width: float,
+        font_tag: str, font_size: float,
+    ) -> List[str]:
+        """Greedy word-wrap: split text into lines that fit within max_width.
+
+        Uses exact glyph widths from the PDF font's /Widths or /W array.
+        Returns a list of line strings.
+        """
+        words = text.split()
+        if not words:
+            return [text]
+
+        lines: List[str] = []
+        current_line: List[str] = []
+        current_width = 0.0
+        space_w = self.measure_text_width(" ", font_tag, font_size)
+        # Minimum space width fallback (some fonts report 0 for space)
+        if space_w < 0.1:
+            space_w = font_size * 0.25
+
+        for word in words:
+            word_w = self.measure_text_width(word, font_tag, font_size)
+            if current_line:
+                test_width = current_width + space_w + word_w
+                if test_width > max_width:
+                    # This word would overflow — start new line
+                    lines.append(" ".join(current_line))
+                    current_line = [word]
+                    current_width = word_w
+                else:
+                    current_line.append(word)
+                    current_width = test_width
+            else:
+                current_line = [word]
+                current_width = word_w
+
+        if current_line:
+            lines.append(" ".join(current_line))
+
+        return lines if lines else [text]
+
+    def get_line_leading(
+        self, blocks: List['ContentBlock'], page_num: int,
+    ) -> float:
+        """Measure actual line leading (baseline-to-baseline distance) from
+        consecutive content blocks on the same page.
+
+        Falls back to font_size * 1.2 if no consecutive blocks are found.
+        """
+        page_blocks = sorted(
+            [b for b in blocks if b.page_num == page_num and b.text_ops],
+            key=lambda b: -b.y  # Sort top-to-bottom (y decreases downward)
+        )
+        if len(page_blocks) < 2:
+            return page_blocks[0].font_size * 1.2 if page_blocks else 12.0
+
+        # Collect y-distances between consecutive blocks at similar x positions
+        deltas: List[float] = []
+        for i in range(len(page_blocks) - 1):
+            b1, b2 = page_blocks[i], page_blocks[i + 1]
+            # Only measure between blocks that are roughly left-aligned (same column)
+            if abs(b1.x - b2.x) < 20:
+                dy = b1.y - b2.y
+                if 4 < dy < 30:  # Reasonable line spacing range
+                    deltas.append(dy)
+
+        if deltas:
+            return sum(deltas) / len(deltas)
+        # Fallback
+        return page_blocks[0].font_size * 1.2
+
+
+def validate_replacements_by_width(
+    pdf_path: str,
+    bullets: List[BulletPoint],
+    skills: List[SkillLine],
+    bullet_replacements: Dict[int, List[str]],
+    skill_replacements: Dict[int, str],
+    title_skills: Optional[List[TitleSkillLine]] = None,
+    title_replacements: Optional[Dict[int, str]] = None,
+) -> Tuple[Dict[int, List[str]], Dict[int, str], Dict[int, str]]:
+    """Validate all replacements against rendered width constraints.
+
+    For each replacement, measures the actual rendered width using the PDF's
+    font metrics and compares against the available line width. Replacements
+    that would overflow are dropped (rejected) to prevent visual corruption.
+
+    This is called AFTER sanitize_bullet_replacements (character-count check)
+    as an additional rendered-width safety net.
+
+    Returns filtered (bullet_replacements, skill_replacements, title_replacements).
+    """
+    doc = fitz.open(pdf_path)
+    cmap_mgr = _CMapManager(doc)
+    width_calc = _WidthCalculator(doc)
+    detector = _OverflowDetector(doc, cmap_mgr, width_calc)
+
+    # Parse content blocks for margin inference
+    all_blocks: List[ContentBlock] = []
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        for xref in page.get_contents():
+            try:
+                stream = doc.xref_stream(xref)
+                blocks = _parse_content_stream(stream, cmap_mgr, page_num, xref)
+                all_blocks.extend(blocks)
+            except Exception:
+                pass
+
+    # ── Validate bullet replacements ──
+    validated_bullets: Dict[int, List[str]] = {}
+    for idx, new_lines in bullet_replacements.items():
+        if idx < 0 or idx >= len(bullets):
+            continue
+        bp = bullets[idx]
+        original_lines = bp.line_texts
+
+        # Get font info from the bullet's first text span
+        text_spans = [
+            s for tl in bp.text_lines for s in tl.spans
+            if not s.is_bullet_char and not s.is_zwsp_only and s.text.strip()
+        ]
+        if not text_spans:
+            validated_bullets[idx] = new_lines
+            continue
+
+        font_name = text_spans[0].font_name
+        font_size = text_spans[0].font_size
+        page_num = text_spans[0].page_num
+        x_start = text_spans[0].bbox[0]  # Left edge of text
+
+        # Resolve font name to font tag
+        font_tag = None
+        for tag, name in cmap_mgr.font_names.items():
+            if name == font_name or font_name in name:
+                font_tag = tag
+                break
+        if not font_tag:
+            # Can't measure without font info — pass through
+            validated_bullets[idx] = new_lines
+            continue
+
+        # Check each line's rendered width
+        avail_w = detector.get_available_width(x_start, page_num, all_blocks)
+        overflow = False
+        for li, new_line in enumerate(new_lines):
+            text_w = detector.measure_text_width(new_line, font_tag, font_size)
+            # Allow Tc compression to absorb up to MAX_TC * num_chars
+            max_tc_savings = _OverflowDetector.MAX_TC * len(new_line)
+            if text_w - max_tc_savings > avail_w:
+                logger.warning(
+                    f"[WIDTH-CHECK] Bullet {idx} line {li}: rendered width {text_w:.1f}pt "
+                    f"exceeds available {avail_w:.1f}pt (even with Tc), dropping bullet"
+                )
+                overflow = True
+                break
+
+        if not overflow:
+            validated_bullets[idx] = new_lines
+
+    # ── Validate skill replacements ──
+    validated_skills: Dict[int, str] = {}
+    for idx, new_content in skill_replacements.items():
+        if idx < 0 or idx >= len(skills):
+            continue
+        sk = skills[idx]
+        if not sk.content_spans:
+            validated_skills[idx] = new_content
+            continue
+
+        font_name = sk.content_spans[0].font_name
+        font_size = sk.content_spans[0].font_size
+        page_num = sk.content_spans[0].page_num
+        x_start = sk.content_spans[0].bbox[0]
+
+        font_tag = None
+        for tag, name in cmap_mgr.font_names.items():
+            if name == font_name or font_name in name:
+                font_tag = tag
+                break
+        if not font_tag:
+            validated_skills[idx] = new_content
+            continue
+
+        avail_w = detector.get_available_width(x_start, page_num, all_blocks)
+        text_w = detector.measure_text_width(new_content, font_tag, font_size)
+        max_tc_savings = _OverflowDetector.MAX_TC * len(new_content)
+        if text_w - max_tc_savings > avail_w:
+            logger.warning(
+                f"[WIDTH-CHECK] Skill {idx}: rendered width {text_w:.1f}pt "
+                f"exceeds available {avail_w:.1f}pt, dropping"
+            )
+        else:
+            validated_skills[idx] = new_content
+
+    # ── Validate title replacements ──
+    validated_titles: Dict[int, str] = {}
+    if title_skills and title_replacements:
+        for idx, new_skills_part in title_replacements.items():
+            if idx < 0 or idx >= len(title_skills):
+                continue
+            ts = title_skills[idx]
+            if not ts.full_spans:
+                validated_titles[idx] = new_skills_part
+                continue
+
+            font_name = ts.full_spans[0].font_name
+            font_size = ts.full_spans[0].font_size
+            page_num = ts.full_spans[0].page_num
+            x_start = ts.full_spans[0].bbox[0]
+
+            font_tag = None
+            for tag, name in cmap_mgr.font_names.items():
+                if name == font_name or font_name in name:
+                    font_tag = tag
+                    break
+            if not font_tag:
+                validated_titles[idx] = new_skills_part
+                continue
+
+            full_new = f"{ts.title_part} ({new_skills_part})"
+            avail_w = detector.get_available_width(x_start, page_num, all_blocks)
+            text_w = detector.measure_text_width(full_new, font_tag, font_size)
+            max_tc_savings = _OverflowDetector.MAX_TC * len(full_new)
+            if text_w - max_tc_savings > avail_w:
+                logger.warning(
+                    f"[WIDTH-CHECK] Title {idx}: rendered width {text_w:.1f}pt "
+                    f"exceeds available {avail_w:.1f}pt, dropping"
+                )
+            else:
+                validated_titles[idx] = new_skills_part
+    elif title_replacements:
+        validated_titles = dict(title_replacements)
+
+    dropped_b = len(bullet_replacements) - len(validated_bullets)
+    dropped_s = len(skill_replacements) - len(validated_skills)
+    dropped_t = len(title_replacements or {}) - len(validated_titles)
+    if dropped_b or dropped_s or dropped_t:
+        logger.info(
+            f"[WIDTH-CHECK] Dropped {dropped_b} bullets, {dropped_s} skills, "
+            f"{dropped_t} titles due to rendered-width overflow"
+        )
+    else:
+        logger.info("[WIDTH-CHECK] All replacements passed rendered-width validation")
+
+    doc.close()
+    return validated_bullets, validated_skills, validated_titles
+
+
 # ─── Step 1: Extract spans ─────────────────────────────────────────────────
 
 def extract_spans_from_pdf(pdf_path: str) -> List[TextSpan]:
@@ -3421,6 +3777,13 @@ async def optimize_pdf(
         bullets, bullet_replacements, length_tolerance=0.15
     )
     logger.info(f"Optimized {len(bullet_replacements)} bullets, {len(skill_replacements)} skills, {len(title_replacements)} title skills")
+
+    # Step 3b: Validate against rendered width (prevents visual overflow)
+    bullet_replacements, skill_replacements, title_replacements = validate_replacements_by_width(
+        pdf_path, bullets, skills,
+        bullet_replacements, skill_replacements,
+        title_skills, title_replacements,
+    )
 
     # Step 4: Apply to PDF
     apply_changes_to_pdf(
