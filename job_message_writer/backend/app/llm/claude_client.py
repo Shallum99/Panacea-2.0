@@ -47,17 +47,81 @@ class ClaudeClient:
                     },
                     timeout=120.0
                 )
-                
+
                 if response.status_code != 200:
                     logger.error(f"API request failed with status code {response.status_code}: {response.text}")
                     raise Exception(f"API request failed with status code {response.status_code}: {response.text}")
-                
+
                 result = response.json()
                 content = result.get("content", [{}])[0].get("text", "")
                 logger.info(f"Received response from Claude API (first 100 chars): {content[:100]}...")
                 return content
         except Exception as e:
             logger.error(f"Error in Claude API request: {str(e)}")
+            raise
+
+    async def _send_request_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        json_schema: Dict[str, Any],
+        max_tokens: int = 4096,
+        model: str = None,
+    ) -> Dict[str, Any]:
+        """Send a request with output_config for guaranteed structured JSON output.
+
+        Uses Anthropic's constrained decoding so the response is always valid
+        JSON that conforms to the provided JSON Schema.
+        """
+        use_model = model or self.model
+        logger.info(f"Sending structured JSON request to Claude API with model: {use_model}")
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    self.base_url,
+                    headers=self.headers,
+                    json={
+                        "model": use_model,
+                        "system": system_prompt,
+                        "messages": [
+                            {"role": "user", "content": user_prompt}
+                        ],
+                        "max_tokens": max_tokens,
+                        "output_config": {
+                            "format": {
+                                "type": "json_schema",
+                                "schema": json_schema,
+                            }
+                        },
+                    },
+                    timeout=120.0,
+                )
+
+                if response.status_code != 200:
+                    logger.error(
+                        f"Structured JSON API request failed with status {response.status_code}: {response.text}"
+                    )
+                    raise Exception(
+                        f"API request failed with status code {response.status_code}: {response.text}"
+                    )
+
+                result = response.json()
+                stop_reason = result.get("stop_reason", "")
+                content = result.get("content", [{}])[0].get("text", "")
+                logger.info(
+                    f"Received structured JSON response (stop={stop_reason}, first 100 chars): {content[:100]}..."
+                )
+
+                # If stop_reason is "refusal" or "max_tokens", output may not match schema
+                if stop_reason == "max_tokens":
+                    logger.warning("[JSON] Response hit max_tokens — output may be truncated")
+
+                return json.loads(content)
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse structured JSON response: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Error in structured JSON API request: {str(e)}")
             raise
 
     async def _stream_request(self, system_prompt: str, user_prompt: str, max_tokens: int = 4096, model: str = None):

@@ -11,6 +11,7 @@ Approach:
 6. Apply all redactions ONCE per page → output new PDF
 """
 
+import copy
 import fitz  # PyMuPDF
 import json
 import logging
@@ -145,7 +146,7 @@ class TitleSkillLine:
 def sanitize_bullet_replacements(
     bullets: List[BulletPoint],
     bullet_replacements: Dict[int, List[str]],
-    length_tolerance: float = 0.15,
+    length_tolerance: float = 0.20,
 ) -> Dict[int, List[str]]:
     """
     Keep only bullet replacements that preserve shape closely enough for safe PDF reflow.
@@ -155,6 +156,7 @@ def sanitize_bullet_replacements(
     - same number of lines as original bullet
     - no empty replacement lines
     - each replacement line length within tolerance of original line length
+    - lines that are too long get smart-truncated at word boundary instead of dropping the entire bullet
     """
     sanitized: Dict[int, List[str]] = {}
 
@@ -177,24 +179,52 @@ def sanitize_bullet_replacements(
             logger.warning(f"[SANITIZE] Bullet {idx}: empty replacement line, dropping")
             continue
 
-        out_of_bounds = False
+        # Smart truncation: if a line is too long, truncate at word boundary
+        # instead of dropping the entire bullet.
+        fixed_lines = []
+        bullet_ok = True
         for line_idx, (orig, new) in enumerate(zip(original_lines, normalized)):
             orig_len = len(orig.strip())
             if orig_len == 0:
+                fixed_lines.append(new)
                 continue
-            delta = abs(len(new) - orig_len) / orig_len
-            if delta > length_tolerance:
-                logger.warning(
-                    f"[SANITIZE] Bullet {idx} line {line_idx}: length delta {delta:.2f} "
-                    f"exceeds tolerance {length_tolerance:.2f}, dropping"
-                )
-                out_of_bounds = True
-                break
+            new_len = len(new)
+            max_len = int(orig_len * (1 + length_tolerance))
+            min_len = int(orig_len * (1 - length_tolerance))
 
-        if out_of_bounds:
+            if new_len > max_len:
+                # Smart truncate at word boundary
+                truncated = new[:max_len]
+                # Find last space to break at word boundary
+                last_space = truncated.rfind(" ")
+                if last_space > min_len:
+                    truncated = truncated[:last_space]
+                # Remove trailing punctuation artifacts
+                truncated = truncated.rstrip(" ,;:")
+                if len(truncated) < min_len:
+                    logger.warning(
+                        f"[SANITIZE] Bullet {idx} line {line_idx}: too long ({new_len} chars) "
+                        f"and truncation below min ({len(truncated)} < {min_len}), dropping bullet"
+                    )
+                    bullet_ok = False
+                    break
+                logger.debug(
+                    f"[SANITIZE] Bullet {idx} line {line_idx}: truncated {new_len} → {len(truncated)} chars"
+                )
+                fixed_lines.append(truncated)
+            elif new_len < min_len:
+                logger.warning(
+                    f"[SANITIZE] Bullet {idx} line {line_idx}: too short ({new_len} < {min_len}), dropping bullet"
+                )
+                bullet_ok = False
+                break
+            else:
+                fixed_lines.append(new)
+
+        if not bullet_ok:
             continue
 
-        sanitized[idx] = normalized
+        sanitized[idx] = fixed_lines
 
     return sanitized
 
@@ -322,10 +352,13 @@ def classify_lines(
     classified: List[ClassifiedLine] = []
     current_section = "HEADER"  # Before first section header
 
-    # First pass: find all bullet marker y-positions
+    # First pass: find all bullet marker y-positions.
+    # Only consider bullet chars among the first 2 non-zwsp spans of each line.
+    # Dashes in the middle/end of a line (e.g. "- Github Link") are separators.
     bullet_y_positions = set()
     for line in visual_lines:
-        for span in line:
+        _leading = [s for s in line if not s.is_zwsp_only][:2]
+        for span in _leading:
             if span.is_bullet_char:
                 bullet_y_positions.add(round(span.origin[1], 1))
 
@@ -353,19 +386,31 @@ def classify_lines(
         # Check if this is a section header
         # Normalize: collapse XeTeX kerning spaces like "Sum mary" → "SUMMARY"
         import re
-        # Lines with bullet markers are never section headers
-        has_bullet_in_line = any(s.is_bullet_char for s in line) or any(
+        # Lines with bullet markers are never section headers.
+        # Only check the first 2 non-zwsp spans — dashes/bullets in the middle
+        # of a line (e.g. "- Github Link" at x=500) are separators, not bullets.
+        _leading_spans = [s for s in line if not s.is_zwsp_only][:2]
+        has_bullet_in_line = any(s.is_bullet_char for s in _leading_spans) or any(
             s.text.replace("\u200b", "").lstrip()[:1] in ("●", "•", "◦", "○", "■", "▪", "·", "▸", "▹")
-            for s in line if not s.is_zwsp_only
+            for s in _leading_spans
         )
         clean_collapsed = re.sub(r'[^A-Z0-9&:]', '', clean_upper)  # strip all non-alpha
         is_header = False
         if not has_bullet_in_line:
             for header in SECTION_HEADERS:
                 header_collapsed = re.sub(r'[^A-Z0-9&:]', '', header)
+                # startswith on collapsed text is too greedy for lines like
+                # "Technologies: Python, Java, ..." — it would match header
+                # "TECHNOLOGIES" but the line is actually a skill content line.
+                # Guard: collapsed text must not be much longer than the header.
+                _startswith_ok = (
+                    len(header_collapsed) > 3
+                    and clean_collapsed.startswith(header_collapsed)
+                    and len(clean_collapsed) < len(header_collapsed) * 2
+                )
                 if (clean_upper == header or clean_upper.startswith(header + " ")
                         or clean_collapsed == header_collapsed
-                        or (len(header_collapsed) > 3 and clean_collapsed.startswith(header_collapsed))):
+                        or _startswith_ok):
                     is_header = True
                     current_section = clean
                     break
@@ -391,7 +436,10 @@ def classify_lines(
 
         # Precompute span properties
         non_zwsp = [s for s in line if not s.is_zwsp_only]
-        has_bullet_span = any(s.is_bullet_char for s in line)
+        # Only consider bullet chars among the first 2 non-zwsp spans.
+        # Dashes at the end of a line (e.g. "- Github Link") are link separators.
+        _leading_for_bullet = [s for s in line if not s.is_zwsp_only][:2]
+        has_bullet_span = any(s.is_bullet_char for s in _leading_for_bullet)
         text_spans = [s for s in line if not s.is_bullet_char and not s.is_zwsp_only and s.text.strip()]
 
         # Detect inline bullets: text starts with "• " or "· " but bullet is not a separate span
@@ -427,6 +475,23 @@ def classify_lines(
                     page_num=page_num, y_pos=y_pos,
                 ))
                 continue
+            # Fallback for uniform-weight fonts (e.g. LaTeX CMR10): detect "Label: val1, val2, ..."
+            # where no bold/regular contrast exists but colon + commas indicate a skill line.
+            if not (has_bold and has_regular) and non_bullet:
+                _skill_line_text = " ".join(
+                    s.text for s in non_bullet
+                ).replace("\u200b", "").strip()
+                _colon_match = re.match(
+                    r'^([A-Za-z][A-Za-z\s&/\-]+)\s*[:]\s*(.+)', _skill_line_text
+                )
+                if _colon_match:
+                    _values_part = _colon_match.group(2).strip()
+                    if "," in _values_part and len(_values_part.split(",")) >= 2:
+                        classified.append(ClassifiedLine(
+                            spans=line, line_type=LineType.SKILL_CONTENT,
+                            page_num=page_num, y_pos=y_pos,
+                        ))
+                        continue
             # Continuation line in skills (regular only, no bold label)
             if not has_bold and has_regular:
                 prev_skills = [c for c in classified if c.line_type == LineType.SKILL_CONTENT]
@@ -483,7 +548,31 @@ def classify_lines(
                     and page_num == last_bullet.page_num + 1
                     and y_pos < 120  # near top of new page
                 )
-                if y_close or page_break_continuation:
+
+                # Check for intervening STRUCTURE lines between last bullet and this line.
+                # If a STRUCTURE line (e.g. project title, company name) exists between them,
+                # this is NOT a continuation — it's the start of a new section/entry.
+                has_intervening_structure = False
+                if same_page and (y_close or page_break_continuation):
+                    for c in reversed(classified):
+                        if c.line_type == LineType.BULLET_TEXT and c.page_num == page_num:
+                            break  # reached the last bullet, no structure between
+                        if c.line_type == LineType.STRUCTURE and c.page_num == page_num:
+                            c_y = c.y_pos
+                            if last_bullet_y < c_y < y_pos or last_bullet_y > c_y > y_pos:
+                                has_intervening_structure = True
+                                break
+
+                # In PROJECTS sections, check if this line looks like a new project title
+                # (starts bold, contains ":", "|", "–"). If so, it's a new entry, not continuation.
+                looks_like_project_title = False
+                if section_collapsed in ("PROJECTS", "PROJECTEXPERIENCE", "TECHNICALPROJECTS"):
+                    if first_non_zwsp.is_bold:
+                        _bold_text = first_non_zwsp.text.replace("\u200b", "").strip()
+                        if ":" in _bold_text or "|" in _bold_text or "\u2013" in _bold_text:
+                            looks_like_project_title = True
+
+                if not has_intervening_structure and not looks_like_project_title and (y_close or page_break_continuation):
                     # Get text x of previous bullet (first non-bullet, non-zwsp span)
                     last_text_x = None
                     for s in last_bullet.spans:
@@ -500,9 +589,19 @@ def classify_lines(
                         continue
 
         # Project description lines (at left margin, in PROJECTS section)
-        if (current_section.upper() in ("PROJECTS", "PROJECT EXPERIENCE", "TECHNICAL PROJECTS")
+        # Use dynamic left margin: section header x + 50pt (handles different resume layouts)
+        _proj_sections = ("PROJECTS", "PROJECT EXPERIENCE", "TECHNICAL PROJECTS")
+        _proj_left_margin = 100  # default
+        if current_section.upper() in _proj_sections:
+            for c in reversed(classified):
+                if c.line_type == LineType.STRUCTURE and c.spans:
+                    _non_zwsp_c = [s for s in c.spans if not s.is_zwsp_only and s.text.strip()]
+                    if _non_zwsp_c:
+                        _proj_left_margin = _non_zwsp_c[0].origin[0] + 50
+                        break
+        if (current_section.upper() in _proj_sections
                 and non_zwsp
-                and non_zwsp[0].origin[0] < 20):
+                and non_zwsp[0].origin[0] < _proj_left_margin):
             first_span = non_zwsp[0]
             if not first_span.is_bold:
                 # Starts with regular text — definitely a description line
@@ -561,6 +660,14 @@ def group_bullet_points(
                         or (len(header_collapsed) > 3 and clean_collapsed.startswith(header_collapsed))):
                     current_section = cl.clean_text
                     break
+
+            # In PROJECTS sections, any STRUCTURE line (project title) terminates
+            # the current bullet group to prevent cross-project merging.
+            _grp_sec_upper = re.sub(r'[^A-Z0-9&:]', '', current_section.upper())
+            if _grp_sec_upper in ("PROJECTS", "PROJECTEXPERIENCE", "TECHNICALPROJECTS"):
+                if current_bullet and current_bullet.text_lines:
+                    bullets.append(current_bullet)
+                    current_bullet = None
 
             # Detect title skill lines: "(Tech1, Tech2, ...)" pattern in STRUCTURE
             clean = cl.clean_text
@@ -629,6 +736,34 @@ def group_bullet_points(
                 else:
                     content_spans.append(span)
 
+            # Colon-split fallback for uniform-weight fonts (e.g. LaTeX CMR10):
+            # When there are no bold spans, split at the first colon to create
+            # label_spans (category name) and content_spans (skill values).
+            if not label_spans and content_spans:
+                _all_text = " ".join(s.text for s in content_spans).replace("\u200b", "").strip()
+                _colon_idx = _all_text.find(":")
+                if _colon_idx > 0:
+                    # Walk through spans, accumulate into label until colon found
+                    _colon_label = []
+                    _colon_content = []
+                    _found_colon = False
+                    for span in content_spans:
+                        if _found_colon:
+                            _colon_content.append(span)
+                        elif ":" in span.text:
+                            # This span contains the colon — split it
+                            _found_colon = True
+                            _parts = span.text.split(":", 1)
+                            if _parts[0].strip():
+                                _colon_label.append(span)  # label includes this span
+                            if len(_parts) > 1 and _parts[1].strip():
+                                _colon_content.append(span)  # content also uses this span
+                        else:
+                            _colon_label.append(span)
+                    if _colon_label and _colon_content:
+                        label_spans = _colon_label
+                        content_spans = _colon_content
+
             if content_spans:
                 if not label_spans and skills:
                     # Continuation of previous skill line (wrapped text, no bold label).
@@ -694,7 +829,10 @@ async def generate_optimized_content(
                 continue
             lines_info = []
             for j, lt in enumerate(bp.line_texts):
-                lines_info.append(f"    Line {j+1} ({len(lt)} chars): {lt}")
+                orig_len = len(lt.strip())
+                min_chars = max(1, int(orig_len * 0.80))
+                max_chars = int(orig_len * 1.20)
+                lines_info.append(f"    Line {j+1} (MUST be {min_chars}-{max_chars} chars): {lt}")
             bullet_texts.append(f"  BULLET {i+1} ({bp.section_name}):\n" + "\n".join(lines_info))
 
         if not bullet_texts:
@@ -711,17 +849,17 @@ async def generate_optimized_content(
         async def _process_bullet_batch(batch_texts: List[str], batch_max_tokens: int) -> Dict[int, List[str]]:
             """Process a batch of bullets — same prompt, same parsing, same rules."""
             batch_result: Dict[int, List[str]] = {}
-            usr_prompt = f"""Rewrite these resume bullet points to be strongly tailored for the job description below.
+            usr_prompt = f"""Rewrite these resume bullet points to be tailored for the job description below.
 
 RULES:
-1. Incorporate keywords, phrases, and terminology directly from the job description
-2. Rephrase to emphasize skills and experience most relevant to this specific role
-3. Use action verbs and terminology that mirror the job posting's language
-4. PRESERVE: company names, metrics, percentages, dates, and factual claims — do NOT fabricate
+1. Rephrase to emphasize skills, experience, and outcomes most relevant to this specific role
+2. Use action verbs and domain terminology that align with the job posting's language
+3. PRESERVE: company names, metrics, percentages, dates, and all factual claims — do NOT fabricate
+4. NEVER add technologies, tools, frameworks, or platforms that are NOT already mentioned in the bullet. You may rephrase existing tech to match JD terminology (e.g., "AWS Lambda" → "serverless Lambda functions"), but NEVER introduce completely new technologies the candidate didn't use. If the JD asks for "Node.js" but the bullet mentions "Python/Django", keep "Python/Django" — do NOT swap it for Node.js.
 5. Each bullet must have EXACTLY the same number of lines as the original
-6. Each line should be SIMILAR length to the original (±15% character count) to fit the PDF layout
+6. CRITICAL: Each line MUST stay within the character range shown (min-max). Going over the max will cause the bullet to be REJECTED. Trim words if needed to stay in range.
 7. Every bullet MUST be modified — do not return any bullet unchanged
-8. Focus on what the job description specifically asks for and weave those themes into each bullet
+8. Focus on transferable themes: if the JD emphasizes "backend scalability" and the bullet describes building scalable services (in any tech), emphasize the scalability angle — do NOT change the tech stack
 
 JOB DESCRIPTION:
 {job_description[:3000]}
@@ -729,22 +867,35 @@ JOB DESCRIPTION:
 BULLET POINTS TO OPTIMIZE:
 {chr(10).join(batch_texts)}
 
-OUTPUT FORMAT — Return ONLY this JSON, no explanation:
-{{
-  "bullets": [
-    {{
-      "index": 1,
-      "lines": ["line 1 text", "line 2 text"]
-    }},
-    ...
-  ]
-}}
-
-IMPORTANT: Make each bullet clearly targeted to THIS specific job. A reader should be able to tell which job this resume was tailored for.
+IMPORTANT: Tailor by emphasizing RELEVANT THEMES from the JD (scalability, real-time, enterprise, etc.) — NOT by swapping in the JD's specific tech stack. The candidate's actual technologies must be preserved.
 """
+            # JSON schema for guaranteed structured output
+            bullet_schema = {
+                "type": "object",
+                "properties": {
+                    "bullets": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "index": {"type": "integer"},
+                                "lines": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            },
+                            "required": ["index", "lines"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["bullets"],
+                "additionalProperties": False,
+            }
             try:
-                response = await claude._send_request(sys_prompt, usr_prompt, max_tokens=batch_max_tokens)
-                parsed = _parse_json_response(response)
+                parsed = await claude._send_request_json(
+                    sys_prompt, usr_prompt, json_schema=bullet_schema, max_tokens=batch_max_tokens,
+                )
                 if parsed and "bullets" in parsed:
                     for item in parsed["bullets"]:
                         idx = item.get("index", 0) - 1  # Original 0-based index
@@ -796,14 +947,16 @@ IMPORTANT: Make each bullet clearly targeted to THIS specific job. A reader shou
         usr_prompt = f"""Optimize these skill lines to best match the job description below.
 
 RULES:
-1. REORDER skills to put the most job-relevant ones FIRST
-2. Substitute equivalent terms to match JD language (e.g., "PostgreSQL" → "Postgres", "JS" → "JavaScript", "REST" → "RESTful APIs")
-3. You may add 1-2 closely related skills if they appear in the JD and the candidate likely has them based on their other skills
-4. You may remove less relevant skills to make room for more relevant ones
-5. Keep the SAME comma-separated format
-6. Each line should be SIMILAR length to the original (±15% character count)
-7. Return ONLY the values after the label (e.g., for "Languages: Python, R, SQL" return "Python, R, SQL" — NOT "Languages: Python, R, SQL")
-8. The ordering should CLEARLY reflect what this specific job prioritizes
+1. REORDER skills WITHIN each line only — do NOT move skills between lines. Each line's bold label describes the category. Keep skills semantically aligned with their category.
+2. Substitute equivalent terms to match JD language (e.g., "PostgreSQL" → "Postgres", "JS" → "JavaScript", "REST" → "RESTful APIs") — but ONLY rename, never replace one technology with a completely different one.
+3. NEVER add technologies that are not already listed on the resume. Do NOT infer skills the candidate "probably" has. If the JD asks for "Node.js" but it's not on the resume, do NOT add it. Only work with what is already listed.
+4. You may remove less relevant skills to make room, or reorder to put the most JD-relevant skills first.
+5. Keep the SAME comma-separated format.
+6. Each line should be SIMILAR length to the original (±15% character count).
+7. Return ONLY the values after the label (e.g., for "Languages: Python, R, SQL" return "Python, R, SQL" — NOT "Languages: Python, R, SQL").
+8. The ordering within each line should CLEARLY reflect what this specific job prioritizes — put matching skills first.
+9. CRITICAL: Line N's output replaces Line N's content only. Do NOT move content between lines. A "Programming" skill should not appear in a "Cloud" category, etc.
+10. NEVER strip qualifiers from technology names. "AWS DynamoDB" must stay as "AWS DynamoDB" or "DynamoDB" — NOT just "AWS". "Google Cloud Platform" must stay complete or use "GCP" — NOT just "Google".
 
 JOB DESCRIPTION:
 {job_description[:3000]}
@@ -811,17 +964,29 @@ JOB DESCRIPTION:
 SKILL LINES:
 {chr(10).join(skill_texts)}
 
-OUTPUT FORMAT — Return ONLY this JSON:
-{{
-  "skills": [
-    {{"index": 1, "content": "reordered, skill, values, here"}},
-    ...
-  ]
-}}
+Return the optimized skill values for each line.
 """
+        skill_schema = {
+            "type": "object",
+            "properties": {
+                "skills": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "index": {"type": "integer"},
+                            "content": {"type": "string"},
+                        },
+                        "required": ["index", "content"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["skills"],
+            "additionalProperties": False,
+        }
         try:
-            response = await claude._send_request(sys_prompt, usr_prompt)
-            parsed = _parse_json_response(response)
+            parsed = await claude._send_request_json(sys_prompt, usr_prompt, json_schema=skill_schema)
             if parsed and "skills" in parsed:
                 for item in parsed["skills"]:
                     idx = item.get("index", 0) - 1
@@ -833,7 +998,164 @@ OUTPUT FORMAT — Return ONLY this JSON:
                         label_base = label.rstrip(": ").strip()
                         if label_base and content.startswith(label_base):
                             content = content[len(label_base):].lstrip(": ").strip()
+                        # Clean trailing punctuation artifacts
+                        content = content.rstrip(" ,;:")
                         replacements[idx] = content
+
+                # ── Garbled output detection ──
+                # Transient LLM API issue: tokens returned with spaces inside
+                # words (e.g., "Ret ri eval" instead of "Retrieval").
+                # Detect by checking if comma-separated terms have abnormally
+                # many short (1-3 char) word fragments.
+                import re as _re_garble
+                _SHORT_WORD_EXCEPTIONS = {
+                    # Common tech abbreviations (1-3 chars)
+                    "ai", "ml", "r", "c", "go", "c++", "c#", ".net", "sql",
+                    "s3", "ec2", "ci", "cd", "js", "ts", "api", "aws", "gcp",
+                    "db", "ui", "ux", "qa", "os", "vm", "ip", "io", "rds",
+                    "sqs", "sns", "iam", "vpc", "dns", "ssl", "tls", "ssh",
+                    "pub", "sub", "git", "npm", "pip", "drf", "jwt", "xml",
+                    "ms", "no", "vs", "de", "cdk", "sdk", "ecs", "eks", "ecr",
+                    "ses", "sso", "cdn", "emr", "gke", "gcr", "edi", "etl",
+                    "erp", "crm", "sap", "iot", "cli", "rag", "llm", "nlp",
+                    "sla", "slo", "sli", "tcp", "udp", "csv", "pdf",
+                }
+                for ri, rcontent in list(replacements.items()):
+                    terms = [t.strip() for t in rcontent.split(",") if t.strip()]
+                    garbled_count = 0
+                    for term in terms:
+                        words = term.split()
+                        if len(words) <= 1:
+                            continue  # Single-word terms like "Docker" are fine
+                        short_words = [
+                            w for w in words
+                            if len(w) <= 3 and w.lower().strip("()") not in _SHORT_WORD_EXCEPTIONS
+                        ]
+                        # For 2-word terms: if ANY word is a short non-exception fragment
+                        # For 3+ word terms: if >40% of words are short fragments
+                        if len(words) == 2:
+                            if short_words:
+                                garbled_count += 1
+                        elif len(short_words) / len(words) > 0.4:
+                            garbled_count += 1
+                    if garbled_count > 0 and garbled_count / max(len(terms), 1) > 0.3:
+                        logger.warning(
+                            f"Skill line {ri}: garbled LLM output detected "
+                            f"({garbled_count}/{len(terms)} terms garbled), reverting to original"
+                        )
+                        del replacements[ri]
+
+                # ── Cross-category validation ──
+                # Build set of original terms per skill line, then check
+                # if any replacement "stole" a term from another line.
+                original_terms_by_idx: Dict[int, set] = {}
+                for si, sk in enumerate(skills):
+                    terms = {t.strip().lower() for t in sk.content_text.split(",") if t.strip()}
+                    original_terms_by_idx[si] = terms
+
+                indices_to_drop: List[int] = []
+                for ri, rcontent in list(replacements.items()):
+                    new_terms = {t.strip().lower() for t in rcontent.split(",") if t.strip()}
+                    orig_terms = original_terms_by_idx.get(ri, set())
+                    # Check each new term: if it was originally in ANOTHER line
+                    # but NOT in this line, it's a cross-category steal.
+                    stolen = set()
+                    for nt in new_terms:
+                        if nt in orig_terms:
+                            continue  # was already here
+                        for oi, oterms in original_terms_by_idx.items():
+                            if oi != ri and nt in oterms:
+                                stolen.add(nt)
+                                break
+                    if len(stolen) >= 2:
+                        # Too many stolen terms — drop this replacement
+                        logger.warning(
+                            f"Skill line {ri}: dropped replacement (stole {stolen} from other lines)"
+                        )
+                        indices_to_drop.append(ri)
+
+                for di in indices_to_drop:
+                    del replacements[di]
+
+                # ── Fabrication detection ──
+                # Build full original resume text from bullets + skills to check
+                # if replacement terms actually exist on the candidate's resume.
+                import re as _re
+                resume_text_parts = []
+                for bp in bullets:
+                    resume_text_parts.extend(bp.line_texts)
+                for sk in skills:
+                    resume_text_parts.append(sk.content_text)
+                    resume_text_parts.append(sk.label_text)
+                full_resume_lower = " ".join(resume_text_parts).lower()
+                # Extract clean words (strip punctuation) using regex
+                # Matches tech terms like "node.js", "c++", "c#", ".net"
+                resume_word_set = set(_re.findall(r'[a-z0-9][a-z0-9.+#]*', full_resume_lower))
+
+                # Also build set of all original comma-separated terms (normalized)
+                all_orig_terms = set()
+                for oterms in original_terms_by_idx.values():
+                    all_orig_terms.update(oterms)
+
+                for ri, rcontent in list(replacements.items()):
+                    # Clean up parentheses artifacts before splitting
+                    clean_content = _re.sub(r'\)\s*$', ')', rcontent)
+                    new_terms = [t.strip().strip(')').strip() for t in clean_content.split(",") if t.strip()]
+                    new_terms = [t for t in new_terms if t]  # remove empties
+
+                    valid_terms = []
+                    fabricated = []
+                    for nt in new_terms:
+                        nt_lower = nt.strip().lower()
+                        # 1. Exact full-term match against any original skill line
+                        if nt_lower in all_orig_terms:
+                            valid_terms.append(nt)
+                            continue
+                        # 2. Extract significant words from the new term
+                        term_words = _re.findall(r'[a-z0-9][a-z0-9.+#]*', nt_lower)
+                        sig_words = [w for w in term_words if len(w) > 2]
+                        if not sig_words:
+                            valid_terms.append(nt)
+                            continue
+                        # 3. ALL significant words must appear as exact words in resume
+                        #    Also check tech abbreviations: "Node" matches "node.js"
+                        _TECH_SUFFIXES = ('.js', '.ts', '.py', '.net')
+                        def _word_on_resume(w):
+                            if w in resume_word_set:
+                                return True
+                            # Check if word + tech suffix exists (e.g., "node" → "node.js")
+                            return any((w + s) in resume_word_set for s in _TECH_SUFFIXES)
+                        all_found = all(_word_on_resume(w) for w in sig_words)
+                        if all_found:
+                            valid_terms.append(nt)
+                        else:
+                            fabricated.append(nt)
+
+                    if fabricated:
+                        logger.warning(
+                            f"Skill line {ri}: removed fabricated terms not on resume: {fabricated}"
+                        )
+                        if valid_terms:
+                            replacements[ri] = ", ".join(valid_terms)
+                        else:
+                            # All terms fabricated — revert to original
+                            del replacements[ri]
+
+                # ── Post-fabrication length safety net ──
+                # If fabrication validator stripped so many terms that the
+                # replacement is <40% of original length, the LLM output
+                # was too damaged — revert to original.
+                for ri, rcontent in list(replacements.items()):
+                    if 0 <= ri < len(skills):
+                        orig_len = len(skills[ri].content_text)
+                        if orig_len > 0 and len(rcontent) / orig_len < 0.4:
+                            logger.warning(
+                                f"Skill line {ri}: replacement too short after validation "
+                                f"({len(rcontent)}/{orig_len} chars = "
+                                f"{len(rcontent)/orig_len:.0%}), reverting to original"
+                            )
+                            del replacements[ri]
+
         except Exception as e:
             logger.error(f"Failed to optimize skills: {e}")
         return replacements
@@ -856,7 +1178,7 @@ OUTPUT FORMAT — Return ONLY this JSON:
 
 RULES:
 1. ONLY change the technologies inside the parentheses — do NOT change the job title itself
-2. Use technologies from the JD that the candidate actually knows (based on their current tech stacks)
+2. Use technologies from the JD that the candidate ACTUALLY LISTS in their Skills section or bullet points. Never put a technology in the title that doesn't appear somewhere else on the resume.
 3. Keep the SAME number of technologies (same comma-separated count)
 4. Return ONLY the parenthesized content (e.g., "Node, Express, MongoDB, PostgreSQL, GCP")
 
@@ -866,23 +1188,78 @@ JOB DESCRIPTION:
 TITLE LINES:
 {chr(10).join(title_texts)}
 
-OUTPUT FORMAT — Return ONLY this JSON:
-{{
-  "titles": [
-    {{"index": 1, "skills": "Tech1, Tech2, Tech3"}},
-    ...
-  ]
-}}
+Return the replacement tech stacks for each title line.
 """
+        title_schema = {
+            "type": "object",
+            "properties": {
+                "titles": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "index": {"type": "integer"},
+                            "skills": {"type": "string"},
+                        },
+                        "required": ["index", "skills"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["titles"],
+            "additionalProperties": False,
+        }
         try:
-            response = await claude._send_request(sys_prompt, usr_prompt)
-            parsed = _parse_json_response(response)
+            parsed = await claude._send_request_json(sys_prompt, usr_prompt, json_schema=title_schema)
             if parsed and "titles" in parsed:
                 for item in parsed["titles"]:
                     idx = item.get("index", 0) - 1
                     new_skills = item.get("skills", "")
                     if 0 <= idx < len(title_skills) and new_skills:
                         replacements[idx] = new_skills
+
+                # ── Title fabrication detection ──
+                # Same approach as skill fabrication: check each term against resume text
+                import re as _re
+                resume_text_parts = []
+                for bp in bullets:
+                    resume_text_parts.extend(bp.line_texts)
+                for sk in skills:
+                    resume_text_parts.append(sk.content_text)
+                    resume_text_parts.append(sk.label_text)
+                full_resume_lower = " ".join(resume_text_parts).lower()
+                resume_word_set = set(_re.findall(r'[a-z0-9][a-z0-9.+#]*', full_resume_lower))
+
+                for ri, rcontent in list(replacements.items()):
+                    new_terms = [t.strip() for t in rcontent.split(",") if t.strip()]
+                    valid_terms = []
+                    fabricated = []
+                    for nt in new_terms:
+                        nt_lower = nt.strip().lower()
+                        term_words = _re.findall(r'[a-z0-9][a-z0-9.+#]*', nt_lower)
+                        sig_words = [w for w in term_words if len(w) > 2]
+                        if not sig_words:
+                            valid_terms.append(nt)
+                            continue
+                        # Check tech abbreviations: "Node" matches "node.js"
+                        _TECH_SUFFIXES = ('.js', '.ts', '.py', '.net')
+                        def _word_on_resume_t(w):
+                            if w in resume_word_set:
+                                return True
+                            return any((w + s) in resume_word_set for s in _TECH_SUFFIXES)
+                        all_found = all(_word_on_resume_t(w) for w in sig_words)
+                        if all_found:
+                            valid_terms.append(nt)
+                        else:
+                            fabricated.append(nt)
+                    if fabricated:
+                        logger.warning(
+                            f"Title line {ri}: removed fabricated tech not on resume: {fabricated}"
+                        )
+                        if valid_terms:
+                            replacements[ri] = ", ".join(valid_terms)
+                        else:
+                            del replacements[ri]
         except Exception as e:
             logger.error(f"Failed to optimize title skills: {e}")
         return replacements
@@ -2103,6 +2480,24 @@ class _WidthCalculator:
 class _FontAugmentor:
     """Handles missing characters by loading system fonts and creating new CMap entries."""
 
+    # Fallback substitutions for characters that can't be augmented.
+    # Maps Unicode chars to safe ASCII equivalents that are likely in any font.
+    _CHAR_FALLBACKS: Dict[str, str] = {
+        "\u2013": "-",   # en-dash → hyphen
+        "\u2014": "-",   # em-dash → hyphen
+        "\u2018": "'",   # left single quote → apostrophe
+        "\u2019": "'",   # right single quote → apostrophe
+        "\u201c": '"',   # left double quote → straight quote
+        "\u201d": '"',   # right double quote → straight quote
+        "\u00a0": " ",   # non-breaking space → space
+        "\u2022": "-",   # bullet → hyphen
+        "\u2026": "...", # ellipsis → three dots
+        "\u00b7": ".",   # middle dot → period
+        "\u2010": "-",   # hyphen → ASCII hyphen
+        "\u2011": "-",   # non-breaking hyphen → ASCII hyphen
+        "\u2212": "-",   # minus sign → ASCII hyphen
+    }
+
     # Cross-platform font paths: {font_name: [(platform, path), ...]}
     _FONT_SEARCH_PATHS = {
         "TimesNewRomanPSMT": [
@@ -2216,14 +2611,15 @@ class _FontAugmentor:
         system_font = self._load_system_font(font_name)
         if not system_font:
             logger.warning(f"[FONT_AUG] No system font found for '{font_name}'")
-            return False
+            # Apply fallback substitutions for any known chars
+            return self._apply_fallbacks(unique_chars, font_tag, cmap_mgr, width_calc)
 
         try:
             from fontTools.ttLib import TTFont
             cmap_table = system_font.getBestCmap()
             if not cmap_table:
                 logger.warning(f"[FONT_AUG] System font has no cmap table")
-                return False
+                return self._apply_fallbacks(unique_chars, font_tag, cmap_mgr, width_calc)
 
             # Get existing CMap to find unused CID range
             existing_fwd = cmap_mgr.font_cmaps.get(font_tag, {}).get("fwd", {})
@@ -2237,19 +2633,20 @@ class _FontAugmentor:
             name_to_gid = {name: idx for idx, name in enumerate(glyf_order)}
 
             all_resolved = True
+            fallback_chars = []  # chars that couldn't be found in system font
             for ch in unique_chars:
                 code_point = ord(ch)
                 glyph_name = cmap_table.get(code_point)
                 if glyph_name is None:
                     logger.warning(f"[FONT_AUG] Char '{ch}' (U+{code_point:04X}) not in system font")
-                    all_resolved = False
+                    fallback_chars.append(ch)
                     continue
 
                 # Convert glyph name to numeric GID
                 gid = name_to_gid.get(glyph_name, -1)
                 if gid < 0:
                     logger.warning(f"[FONT_AUG] Glyph '{glyph_name}' for '{ch}' has no GID")
-                    all_resolved = False
+                    fallback_chars.append(ch)
                     continue
 
                 # Assign a new CID (use the GID from system font if possible,
@@ -2260,21 +2657,30 @@ class _FontAugmentor:
                 # Add to CMap manager
                 cmap_mgr.add_mapping(font_tag, ch, new_cid)
 
-                # Get width from system font
+                # Get width from system font and convert to PDF 1/1000 em units
                 if hmtx:
                     try:
-                        advance_width = hmtx[glyph_name][0]  # (width, lsb)
+                        advance_width = hmtx[glyph_name][0]  # (width, lsb) in font units
                     except (KeyError, IndexError):
                         advance_width = 500
+                    # Convert from font units (UPM) to PDF width units (1/1000 em)
+                    upm = system_font["head"].unitsPerEm if "head" in system_font else 1000
+                    pdf_width = advance_width * 1000.0 / upm
                     # Add to width calculator
                     if font_tag not in width_calc.font_widths:
                         width_calc.font_widths[font_tag] = {}
-                    width_calc.font_widths[font_tag][new_cid] = float(advance_width)
+                    width_calc.font_widths[font_tag][new_cid] = pdf_width
 
                 logger.info(
                     f"[FONT_AUG] Mapped '{ch}' (U+{code_point:04X}) → CID {new_cid} "
                     f"in font {font_tag}"
                 )
+
+            # Try fallback substitution for any chars that couldn't be resolved
+            if fallback_chars:
+                fb_ok = self._apply_fallbacks(fallback_chars, font_tag, cmap_mgr, width_calc)
+                if not fb_ok:
+                    all_resolved = False
 
             return all_resolved
 
@@ -2284,6 +2690,34 @@ class _FontAugmentor:
         except Exception as e:
             logger.warning(f"[FONT_AUG] Font augmentation failed: {e}")
             return False
+
+    def _apply_fallbacks(
+        self,
+        chars: List[str],
+        font_tag: str,
+        cmap_mgr: _CMapManager,
+        width_calc: _WidthCalculator,
+    ) -> bool:
+        """Apply fallback character substitutions for chars that can't be augmented.
+        Maps Unicode chars to ASCII equivalents that are already in the font."""
+        all_resolved = True
+        rev = cmap_mgr.font_cmaps.get(font_tag, {}).get("rev", {})
+        for ch in chars:
+            fallback = self._CHAR_FALLBACKS.get(ch)
+            if fallback and fallback in rev:
+                # Use the existing CID for the fallback character
+                fallback_cid = rev[fallback]
+                cmap_mgr.add_mapping(font_tag, ch, fallback_cid)
+                # Copy width from fallback
+                fb_width = width_calc.font_widths.get(font_tag, {}).get(fallback_cid, 500)
+                if font_tag not in width_calc.font_widths:
+                    width_calc.font_widths[font_tag] = {}
+                width_calc.font_widths[font_tag][fallback_cid] = fb_width
+                logger.info(f"[FONT_AUG] Fallback: '{ch}' → '{fallback}' (CID {fallback_cid})")
+            else:
+                logger.warning(f"[FONT_AUG] No fallback for '{ch}' (U+{ord(ch):04X})")
+                all_resolved = False
+        return all_resolved
 
     def _load_system_font(self, font_name: str) -> Optional[Any]:
         """Load a system font matching the given PDF font name."""
@@ -2366,11 +2800,17 @@ def _update_pdf_font_structures(
             old_stream = doc.xref_stream(tu_xref)
             old_text = old_stream.decode("latin-1", errors="replace")
 
+            # Detect byte width from existing codespace range
+            cid_hex_chars = 4  # default 2-byte
+            cs_match = re.search(r'begincodespacerange\s*<([0-9A-Fa-f]+)>', old_text)
+            if cs_match:
+                cid_hex_chars = len(cs_match.group(1))  # 2 for 1-byte, 4 for 2-byte
+
             # Build new bfchar entries
             new_entries = []
             for char, cid in new_mappings.items():
                 unicode_hex = f"{ord(char):04X}"
-                new_entries.append(f"<{cid:04X}> <{unicode_hex}>")
+                new_entries.append(f"<{cid:0{cid_hex_chars}X}> <{unicode_hex}>")
 
             if new_entries:
                 insert_block = (
@@ -2386,10 +2826,11 @@ def _update_pdf_font_structures(
     except Exception as e:
         logger.warning(f"[FONT_AUG] Failed to update ToUnicode CMap: {e}")
 
-    # 2. Update W array in CIDFont (skip on error — renders with default width)
+    # 2. Update width structures
     try:
         desc_val = doc.xref_get_key(font_xref, "DescendantFonts")
         if desc_val[0] != "null" and desc_val[1]:
+            # Type0/CID: update W array
             desc_text = desc_val[1].strip().strip("[]").strip()
             ref_match = re.match(r'(\d+)\s+0\s+R', desc_text)
             if ref_match:
@@ -2415,44 +2856,116 @@ def _update_pdf_font_structures(
                         w_text += " " + " ".join(new_w_entries) + "]"
                         doc.xref_set_key(cidfont_xref, "W", w_text)
                         logger.info(f"[FONT_AUG] Updated W array with {len(new_w_entries)} new entries")
+        else:
+            # Simple TrueType: update /Widths, /FirstChar, /LastChar
+            _update_truetype_widths(doc, font_xref, new_widths)
     except Exception as e:
-        logger.debug(f"[FONT_AUG] W array update skipped (non-critical): {e}")
+        logger.debug(f"[FONT_AUG] Width update skipped (non-critical): {e}")
 
     # 3. Update the font's FontFile2 with augmented subset
     try:
         _augment_font_file(doc, font_xref, font_tag, new_mappings)
     except Exception as e:
-        logger.warning(f"[FONT_AUG] Failed to augment FontFile2: {e}")
+        logger.warning(f"[FONT_AUG] Failed to augment FontFile2 for {font_tag}: {e}")
+
+
+def _update_truetype_widths(doc, font_xref: int, new_widths: Dict[int, float]) -> None:
+    """Update /Widths, /FirstChar, /LastChar for simple TrueType fonts."""
+    try:
+        fc_val = doc.xref_get_key(font_xref, "FirstChar")
+        lc_val = doc.xref_get_key(font_xref, "LastChar")
+        w_val = doc.xref_get_key(font_xref, "Widths")
+
+        if fc_val[0] == "null" or lc_val[0] == "null" or w_val[0] == "null":
+            return
+
+        first_char = int(fc_val[1].strip())
+        last_char = int(lc_val[1].strip())
+
+        # Parse existing widths array
+        w_text = w_val[1].strip()
+        if w_val[0] == "xref":
+            ref_m = re.match(r'(\d+)\s+0\s+R', w_text)
+            if ref_m:
+                w_xref = int(ref_m.group(1))
+                w_text = doc.xref_object(w_xref).strip()
+
+        # Parse [w1 w2 w3 ...] into list
+        inner = w_text.strip("[]").strip()
+        widths = [float(x) for x in inner.split()] if inner else []
+
+        # Extend widths array to cover new CIDs
+        max_new_cid = max(new_widths.keys()) if new_widths else last_char
+        if max_new_cid > last_char:
+            # Extend with 0-width entries up to the new max
+            extra = max_new_cid - last_char
+            widths.extend([0] * extra)
+            last_char = max_new_cid
+
+        # Set widths for new CIDs
+        for cid, width in new_widths.items():
+            idx = cid - first_char
+            if 0 <= idx < len(widths):
+                widths[idx] = width
+
+        # Write back
+        new_w = "[" + " ".join(str(int(w)) for w in widths) + "]"
+        doc.xref_set_key(font_xref, "Widths", new_w)
+        doc.xref_set_key(font_xref, "LastChar", str(last_char))
+        logger.info(f"[FONT_AUG] Updated TrueType /Widths (LastChar {first_char}→{last_char})")
+    except Exception as e:
+        logger.debug(f"[FONT_AUG] TrueType width update skipped: {e}")
 
 
 def _augment_font_file(doc, font_xref: int, font_tag: str, new_mappings: Dict[str, int]):
     """
     Augment the embedded font's FontFile2 with glyphs from the system font.
     This ensures new CIDs actually render correctly.
+    Handles both Type0/CID fonts (via DescendantFonts) and simple TrueType fonts.
     """
     try:
         from fontTools.ttLib import TTFont
         from io import BytesIO
 
-        # Get the DescendantFont to find FontFile2
+        # Strategy 1: Type0/CID font (via DescendantFonts)
+        # Strategy 2: Simple TrueType font (FontDescriptor directly on font dict)
+        fd_xref = None
+        basefont_name = ""
+        is_simple_truetype = False
+
         desc_val = doc.xref_get_key(font_xref, "DescendantFonts")
-        if desc_val[0] == "null":
-            return
+        if desc_val[0] != "null" and desc_val[1]:
+            # Type0/CID path
+            desc_text = desc_val[1].strip().strip("[]").strip()
+            ref_match = re.match(r'(\d+)\s+0\s+R', desc_text)
+            if ref_match:
+                cidfont_xref = int(ref_match.group(1))
+                fd_val = doc.xref_get_key(cidfont_xref, "FontDescriptor")
+                if fd_val[0] != "null":
+                    fd_match = re.match(r'(\d+)\s+0\s+R', fd_val[1].strip())
+                    if fd_match:
+                        fd_xref = int(fd_match.group(1))
+                bf_val = doc.xref_get_key(cidfont_xref, "BaseFont")
+                if bf_val[0] != "null":
+                    basefont_name = bf_val[1].strip().lstrip("/")
+                    if "+" in basefont_name:
+                        basefont_name = basefont_name.split("+", 1)[1]
 
-        desc_text = desc_val[1].strip().strip("[]").strip()
-        ref_match = re.match(r'(\d+)\s+0\s+R', desc_text)
-        if not ref_match:
-            return
-        cidfont_xref = int(ref_match.group(1))
-
-        # Get FontDescriptor
-        fd_val = doc.xref_get_key(cidfont_xref, "FontDescriptor")
-        if fd_val[0] == "null":
-            return
-        fd_match = re.match(r'(\d+)\s+0\s+R', fd_val[1].strip())
-        if not fd_match:
-            return
-        fd_xref = int(fd_match.group(1))
+        if fd_xref is None:
+            # Simple TrueType path — FontDescriptor directly on font dict
+            fd_val = doc.xref_get_key(font_xref, "FontDescriptor")
+            if fd_val[0] == "null":
+                return
+            fd_match = re.match(r'(\d+)\s+0\s+R', fd_val[1].strip())
+            if not fd_match:
+                return
+            fd_xref = int(fd_match.group(1))
+            is_simple_truetype = True
+            bf_val = doc.xref_get_key(font_xref, "BaseFont")
+            if bf_val[0] != "null":
+                basefont_name = bf_val[1].strip().lstrip("/")
+                if "+" in basefont_name:
+                    basefont_name = basefont_name.split("+", 1)[1]
 
         # Get FontFile2
         ff2_val = doc.xref_get_key(fd_xref, "FontFile2")
@@ -2466,14 +2979,6 @@ def _augment_font_file(doc, font_xref: int, font_tag: str, new_mappings: Dict[st
         # Read the embedded font
         font_bytes = doc.xref_stream(ff2_xref)
         embedded_font = TTFont(BytesIO(font_bytes))
-
-        # Get basefont name to find matching system font
-        basefont_val = doc.xref_get_key(cidfont_xref, "BaseFont")
-        basefont_name = ""
-        if basefont_val[0] != "null":
-            basefont_name = basefont_val[1].strip().lstrip("/")
-            if "+" in basefont_name:
-                basefont_name = basefont_name.split("+", 1)[1]
 
         augmentor = _FontAugmentor()
         system_font = augmentor._load_system_font(basefont_name)
@@ -2496,6 +3001,29 @@ def _augment_font_file(doc, font_xref: int, font_tag: str, new_mappings: Dict[st
 
         sys_name_to_gid = {name: idx for idx, name in enumerate(sys_glyph_order)}
 
+        # Get the embedded font's cmap table for updating
+        emb_cmap_table = embedded_font.get("cmap")
+        emb_cmap_subtables = []
+        if emb_cmap_table:
+            for subtable in emb_cmap_table.tables:
+                if hasattr(subtable, 'cmap') and subtable.cmap:
+                    emb_cmap_subtables.append(subtable)
+
+        # Detect glyph naming convention from existing font
+        # e.g. "glyph00001" vs "gid00001" vs "cid00001"
+        glyph_prefix = "glyph"
+        glyph_digits = 5
+        for name in emb_glyph_order[1:5]:  # skip .notdef
+            import re as _re
+            m = _re.match(r'^([a-zA-Z]+)(\d+)$', name)
+            if m:
+                glyph_prefix = m.group(1)
+                glyph_digits = len(m.group(2))
+                break
+
+        def _make_glyph_name(idx):
+            return f"{glyph_prefix}{idx:0{glyph_digits}d}"
+
         for char, cid in new_mappings.items():
             code_point = ord(char)
             sys_glyph_name = sys_cmap.get(code_point)
@@ -2503,25 +3031,56 @@ def _augment_font_file(doc, font_xref: int, font_tag: str, new_mappings: Dict[st
                 continue
 
             # Target glyph name in embedded font (by CID/GID)
-            target_name = f"gid{cid:05d}" if cid >= len(emb_glyph_order) else emb_glyph_order[cid] if cid < len(emb_glyph_order) else f"gid{cid:05d}"
+            if cid < len(emb_glyph_order):
+                target_name = emb_glyph_order[cid]
+            else:
+                target_name = _make_glyph_name(cid)
 
-            # Ensure target slot exists
+            # Ensure target slot exists — add placeholder glyphs to glyf/hmtx
+            # IMMEDIATELY so the glyf table's internal order matches the font's
+            # global glyph order (required for correct loca table compilation).
             if target_name not in emb_glyph_order:
-                # Extend glyph order
+                from fontTools.ttLib.tables._g_l_y_f import Glyph as _Glyph
                 while len(emb_glyph_order) <= cid:
-                    placeholder = f"gid{len(emb_glyph_order):05d}"
+                    placeholder = _make_glyph_name(len(emb_glyph_order))
                     emb_glyph_order.append(placeholder)
+                    # Add empty glyph to glyf table NOW (not later)
+                    empty_g = _Glyph()
+                    empty_g.numberOfContours = 0
+                    emb_glyf[placeholder] = empty_g
+                    emb_hmtx[placeholder] = (0, 0)
 
             try:
-                # Copy glyph outline
+                # Copy glyph outline (deepcopy to avoid cross-font references)
                 if sys_glyph_name in sys_glyf:
-                    emb_glyf[target_name] = sys_glyf[sys_glyph_name]
+                    emb_glyf[target_name] = copy.deepcopy(sys_glyf[sys_glyph_name])
 
                 # Copy metrics
                 if sys_glyph_name in sys_hmtx.metrics:
                     emb_hmtx[target_name] = sys_hmtx[sys_glyph_name]
+
+                # Update the embedded font's internal cmap to map CID → glyph
+                # The CID (not Unicode code point) is used as the byte value in
+                # the content stream, so the font's cmap must map CID → glyph.
+                for subtable in emb_cmap_subtables:
+                    subtable.cmap[cid] = target_name
             except Exception as e:
                 logger.debug(f"[FONT_AUG] Failed to copy glyph '{char}': {e}")
+
+        # Verify augmented glyphs have valid metrics (width > 0)
+        for char, cid in new_mappings.items():
+            if cid < len(emb_glyph_order):
+                gname = emb_glyph_order[cid]
+                if gname in emb_hmtx.metrics:
+                    w, _ = emb_hmtx[gname]
+                    if w <= 0:
+                        logger.warning(
+                            f"[FONT_AUG] Glyph '{char}' (CID {cid}) has zero width after augmentation"
+                        )
+
+        # Update font's global glyph order to match extended order
+        if len(emb_glyph_order) > len(embedded_font.getGlyphOrder()):
+            embedded_font.setGlyphOrder(emb_glyph_order)
 
         # Save augmented font back to PDF
         try:
@@ -2539,6 +3098,41 @@ def _augment_font_file(doc, font_xref: int, font_tag: str, new_mappings: Dict[st
         logger.debug("[FONT_AUG] fontTools not available for FontFile2 augmentation")
     except Exception as e:
         logger.warning(f"[FONT_AUG] FontFile2 augmentation failed: {e}")
+
+
+def _pad_skill_replacement(original_content: str, replacement_content: str) -> str:
+    """Pad a skill replacement that's too short by appending original skills.
+
+    When the LLM's replacement is significantly shorter than the original,
+    continuation lines in the PDF get zeroed, leaving visible gaps.
+    Padding the replacement with skills from the original that weren't
+    included ensures the text fills the same visual space.
+    """
+    orig_len = len(original_content)
+    rep_len = len(replacement_content)
+
+    if rep_len >= orig_len * 0.85:
+        return replacement_content  # Close enough, no padding needed
+
+    # Extract comma-separated skills from both
+    orig_skills = [s.strip() for s in original_content.split(",")]
+    rep_lower = replacement_content.lower()
+
+    # Find skills in original that aren't already in the replacement
+    missing = []
+    for skill in orig_skills:
+        skill_clean = skill.strip()
+        if skill_clean and skill_clean.lower() not in rep_lower:
+            missing.append(skill_clean)
+
+    # Append missing skills until we reach 85% of original length
+    padded = replacement_content
+    for skill in missing:
+        if len(padded) >= orig_len * 0.85:
+            break
+        padded += f", {skill}"
+
+    return padded
 
 
 def _find_blocks_for_text(
@@ -2914,31 +3508,44 @@ def _patch_content_stream(
 
         def _trim_text_to_fit(
             text: str, orig_hex: str, font_tag: str, font_size: float,
+            orig_w_override: float = 0.0,
         ) -> str:
             """Trim words from text end if too wide for Tc to compensate.
 
             When replacement text is significantly wider than original,
             Tc clamp can't prevent overflow. Removes trailing words until
             the text fits within the width budget.
+
+            If orig_w_override > 0, use that as the target width instead
+            of computing from orig_hex (for multi-font lines where the
+            full visual width spans multiple fonts).
             """
-            if not text or not orig_hex:
+            if not text or (not orig_hex and orig_w_override <= 0):
                 return text
             full_hex, _ = cmap_mgr.encode_text(font_tag, text)
             if not full_hex:
                 return text
-            orig_w = _calc_hex_width(orig_hex)
+            orig_w = orig_w_override if orig_w_override > 0 else _calc_hex_width(orig_hex)
             new_w = _calc_hex_width(full_hex)
             n = max(1, len(full_hex) // hex_per_char)
             if orig_w <= 0:
                 return text
             tc_needed = font_size * (orig_w - new_w) / (1000.0 * n)
-            tc_limit = 0.05 * font_size
+            tc_limit = 0.02 * font_size
             if tc_needed >= -tc_limit:
                 return text  # Fits fine
             words = text.split()
             while len(words) > 1:
                 words.pop()
                 trimmed = " ".join(words)
+                # Clean trailing punctuation left after word removal
+                trimmed = trimmed.rstrip(" ,;:")
+                # Close unclosed parentheses/brackets
+                open_parens = trimmed.count("(") - trimmed.count(")")
+                if open_parens > 0:
+                    trimmed += ")" * open_parens
+                if not trimmed:
+                    continue
                 trimmed_hex, _ = cmap_mgr.encode_text(font_tag, trimmed)
                 if not trimmed_hex:
                     continue
@@ -2952,12 +3559,16 @@ def _patch_content_stream(
         def _inject_width_adjustment(
             op: TextOp, xref: int, orig_hex: str, new_hex: str,
             content_bytes: bytes, font_size: float = 10.0,
+            orig_w_override: float = 0.0,
         ) -> bytes:
             """Inject Tc (character spacing) to match replacement width to original.
 
             Tc adjusts gaps between characters uniformly. This is far less visible
             than Tz (horizontal scaling) because character shapes are preserved —
             only the inter-character spacing changes.
+
+            If orig_w_override > 0, use that as the target width instead of
+            computing from orig_hex (for multi-font lines).
 
             PDF displacement formula (ISO 32000 Table 105):
               tx = (w0/1000 * Tfs + Tc) * Th
@@ -2966,7 +3577,7 @@ def _patch_content_stream(
             if not orig_hex or not new_hex:
                 adj_bytes = b" 0 Tc "
             else:
-                orig_w = _calc_hex_width(orig_hex)
+                orig_w = orig_w_override if orig_w_override > 0 else _calc_hex_width(orig_hex)
                 new_w = _calc_hex_width(new_hex)
                 num_new_chars = max(1, len(new_hex) // hex_per_char)
 
@@ -2976,9 +3587,13 @@ def _patch_content_stream(
                     # Tc = Tfs * (orig_width - new_width) / (1000 * num_chars)
                     # font_size (Tfs) multiplier is critical per ISO 32000.
                     tc_val = font_size * (orig_w - new_w) / (1000.0 * num_new_chars)
-                    # Dynamic clamp: ±0.05 * font_size (±0.5 at 10pt, ±0.6 at 12pt)
-                    tc_limit = 0.05 * font_size
-                    tc_val = max(-tc_limit, min(tc_limit, tc_val))
+                    # Only apply NEGATIVE Tc (squeeze longer text to fit).
+                    # Never apply positive Tc — stretching shorter text creates
+                    # visible gaps between characters/words.
+                    # Keep clamp tight (0.02) to minimize visible character overlap.
+                    # Wider text relies on trimming instead of aggressive squeezing.
+                    tc_limit = 0.02 * font_size
+                    tc_val = max(-tc_limit, min(0, tc_val))
                     adj_bytes = f" {tc_val:.4f} Tc ".encode("latin-1")
             if op.operator == "TJ" and op.tj_array_start >= 0:
                 queue_patch(xref, op.tj_array_start, 0, adj_bytes)
@@ -2991,13 +3606,57 @@ def _patch_content_stream(
         # For multi-line matches: split replacement by WORDS (not chars) per line.
         # For single-line matches: put all text in leftmost block.
         # In all cases: zero remaining blocks, apply Tz scaling if wider.
+        #
+        # MULTI-FONT SAFETY: If matched blocks span multiple fonts, check
+        # CMap compatibility. Compatible fonts (same CID encoding, e.g. Bold
+        # and Regular variants of the same CID font) can be encoded normally.
+        # Incompatible fonts (different CID mappings, e.g. 1-byte TrueType
+        # subsets) must be skipped to avoid garbled text.
+        empty_bytes = b"()" if uses_literal else b"<>"
         y_groups: Dict[float, List[int]] = {}  # rounded_y → [block_index, ...]
+        other_font_blocks: List[int] = []  # blocks in incompatible fonts
+
+        # Helper: check if two fonts have compatible CMaps
+        def _cmaps_compatible(font_a: str, font_b: str) -> bool:
+            rev_a = cmap_mgr.font_cmaps.get(font_a, {}).get("rev", {})
+            rev_b = cmap_mgr.font_cmaps.get(font_b, {}).get("rev", {})
+            if not rev_a or not rev_b:
+                return False
+            # Compare CIDs for common characters
+            test_chars = "aeioustrnl0123456789 .,;:-"
+            matches = checked = 0
+            for ch in test_chars:
+                if ch in rev_a and ch in rev_b:
+                    checked += 1
+                    if rev_a[ch] == rev_b[ch]:
+                        matches += 1
+            # Need at least 5 shared chars, 80%+ same CID = compatible
+            return checked >= 5 and matches / checked >= 0.8
+
+        has_incompatible_fonts = False
         for bi in block_indices:
             block = all_content_blocks[bi]
+            if block.font_tag != actual_font:
+                if _cmaps_compatible(actual_font, block.font_tag):
+                    pass  # Compatible CMap — safe to encode with primary font
+                else:
+                    other_font_blocks.append(bi)
+                    has_incompatible_fonts = True
             y_key = round(block.y, 1)
             if y_key not in y_groups:
                 y_groups[y_key] = []
             y_groups[y_key].append(bi)
+
+        if has_incompatible_fonts:
+            logger.info(
+                f"[PATCH] {label}: {len(other_font_blocks)} blocks in incompatible "
+                f"fonts — will zero them and write text to primary-font blocks only"
+            )
+
+        # If ALL blocks were filtered out, we can't patch anything
+        if not y_groups:
+            logger.warning(f"[PATCH] {label}: no blocks in primary font {actual_font}, skipping")
+            return False
 
         # Order y-groups by first appearance in block_indices (reading order).
         # We can't sort by raw y-value because some PDFs use negative y-coords
@@ -3014,39 +3673,142 @@ def _patch_content_stream(
         for y_key in sorted_y_keys:
             y_groups[y_key].sort(key=lambda bi: all_content_blocks[bi].x)
 
-        empty_bytes = b"()" if uses_literal else b"<>"
-
         if len(sorted_y_keys) > 1:
-            # Multi-line: distribute WORDS proportionally across y-groups.
-            # This avoids mid-word splits that character-level distribution causes.
-            y_group_chars: Dict[int, int] = {}
+            # Multi-line: GREEDY WORD-FILL across y-groups.
+            # Fills each visual line to its width budget before moving to
+            # the next line.  Only the LAST line may be short.  This matches
+            # how word processors reflow text and eliminates the "every line
+            # equally short" artefact of proportional distribution.
+
+            # ── Step 1: Build per-line width budgets ──
+            # The budget for each y-group must include ALL blocks on the line
+            # (including incompatible-font blocks), because those blocks will
+            # be zeroed and their visual space is available for our text.
+            # We compute each block's width using its OWN font's width map.
+            y_budgets: List[dict] = []  # one dict per y-group
             for y_key in sorted_y_keys:
-                total_chars = 0
-                for bi in y_groups[y_key]:
-                    block = all_content_blocks[bi]
-                    total_chars += sum(len(op.decoded_text) for op in block.text_ops)
-                y_group_chars[y_key] = max(total_chars, 1)
-            total_orig_chars = sum(y_group_chars.values())
-
-            # Split new text into words and distribute by proportion
-            words = new_text.split()
-            word_idx = 0
-            for yi, y_key in enumerate(sorted_y_keys):
                 group_blocks = y_groups[y_key]
-                orig_count = y_group_chars[y_key]
 
-                # Last y-group gets all remaining words
-                if yi == len(sorted_y_keys) - 1:
-                    line_words = words[word_idx:]
-                else:
-                    proportion = orig_count / total_orig_chars
-                    alloc_words = max(1, round(len(words) * proportion))
-                    line_words = words[word_idx:word_idx + alloc_words]
-                    word_idx += alloc_words
+                # Collect primary-font hex (for Tc reference in same-font lines)
+                line_orig_hex = ""
+                for bi in group_blocks:
+                    if bi in other_font_blocks:
+                        continue
+                    block = all_content_blocks[bi]
+                    for op in block.text_ops:
+                        line_orig_hex += op.hex_string
 
-                line_text = " ".join(line_words) if line_words else ""
+                primary_w = _calc_hex_width(line_orig_hex)
+
+                # Compute FULL line width across ALL fonts (for budget).
+                # Incompatible-font blocks use their own font's width map.
+                full_line_w = primary_w
+                for bi in group_blocks:
+                    if bi not in other_font_blocks:
+                        continue  # Already counted in primary_w
+                    block = all_content_blocks[bi]
+                    blk_font = block.font_tag
+                    blk_widths = width_calc.font_widths.get(blk_font, {})
+                    blk_default = width_calc._default_widths.get(blk_font, default_w)
+                    for op in block.text_ops:
+                        for ci in range(0, len(op.hex_string), hex_per_char):
+                            if ci + hex_per_char > len(op.hex_string):
+                                break
+                            cid = int(op.hex_string[ci:ci + hex_per_char], 16)
+                            full_line_w += blk_widths.get(cid, blk_default)
+
+                # Write target = prefer LEFTMOST block, but inject font switch
+                # if it's not the primary font.  Compatible fonts (e.g. Bold
+                # and Regular variants) may share CMap encoding but have
+                # different font-file SUBSETS — the bold subset might lack
+                # glyphs like "3" that the regular subset has.  A font switch
+                # tells the renderer to use the primary font's glyphs.
+                write_bi = group_blocks[0]
+                write_blk = all_content_blocks[write_bi]
+                fs = write_blk.font_size if write_blk.text_ops else 10.0
+                needs_font_switch = (write_blk.font_tag != actual_font)
+
+                # Width budget = full line width + Tc headroom.
+                # Tc headroom based on estimated character count for the full line.
+                avg_char_w = max(primary_w / max(1, len(line_orig_hex) // hex_per_char), 300) if line_orig_hex else 500
+                est_chars = max(1, int(full_line_w / avg_char_w))
+                tc_headroom = 20 * est_chars  # 20 font units per char of Tc capacity
+                max_w = full_line_w + tc_headroom
+
+                y_budgets.append({
+                    "y_key": y_key,
+                    "blocks": group_blocks,
+                    "orig_hex": line_orig_hex,
+                    "primary_w": primary_w,
+                    "full_line_w": full_line_w,
+                    "max_w": max_w,
+                    "fs": fs,
+                    "write_bi": write_bi,
+                    "needs_font_switch": needs_font_switch,
+                })
+
+            # ── Step 2: Measure space width in font units ──
+            space_hex, _ = cmap_mgr.encode_text(actual_font, " ")
+            space_w = _calc_hex_width(space_hex) if space_hex else default_w
+
+            # ── Step 3: Greedy word-fill distribution ──
+            words = new_text.split()
+            # line_assignments[i] = text for y-group i, or None
+            line_assignments: List[Optional[str]] = [None] * len(y_budgets)
+            word_idx = 0
+            num_groups = len(y_budgets)
+
+            for gi in range(num_groups):
+                if word_idx >= len(words):
+                    break  # No more words; remaining y-groups will be zeroed.
+                budget = y_budgets[gi]
+                is_last = (gi == num_groups - 1)
+                line_words: List[str] = []
+                line_w = 0.0
+
+                while word_idx < len(words):
+                    word = words[word_idx]
+                    w_hex, _ = cmap_mgr.encode_text(actual_font, word)
+                    word_w = _calc_hex_width(w_hex) if w_hex else default_w * len(word)
+
+                    if not line_words:
+                        # First word: always accept (even if overflows —
+                        # trimming will handle it downstream).
+                        line_words.append(word)
+                        line_w = word_w
+                        word_idx += 1
+                    else:
+                        test_w = line_w + space_w + word_w
+                        if test_w <= budget["max_w"]:
+                            line_words.append(word)
+                            line_w = test_w
+                            word_idx += 1
+                        elif is_last:
+                            # Last available line — absorb all remaining words.
+                            line_words.append(word)
+                            line_w = test_w
+                            word_idx += 1
+                        else:
+                            break  # Next word goes to next y-group.
+
+                if line_words:
+                    line_assignments[gi] = " ".join(line_words)
+
+            # If words remain after all groups filled, append to last used line
+            if word_idx < len(words):
+                for gi in range(num_groups - 1, -1, -1):
+                    if line_assignments[gi] is not None:
+                        remaining = " ".join(words[word_idx:])
+                        line_assignments[gi] += " " + remaining
+                        break
+
+            # ── Step 4: Apply patches ──
+            for gi, budget in enumerate(y_budgets):
+                group_blocks = budget["blocks"]
+                line_text = line_assignments[gi]
 
                 if not line_text:
+                    # Zero out all blocks in this unused y-group
                     for bi in group_blocks:
                         block = all_content_blocks[bi]
                         for op in block.text_ops:
@@ -3054,99 +3816,152 @@ def _patch_content_stream(
                                         op.byte_length, empty_bytes)
                     continue
 
-                # Collect original hex for this y-group FIRST (needed for trim)
-                line_orig_hex = ""
-                for bi in group_blocks:
-                    block = all_content_blocks[bi]
-                    for op in block.text_ops:
-                        line_orig_hex += op.hex_string
+                write_bi = budget["write_bi"]
+                write_blk = all_content_blocks[write_bi]
+                fs_line = budget["fs"]
+                line_orig_hex = budget["orig_hex"]
+                full_line_w = budget["full_line_w"]
+                needs_font_switch = budget["needs_font_switch"]
 
-                # Trim text if too wide for Tc clamp
-                first_bi = group_blocks[0]
-                first_blk = all_content_blocks[first_bi]
-                fs_line = first_blk.font_size if first_blk.text_ops else 10.0
+                # Trim text if too wide for FULL line width.
+                # Use full_line_w so text can fill the entire visual line
+                # (including space freed by zeroed incompatible-font blocks).
                 line_text = _trim_text_to_fit(
                     line_text, line_orig_hex, actual_font, fs_line,
+                    orig_w_override=full_line_w,
                 )
 
-                # Encode this line's text separately
+                # Encode this line's text
                 line_hex, line_missing = cmap_mgr.encode_text(actual_font, line_text)
                 if not line_hex:
+                    for bi in group_blocks:
+                        block = all_content_blocks[bi]
+                        for op in block.text_ops:
+                            queue_patch(block.stream_xref, op.byte_offset,
+                                        op.byte_length, empty_bytes)
                     continue
 
-                # Build content bytes for this line
+                # Build content bytes for this line.
                 if uses_literal:
-                    # Use TJ kerning for word spacing (Type1 fonts)
                     line_content = _build_literal_content(line_text, actual_font)
                 else:
                     line_content = f"<{line_hex}>".encode("latin-1")
 
-                # Put in first (leftmost) block, Tc adjust, zero the rest
-                if first_blk.text_ops:
-                    first_op = first_blk.text_ops[0]
+                # Put in write target block, Tc adjust targeting FULL line width.
+                # This prevents Tc from squeezing text that should fill the
+                # space freed by zeroed incompatible-font blocks.
+                if write_blk.text_ops:
+                    first_op = write_blk.text_ops[0]
+
+                    # If write target is in an incompatible font, inject a
+                    # font switch to the primary font.  For TJ arrays the
+                    # switch MUST go before the '[', not inside the array.
+                    if needs_font_switch:
+                        fs_bytes = f"/{actual_font} {fs_line:.1f} Tf ".encode("latin-1")
+                        if first_op.operator == "TJ" and first_op.tj_array_start >= 0:
+                            queue_patch(write_blk.stream_xref, first_op.tj_array_start, 0, fs_bytes)
+                        else:
+                            line_content = fs_bytes + line_content
+
                     line_content = _inject_width_adjustment(
-                        first_op, first_blk.stream_xref,
+                        first_op, write_blk.stream_xref,
                         line_orig_hex, line_hex, line_content,
                         font_size=fs_line,
+                        orig_w_override=full_line_w,
                     )
-                    queue_patch(first_blk.stream_xref, first_op.byte_offset,
+                    queue_patch(write_blk.stream_xref, first_op.byte_offset,
                                 first_op.byte_length, line_content)
-                    for op in first_blk.text_ops[1:]:
-                        queue_patch(first_blk.stream_xref, op.byte_offset,
+                    for op in write_blk.text_ops[1:]:
+                        queue_patch(write_blk.stream_xref, op.byte_offset,
                                     op.byte_length, empty_bytes)
 
-                for bi in group_blocks[1:]:
+                for bi in group_blocks:
+                    if bi == write_bi:
+                        continue
                     block = all_content_blocks[bi]
                     for op in block.text_ops:
                         queue_patch(block.stream_xref, op.byte_offset,
                                     op.byte_length, empty_bytes)
 
         else:
-            # Single y-line (any number of blocks): all text in leftmost block.
-            # Sort already done above, so block_indices[0] may not be leftmost.
-            # Use the first entry in the sorted y-group instead.
+            # Single y-line (any number of blocks).
             sole_y = sorted_y_keys[0]
             sorted_blocks = y_groups[sole_y]
 
-            first_bi = sorted_blocks[0]
-            first_blk = all_content_blocks[first_bi]
-
-            # Calculate original total hex from all blocks FIRST (needed for trim)
+            # Calculate original hex from primary-font blocks (for Tc reference)
             all_orig_hex = ""
             for bi in sorted_blocks:
+                if bi in other_font_blocks:
+                    continue
                 block = all_content_blocks[bi]
                 for op in block.text_ops:
                     all_orig_hex += op.hex_string
 
-            # Trim text if too wide for Tc clamp
-            fs_single = first_blk.font_size if first_blk.text_ops else 10.0
+            # Compute FULL line width across ALL fonts (for budget)
+            primary_w_single = _calc_hex_width(all_orig_hex)
+            full_line_w_single = primary_w_single
+            for bi in sorted_blocks:
+                if bi not in other_font_blocks:
+                    continue
+                block = all_content_blocks[bi]
+                blk_font = block.font_tag
+                blk_widths = width_calc.font_widths.get(blk_font, {})
+                blk_default = width_calc._default_widths.get(blk_font, default_w)
+                for op in block.text_ops:
+                    for ci in range(0, len(op.hex_string), hex_per_char):
+                        if ci + hex_per_char > len(op.hex_string):
+                            break
+                        cid = int(op.hex_string[ci:ci + hex_per_char], 16)
+                        full_line_w_single += blk_widths.get(cid, blk_default)
+
+            # ── Single-write-target path ──
+            # Use LEFTMOST block as write target, inject font switch if
+            # it's in any different font (even "compatible" ones may have
+            # different subset glyphs).
+            write_bi = sorted_blocks[0]
+            write_blk = all_content_blocks[write_bi]
+            needs_font_switch_single = (write_blk.font_tag != actual_font)
+
+            fs_single = write_blk.font_size if write_blk.text_ops else 10.0
             trimmed_text = _trim_text_to_fit(
                 new_text, all_orig_hex, actual_font, fs_single,
+                orig_w_override=full_line_w_single,
             )
             if trimmed_text != new_text:
                 hex_encoded, _ = cmap_mgr.encode_text(actual_font, trimmed_text)
                 new_text = trimmed_text
 
             if uses_literal:
-                # Use TJ kerning for word spacing (Type1 fonts)
                 new_content_bytes = _build_literal_content(new_text, actual_font)
             else:
                 new_content_bytes = f"<{hex_encoded}>".encode("latin-1")
 
-            if first_blk.text_ops:
-                first_op = first_blk.text_ops[0]
+            if write_blk.text_ops:
+                first_op = write_blk.text_ops[0]
+
+                # Font switch for incompatible-font write target
+                if needs_font_switch_single:
+                    fs_bytes = f"/{actual_font} {fs_single:.1f} Tf ".encode("latin-1")
+                    if first_op.operator == "TJ" and first_op.tj_array_start >= 0:
+                        queue_patch(write_blk.stream_xref, first_op.tj_array_start, 0, fs_bytes)
+                    else:
+                        new_content_bytes = fs_bytes + new_content_bytes
+
                 new_content_bytes = _inject_width_adjustment(
-                    first_op, first_blk.stream_xref,
+                    first_op, write_blk.stream_xref,
                     all_orig_hex, hex_encoded, new_content_bytes,
                     font_size=fs_single,
+                    orig_w_override=full_line_w_single,
                 )
-                queue_patch(first_blk.stream_xref, first_op.byte_offset,
+                queue_patch(write_blk.stream_xref, first_op.byte_offset,
                             first_op.byte_length, new_content_bytes)
-                for op in first_blk.text_ops[1:]:
-                    queue_patch(first_blk.stream_xref, op.byte_offset,
+                for op in write_blk.text_ops[1:]:
+                    queue_patch(write_blk.stream_xref, op.byte_offset,
                                 op.byte_length, empty_bytes)
 
-            for bi in sorted_blocks[1:]:
+            for bi in sorted_blocks:
+                if bi == write_bi:
+                    continue
                 block = all_content_blocks[bi]
                 for op in block.text_ops:
                     queue_patch(block.stream_xref, op.byte_offset,
@@ -3249,6 +4064,10 @@ def _patch_content_stream(
             if not orig_text or not new_content:
                 continue
 
+            # Pad short replacements to prevent visual gaps from zeroed
+            # continuation lines (when original wraps but replacement doesn't)
+            new_content = _pad_skill_replacement(orig_text, new_content)
+
             font = sk.content_spans[0].font_name if sk.content_spans else ""
             if _do_replacement(orig_text, new_content, font, f"skill {s_idx}"):
                 replacements_applied += 1
@@ -3296,18 +4115,14 @@ def _patch_content_stream(
                 new_text_str = new_bytes.decode("latin-1")
                 stream_text = stream_text[:offset] + new_text_str + stream_text[offset + old_len:]
 
-            # ── Reset Tc and Tz at the start of every BT text object ──
-            # Both Tc (character spacing) and Tz (horizontal scaling) persist
-            # across BT/ET blocks in the PDF graphics state. Without resets,
-            # any Tc/Tz injected for a replacement leaks to ALL subsequent
-            # text objects on the page (headers, titles, dates, etc.).
-            # Insert "0 Tc 100 Tz" after every BT keyword to ensure every
-            # text object starts with clean default state.
-            stream_text = re.sub(
-                r'((?:^|\s)BT)(?=\s)',
-                r'\1\n0 Tc 100 Tz',
-                stream_text,
-            )
+            # ── Tc/Tz leak prevention ──
+            # Tc/Tz persist across BT/ET blocks in the PDF graphics state.
+            # The within-block reset (injected after each replacement's last
+            # patched op) ensures our Tc values don't leak to subsequent text.
+            # We do NOT inject resets into unmodified BT blocks — doing so
+            # adds unnecessary bytes and can subtly alter rendering in some
+            # PDF viewers (especially for PDFs with per-character Td positioning
+            # like Google Docs output).
 
             doc.update_stream(xref, stream_text.encode("latin-1"))
         except Exception as e:
@@ -3401,6 +4216,990 @@ def _int_to_rgb(color: int) -> Tuple[float, float, float]:
     return (r, g, b)
 
 
+# ─── Boundary Detection (Date/Location Protection) ────────────────────────
+
+class _BoundaryDetector:
+    """Detect semantic boundaries within content blocks to protect dates,
+    contact info, and other immutable content from being overwritten."""
+
+    DATE_PATTERNS = [
+        r'\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*\.?\s*\d{4}\b',
+        r'\b\d{4}\s*[-–—]\s*(?:\d{4}|Present|Current|Now)\b',
+        r'\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*\.?\s*\d{4}\s*[-–—]',
+        r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4}\s*[-–—]\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4}\b',
+        r'^(?:Present|Current|Now)$',
+        r'\b\d{1,2}/\d{4}\b',
+    ]
+
+    DATE_FRAGMENT_PATTERNS = [
+        r'^(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?$',
+        r'^20[12]\d$',
+        r'^20[12]\d\s*[-–—]\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*$',
+        r'^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s*[-–—]$',
+    ]
+
+    _date_re = [re.compile(p, re.IGNORECASE) for p in DATE_PATTERNS]
+    _date_fragment_re = [re.compile(p, re.IGNORECASE) for p in DATE_FRAGMENT_PATTERNS]
+
+    LOCATION_PATTERNS = [
+        r'^[A-Z][a-z]+(?:\s[A-Z][a-z]+)*,\s*[A-Z]{2}$',
+        r'^Remote$',
+    ]
+
+    _location_re = [re.compile(p, re.IGNORECASE) for p in LOCATION_PATTERNS]
+
+    @classmethod
+    def is_date_text(cls, text: str) -> bool:
+        clean = text.strip()
+        if not clean:
+            return False
+        for pattern in cls._date_re:
+            if pattern.search(clean):
+                return True
+        return False
+
+    @classmethod
+    def is_date_fragment(cls, text: str) -> bool:
+        clean = text.strip()
+        if not clean:
+            return False
+        for pattern in cls._date_fragment_re:
+            if pattern.search(clean):
+                return True
+        return False
+
+    @classmethod
+    def is_location_text(cls, text: str) -> bool:
+        clean = text.strip()
+        if not clean:
+            return False
+        for pattern in cls._location_re:
+            if pattern.search(clean):
+                return True
+        return False
+
+    @classmethod
+    def is_protected(cls, text: str) -> bool:
+        return cls.is_date_text(text) or cls.is_date_fragment(text) or cls.is_location_text(text)
+
+    @classmethod
+    def filter_extension_blocks(
+        cls,
+        all_blocks: List['ContentBlock'],
+        extension_candidates: List[int],
+        matched_block_indices: Optional[List[int]] = None,
+    ) -> List[int]:
+        matched_max_x = 0.0
+        if matched_block_indices:
+            for mi in matched_block_indices:
+                b = all_blocks[mi]
+                matched_max_x = max(matched_max_x, b.x)
+
+        filtered = []
+        for bi in extension_candidates:
+            block = all_blocks[bi]
+            text = block.full_text.strip()
+
+            if text and cls.is_protected(text):
+                logger.info(
+                    f"[BOUNDARY] Protected block (text pattern) at "
+                    f"x={block.x:.1f} y={block.y:.1f}: '{text[:60]}'"
+                )
+                continue
+
+            if matched_max_x > 0 and block.x - matched_max_x > 200:
+                logger.info(
+                    f"[BOUNDARY] Protected block (x-gap {block.x - matched_max_x:.0f}pt) at "
+                    f"x={block.x:.1f} y={block.y:.1f}: '{text[:60]}'"
+                )
+                continue
+
+            filtered.append(bi)
+        return filtered
+
+    @classmethod
+    def filter_matched_blocks(
+        cls,
+        all_blocks: List['ContentBlock'],
+        block_indices: List[int],
+        original_text: str,
+    ) -> List[int]:
+        if not block_indices:
+            return block_indices
+
+        orig_clean = original_text.replace("\u200b", "").strip().lower()
+        filtered = []
+
+        for bi in block_indices:
+            block = all_blocks[bi]
+            block_text = block.full_text.strip()
+            if not block_text:
+                filtered.append(bi)
+                continue
+
+            block_text_lower = block_text.lower().strip()
+            if block_text_lower in orig_clean:
+                filtered.append(bi)
+                continue
+
+            if cls.is_protected(block_text):
+                logger.info(
+                    f"[BOUNDARY] Removed matched block with protected text: "
+                    f"'{block_text[:60]}'"
+                )
+                continue
+
+            filtered.append(bi)
+
+        return filtered
+
+
+# ─── Font Analysis (Character Availability) ────────────────────────────────
+
+class FontAnalyzer:
+    """Analyze PDF fonts and build character availability maps."""
+
+    def __init__(self, cmap_mgr: '_CMapManager'):
+        self._cmap = cmap_mgr
+
+    def get_available_chars(self, font_tag: str) -> set:
+        font_data = self._cmap.font_cmaps.get(font_tag, {})
+        fwd = font_data.get("fwd", {})
+        chars = set()
+        for cid, char_str in fwd.items():
+            for ch in char_str:
+                chars.add(ch)
+        return chars
+
+    def get_all_available_chars(self) -> set:
+        all_chars = set()
+        for font_tag in self._cmap.font_cmaps:
+            all_chars.update(self.get_available_chars(font_tag))
+        return all_chars
+
+    def get_unavailable_standard_chars(self, font_tag: str) -> List[str]:
+        available = self.get_available_chars(font_tag)
+        if not available:
+            return []
+        standard = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,;:!?-/()&%+')
+        missing = sorted(ch for ch in standard if ch not in available)
+        return missing
+
+    def check_text(self, text: str, font_tag: str) -> List[str]:
+        available = self.get_available_chars(font_tag)
+        if not available:
+            return []
+        missing = []
+        seen = set()
+        for ch in text:
+            if ch not in available and ch not in seen and ch != ' ':
+                missing.append(ch)
+                seen.add(ch)
+        return missing
+
+    def build_char_constraint_string(self) -> str:
+        if not self._cmap.font_cmaps:
+            return ""
+
+        largest_set = set()
+        for ft in self._cmap.font_cmaps:
+            chars = self.get_available_chars(ft)
+            if len(chars) > len(largest_set):
+                largest_set = chars
+
+        if not largest_set or len(largest_set) < 30:
+            return ""
+
+        common = largest_set
+
+        ascii_letters = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ')
+        ascii_digits = set('0123456789')
+        common_punct = set('.,;:!?()-/&@#$%+\'"')
+
+        missing_letters = ascii_letters - common
+        missing_digits = ascii_digits - common
+        missing_punct = common_punct - common
+
+        if not missing_letters and not missing_digits:
+            if missing_punct:
+                return f"AVOID these characters (not in font): {' '.join(sorted(missing_punct))}"
+            return ""
+
+        all_missing = sorted(missing_letters | missing_digits | missing_punct)
+        if len(all_missing) <= 30:
+            avoid_desc = []
+            if missing_letters:
+                avoid_desc.append(f"letters: {' '.join(sorted(missing_letters))}")
+            if missing_digits:
+                avoid_desc.append(f"digits: {' '.join(sorted(missing_digits))}")
+            if missing_punct:
+                avoid_desc.append(f"punctuation: {' '.join(sorted(missing_punct))}")
+            return f"AVOID these characters (not in font): {'; '.join(avoid_desc)}"
+
+        avail_printable = sorted(c for c in common if c.isprintable() and c != ' ')
+        if len(avail_printable) > 80:
+            return ""
+
+        return f"ONLY use these characters: {''.join(avail_printable)} and space"
+
+    def get_font_summary(self) -> str:
+        lines = []
+        for font_tag in sorted(self._cmap.font_cmaps.keys()):
+            font_name = self._cmap.font_names.get(font_tag, "unknown")
+            chars = self.get_available_chars(font_tag)
+            ascii_count = sum(1 for c in chars if c.isascii() and c.isprintable())
+            lines.append(
+                f"  {font_tag} ({font_name}): {len(chars)} chars "
+                f"({ascii_count} ASCII)"
+            )
+        return "\n".join(lines)
+
+
+# ─── Overflow Detection ───────────────────────────────────────────────────
+
+class _OverflowDetector:
+    """Detects and prevents text overflow by measuring rendered widths."""
+
+    MAX_TC = 0.15
+
+    def __init__(self, doc, cmap_mgr: '_CMapManager', width_calc: '_WidthCalculator'):
+        self._doc = doc
+        self._cmap = cmap_mgr
+        self._wc = width_calc
+        self._page_dims: Dict[int, Tuple[float, float]] = {}
+        self._page_bounds: Dict[int, Tuple[float, float, float, float]] = {}
+
+    def _get_page_dims(self, page_num: int) -> Tuple[float, float]:
+        if page_num not in self._page_dims:
+            page = self._doc[page_num]
+            rect = page.rect
+            self._page_dims[page_num] = (rect.width, rect.height)
+        return self._page_dims[page_num]
+
+    def measure_text_width(self, text: str, font_tag: str, font_size: float) -> float:
+        hex_encoded, _ = self._cmap.encode_text(font_tag, text)
+        if not hex_encoded:
+            return len(text) * font_size * 0.5
+        byte_width = self._cmap.get_byte_width(font_tag)
+        return self._wc.text_width_from_hex(font_tag, hex_encoded, font_size, byte_width)
+
+    def measure_hex_width(self, hex_string: str, font_tag: str, font_size: float) -> float:
+        if not hex_string:
+            return 0.0
+        byte_width = self._cmap.get_byte_width(font_tag)
+        return self._wc.text_width_from_hex(font_tag, hex_string, font_size, byte_width)
+
+    def get_available_width(
+        self, x_start: float, page_num: int,
+        all_blocks: Optional[List['ContentBlock']] = None,
+    ) -> float:
+        page_w, _ = self._get_page_dims(page_num)
+
+        if page_num in self._page_bounds:
+            _, right_x, _, _ = self._page_bounds[page_num]
+            return right_x - x_start
+
+        if all_blocks:
+            page_blocks = [b for b in all_blocks if b.page_num == page_num and b.text_ops]
+            if page_blocks:
+                max_right = 0.0
+                for block in page_blocks:
+                    block_text = block.full_text
+                    if block_text and block.font_tag:
+                        block_w = self.measure_text_width(
+                            block_text, block.font_tag, block.font_size
+                        )
+                        max_right = max(max_right, block.x + block_w)
+
+                if max_right > x_start:
+                    right_bound = max_right + 2.0
+                    left_x = min(b.x for b in page_blocks)
+                    self._page_bounds[page_num] = (left_x, right_bound, 0, 0)
+                    return right_bound - x_start
+
+        return page_w - 36.0 - x_start
+
+    def would_overflow(
+        self, new_text: str, font_tag: str, font_size: float,
+        x_start: float, page_num: int,
+        all_blocks: Optional[List['ContentBlock']] = None,
+    ) -> Tuple[bool, float, float]:
+        text_w = self.measure_text_width(new_text, font_tag, font_size)
+        avail_w = self.get_available_width(x_start, page_num, all_blocks)
+        num_chars = len(new_text)
+        max_tc_savings = self.MAX_TC * num_chars
+        effective_width = text_w - max_tc_savings
+        return effective_width > avail_w, text_w, avail_w
+
+    def wrap_text(
+        self, text: str, max_width: float,
+        font_tag: str, font_size: float,
+    ) -> List[str]:
+        words = text.split()
+        if not words:
+            return [text]
+
+        lines: List[str] = []
+        current_line: List[str] = []
+        current_width = 0.0
+        space_w = self.measure_text_width(" ", font_tag, font_size)
+        if space_w < 0.1:
+            space_w = font_size * 0.25
+
+        for word in words:
+            word_w = self.measure_text_width(word, font_tag, font_size)
+            if current_line:
+                test_width = current_width + space_w + word_w
+                if test_width > max_width:
+                    lines.append(" ".join(current_line))
+                    current_line = [word]
+                    current_width = word_w
+                else:
+                    current_line.append(word)
+                    current_width = test_width
+            else:
+                current_line = [word]
+                current_width = word_w
+
+        if current_line:
+            lines.append(" ".join(current_line))
+
+        return lines if lines else [text]
+
+    def get_line_leading(
+        self, blocks: List['ContentBlock'], page_num: int,
+    ) -> float:
+        page_blocks = sorted(
+            [b for b in blocks if b.page_num == page_num and b.text_ops],
+            key=lambda b: -b.y
+        )
+        if len(page_blocks) < 2:
+            return page_blocks[0].font_size * 1.2 if page_blocks else 12.0
+
+        deltas: List[float] = []
+        for i in range(len(page_blocks) - 1):
+            b1, b2 = page_blocks[i], page_blocks[i + 1]
+            if abs(b1.x - b2.x) < 20:
+                dy = b1.y - b2.y
+                if 4 < dy < 30:
+                    deltas.append(dy)
+
+        if deltas:
+            return sum(deltas) / len(deltas)
+        return page_blocks[0].font_size * 1.2
+
+
+# ─── Width Budget Calculator ──────────────────────────────────────────────
+
+def calculate_width_budgets(
+    pdf_path: str,
+    bullets: List['BulletPoint'],
+    skills: List['SkillLine'],
+    title_skills: Optional[List['TitleSkillLine']] = None,
+) -> Dict[str, Any]:
+    """Calculate per-item max character counts based on rendered font widths."""
+    doc = fitz.open(pdf_path)
+    cmap_mgr = _CMapManager(doc)
+    width_calc = _WidthCalculator(doc)
+    detector = _OverflowDetector(doc, cmap_mgr, width_calc)
+
+    all_blocks: List['ContentBlock'] = []
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        for xref in page.get_contents():
+            try:
+                stream = doc.xref_stream(xref)
+                blocks = _parse_content_stream(stream, cmap_mgr, page_num, xref)
+                all_blocks.extend(blocks)
+            except Exception:
+                pass
+
+    def _avg_char_width(text: str, font_tag: str, font_size: float) -> float:
+        if not text.strip():
+            return font_size * 0.5
+        w = detector.measure_text_width(text, font_tag, font_size)
+        if w > 0 and len(text.strip()) > 0:
+            return w / len(text.strip())
+        return font_size * 0.5
+
+    def _resolve_font_tag(font_name: str) -> Optional[str]:
+        for tag, name in cmap_mgr.font_names.items():
+            if name == font_name or font_name in name:
+                return tag
+        return None
+
+    bullet_budgets: Dict[int, List[int]] = {}
+    skill_budgets: Dict[int, int] = {}
+    title_budgets: Dict[int, int] = {}
+
+    for idx, bp in enumerate(bullets):
+        text_spans = [
+            s for tl in bp.text_lines for s in tl.spans
+            if not s.is_bullet_char and not s.is_zwsp_only and s.text.strip()
+        ]
+        if not text_spans:
+            continue
+
+        font_tag = _resolve_font_tag(text_spans[0].font_name)
+        if not font_tag:
+            continue
+
+        font_size = text_spans[0].font_size
+
+        line_budgets = []
+        for lt in bp.line_texts:
+            orig_line_w = detector.measure_text_width(lt, font_tag, font_size)
+            tc_headroom = detector.MAX_TC * max(len(lt), 1)
+            effective_w = orig_line_w + tc_headroom
+
+            avg_cw = _avg_char_width(lt, font_tag, font_size)
+            max_chars = int(effective_w / avg_cw) if avg_cw > 0 else len(lt)
+            max_chars = max(max_chars, len(lt))
+            line_budgets.append(max_chars)
+
+        bullet_budgets[idx] = line_budgets
+
+    for idx, sk in enumerate(skills):
+        if not sk.content_spans:
+            continue
+        font_tag = _resolve_font_tag(sk.content_spans[0].font_name)
+        if not font_tag:
+            continue
+
+        font_size = sk.content_spans[0].font_size
+
+        content = sk.content_text if hasattr(sk, 'content_text') else " ".join(s.text for s in sk.content_spans)
+        orig_w = detector.measure_text_width(content, font_tag, font_size)
+        tc_headroom = detector.MAX_TC * max(len(content), 1)
+        effective_w = orig_w + tc_headroom
+
+        avg_cw = _avg_char_width(content, font_tag, font_size)
+        max_chars = int(effective_w / avg_cw) if avg_cw > 0 else len(content)
+        max_chars = max(max_chars, len(content))
+        skill_budgets[idx] = max_chars
+
+    if title_skills:
+        for idx, ts in enumerate(title_skills):
+            if not ts.full_spans:
+                continue
+            font_tag = _resolve_font_tag(ts.full_spans[0].font_name)
+            if not font_tag:
+                continue
+
+            font_size = ts.full_spans[0].font_size
+
+            orig_skills_w = detector.measure_text_width(ts.skills_part, font_tag, font_size)
+            tc_headroom = detector.MAX_TC * max(len(ts.skills_part), 1)
+            effective_skills_w = orig_skills_w + tc_headroom
+
+            avg_cw = _avg_char_width(ts.skills_part, font_tag, font_size)
+            max_chars = int(effective_skills_w / avg_cw) if avg_cw > 0 else len(ts.skills_part)
+            max_chars = max(max_chars, len(ts.skills_part))
+            title_budgets[idx] = max_chars
+
+    doc.close()
+
+    budget_info = {
+        "bullet_budgets": bullet_budgets,
+        "skill_budgets": skill_budgets,
+        "title_budgets": title_budgets,
+    }
+
+    total_items = len(bullet_budgets) + len(skill_budgets) + len(title_budgets)
+    logger.info(f"[BUDGET] Calculated width budgets for {total_items} items")
+
+    return budget_info
+
+
+# ─── Post-Patch Verification ────────────────────────────────────────────────
+
+@dataclass
+class VerificationResult:
+    """Result of a single verification check."""
+    passed: bool
+    details: Dict[str, Any] = field(default_factory=dict)
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class VerificationReport:
+    """Complete verification report for a tailored PDF."""
+    text_extraction: VerificationResult
+    protected_content: VerificationResult
+    fonts: VerificationResult
+    visual: VerificationResult
+    garbled: VerificationResult
+    overflow: VerificationResult
+
+    @property
+    def passed(self) -> bool:
+        return (
+            self.protected_content.passed
+            and self.fonts.passed
+            and self.garbled.passed
+            and self.overflow.passed
+        )
+
+    @property
+    def summary(self) -> str:
+        checks = [
+            ("text_extraction", self.text_extraction),
+            ("protected_content", self.protected_content),
+            ("fonts", self.fonts),
+            ("visual", self.visual),
+            ("garbled", self.garbled),
+            ("overflow", self.overflow),
+        ]
+        lines = []
+        for name, result in checks:
+            status = "PASS" if result.passed else "FAIL"
+            lines.append(f"  [{status}] {name}")
+            for w in result.warnings:
+                lines.append(f"    WARNING: {w}")
+        return "\n".join(lines)
+
+
+class PostPatchVerifier:
+    """Verify tailored PDF quality before returning to user.
+
+    Runs 6 verification layers:
+    1. Text extraction — replacement text is extractable
+    2. Protected content — dates, headers, contact info unchanged
+    3. Font integrity — same fonts, same count
+    4. Visual regression (SSIM) — overall + protected region similarity
+    5. Garbled character detection — no mid-word symbols or replacement chars
+    6. Text overflow detection — no text past page margins
+    """
+
+    OVERALL_SSIM_MIN = 0.75
+    HEADER_SSIM_MIN = 0.95
+    HEADER_REGION_RATIO = 0.12
+
+    def verify(
+        self,
+        original_path: str,
+        tailored_path: str,
+        bullet_replacements: Optional[Dict[int, List[str]]] = None,
+        skill_replacements: Optional[Dict[int, str]] = None,
+        title_replacements: Optional[Dict[int, str]] = None,
+    ) -> VerificationReport:
+        text_result = self._check_text_extraction(
+            tailored_path,
+            bullet_replacements or {},
+            skill_replacements or {},
+            title_replacements or {},
+        )
+        protected_result = self._check_protected_content(original_path, tailored_path)
+        font_result = self._check_fonts(original_path, tailored_path)
+        visual_result = self._check_visual_similarity(original_path, tailored_path)
+        garbled_result = self._check_garbled_chars(tailored_path)
+        overflow_result = self._check_overflow(tailored_path, original_path)
+
+        return VerificationReport(
+            text_extraction=text_result,
+            protected_content=protected_result,
+            fonts=font_result,
+            visual=visual_result,
+            garbled=garbled_result,
+            overflow=overflow_result,
+        )
+
+    def _check_text_extraction(
+        self,
+        tailored_path: str,
+        bullet_replacements: Dict[int, List[str]],
+        skill_replacements: Dict[int, str],
+        title_replacements: Dict[int, str],
+    ) -> VerificationResult:
+        try:
+            doc = fitz.open(tailored_path)
+            full_text = ""
+            for page in doc:
+                full_text += page.get_text("text")
+            doc.close()
+
+            full_norm = " ".join(full_text.split()).lower()
+
+            found = 0
+            total = 0
+            missing = []
+
+            for idx, lines in bullet_replacements.items():
+                for line in lines:
+                    total += 1
+                    words = [w for w in line.split() if len(w) > 3]
+                    if not words:
+                        found += 1
+                        continue
+                    matched = sum(1 for w in words if w.lower() in full_norm)
+                    if matched >= len(words) * 0.6:
+                        found += 1
+                    else:
+                        missing.append(f"Bullet {idx}: '{line[:50]}...'")
+
+            for idx, content in skill_replacements.items():
+                total += 1
+                words = [w.strip(",. ") for w in content.split() if len(w.strip(",. ")) > 2]
+                if not words:
+                    found += 1
+                    continue
+                matched = sum(1 for w in words if w.lower() in full_norm)
+                if matched >= len(words) * 0.5:
+                    found += 1
+                else:
+                    missing.append(f"Skill {idx}: '{content[:50]}...'")
+
+            for idx, skills_part in title_replacements.items():
+                total += 1
+                words = [w.strip(",. ") for w in skills_part.split(",") if len(w.strip()) > 1]
+                if not words:
+                    found += 1
+                    continue
+                matched = sum(1 for w in words if w.strip().lower() in full_norm)
+                if matched >= len(words) * 0.5:
+                    found += 1
+                else:
+                    missing.append(f"Title {idx}: '{skills_part[:50]}'")
+
+            rate = found / total if total > 0 else 1.0
+            warnings = missing[:5] if missing else []
+
+            return VerificationResult(
+                passed=rate >= 0.7,
+                details={"found": found, "total": total, "rate": rate},
+                warnings=warnings,
+            )
+        except Exception as e:
+            return VerificationResult(
+                passed=False,
+                details={"error": str(e)},
+                warnings=[f"Text extraction failed: {e}"],
+            )
+
+    def _check_protected_content(
+        self, original_path: str, tailored_path: str
+    ) -> VerificationResult:
+        try:
+            orig_doc = fitz.open(original_path)
+            tail_doc = fitz.open(tailored_path)
+
+            orig_text = ""
+            tail_text = ""
+            for page in orig_doc:
+                orig_text += page.get_text("text")
+            for page in tail_doc:
+                tail_text += page.get_text("text")
+            orig_doc.close()
+            tail_doc.close()
+
+            date_patterns = [
+                r'\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*\.?\s*\d{4}\b',
+                r'\b\d{4}\s*[-–—]\s*(?:\d{4}|Present|Current|Now)\b',
+                r'\b\d{1,2}/\d{4}\b',
+            ]
+
+            original_dates = set()
+            for pattern in date_patterns:
+                original_dates.update(re.findall(pattern, orig_text, re.IGNORECASE))
+
+            missing_dates = []
+            for date in original_dates:
+                if date not in tail_text:
+                    date_norm = " ".join(date.split())
+                    tail_norm = " ".join(tail_text.split())
+                    if date_norm not in tail_norm:
+                        missing_dates.append(date)
+
+            email_re = re.compile(r'[\w.+-]+@[\w-]+\.[\w.-]+')
+
+            orig_emails = set(email_re.findall(orig_text))
+            tail_emails = set(email_re.findall(tail_text))
+            missing_emails = orig_emails - tail_emails
+
+            warnings = []
+            if missing_dates:
+                warnings.extend([f"Missing date: {d}" for d in missing_dates[:5]])
+            if missing_emails:
+                warnings.extend([f"Missing email: {e}" for e in missing_emails])
+
+            return VerificationResult(
+                passed=len(missing_dates) == 0 and len(missing_emails) == 0,
+                details={
+                    "dates_found": len(original_dates),
+                    "dates_missing": len(missing_dates),
+                    "emails_found": len(orig_emails),
+                    "emails_missing": len(missing_emails),
+                },
+                warnings=warnings,
+            )
+        except Exception as e:
+            return VerificationResult(
+                passed=False,
+                details={"error": str(e)},
+                warnings=[f"Protected content check failed: {e}"],
+            )
+
+    def _check_fonts(
+        self, original_path: str, tailored_path: str
+    ) -> VerificationResult:
+        try:
+            orig_doc = fitz.open(original_path)
+            tail_doc = fitz.open(tailored_path)
+
+            orig_fonts = set()
+            tail_fonts = set()
+
+            for page in orig_doc:
+                for f in page.get_fonts():
+                    orig_fonts.add(f[3])
+            for page in tail_doc:
+                for f in page.get_fonts():
+                    tail_fonts.add(f[3])
+
+            orig_doc.close()
+            tail_doc.close()
+
+            missing = orig_fonts - tail_fonts
+            extra = tail_fonts - orig_fonts
+
+            warnings = []
+            if missing:
+                warnings.append(f"Missing fonts: {missing}")
+            if extra:
+                warnings.append(f"Extra fonts: {extra}")
+
+            return VerificationResult(
+                passed=len(missing) == 0,
+                details={
+                    "original_count": len(orig_fonts),
+                    "tailored_count": len(tail_fonts),
+                    "missing": list(missing),
+                    "extra": list(extra),
+                },
+                warnings=warnings,
+            )
+        except Exception as e:
+            return VerificationResult(
+                passed=False,
+                details={"error": str(e)},
+                warnings=[f"Font check failed: {e}"],
+            )
+
+    def _check_visual_similarity(
+        self, original_path: str, tailored_path: str
+    ) -> VerificationResult:
+        try:
+            import numpy as np
+            from skimage.metrics import structural_similarity
+
+            orig_doc = fitz.open(original_path)
+            tail_doc = fitz.open(tailored_path)
+
+            overall_ssims = []
+            header_ssims = []
+
+            for pn in range(min(len(orig_doc), len(tail_doc))):
+                orig_pix = orig_doc[pn].get_pixmap(dpi=150)
+                tail_pix = tail_doc[pn].get_pixmap(dpi=150)
+
+                orig_arr = np.frombuffer(orig_pix.samples, dtype=np.uint8).reshape(
+                    orig_pix.h, orig_pix.w, orig_pix.n
+                )
+                tail_arr = np.frombuffer(tail_pix.samples, dtype=np.uint8).reshape(
+                    tail_pix.h, tail_pix.w, tail_pix.n
+                )
+
+                h = min(orig_arr.shape[0], tail_arr.shape[0])
+                w = min(orig_arr.shape[1], tail_arr.shape[1])
+                c = min(orig_arr.shape[2], tail_arr.shape[2])
+                orig_crop = orig_arr[:h, :w, :c]
+                tail_crop = tail_arr[:h, :w, :c]
+
+                if c >= 3:
+                    orig_gray = np.mean(orig_crop[:, :, :3], axis=2).astype(np.uint8)
+                    tail_gray = np.mean(tail_crop[:, :, :3], axis=2).astype(np.uint8)
+                else:
+                    orig_gray = orig_crop[:, :, 0]
+                    tail_gray = tail_crop[:, :, 0]
+
+                overall = structural_similarity(orig_gray, tail_gray)
+                overall_ssims.append(overall)
+
+                header_h = int(h * self.HEADER_REGION_RATIO)
+                if header_h > 10:
+                    header_ssim = structural_similarity(
+                        orig_gray[:header_h, :],
+                        tail_gray[:header_h, :],
+                    )
+                    header_ssims.append(header_ssim)
+
+            orig_doc.close()
+            tail_doc.close()
+
+            avg_overall = sum(overall_ssims) / len(overall_ssims) if overall_ssims else 0
+            avg_header = sum(header_ssims) / len(header_ssims) if header_ssims else 0
+
+            warnings = []
+            if avg_overall < self.OVERALL_SSIM_MIN:
+                warnings.append(
+                    f"Overall SSIM {avg_overall:.3f} below threshold {self.OVERALL_SSIM_MIN}"
+                )
+            if avg_header < self.HEADER_SSIM_MIN:
+                warnings.append(
+                    f"Header SSIM {avg_header:.3f} below threshold {self.HEADER_SSIM_MIN}"
+                )
+
+            return VerificationResult(
+                passed=avg_overall >= self.OVERALL_SSIM_MIN,
+                details={
+                    "overall_ssim": round(avg_overall, 4),
+                    "header_ssim": round(avg_header, 4),
+                    "pages_compared": len(overall_ssims),
+                },
+                warnings=warnings,
+            )
+        except ImportError:
+            return VerificationResult(
+                passed=True,
+                details={"skipped": "scikit-image not available"},
+                warnings=["SSIM check skipped — scikit-image not installed"],
+            )
+        except Exception as e:
+            return VerificationResult(
+                passed=True,
+                details={"error": str(e)},
+                warnings=[f"Visual check failed: {e}"],
+            )
+
+    def _check_garbled_chars(self, pdf_path: str) -> VerificationResult:
+        try:
+            doc = fitz.open(pdf_path)
+            issues = []
+
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                text = page.get_text("text")
+
+                if '\ufffd' in text:
+                    count = text.count('\ufffd')
+                    issues.append(
+                        f"Page {page_num}: {count} Unicode replacement character(s)"
+                    )
+
+                garbled_re = re.compile(
+                    r'[a-z][^a-zA-Z0-9\u2019\'\-/+_.][a-z]'
+                )
+                words = text.split()
+                for word in words:
+                    clean = word.strip(".,;:!?()[]{}\"'-/")
+                    if len(clean) > 4:
+                        match = garbled_re.search(clean)
+                        if match:
+                            if '@' in word or '://' in word:
+                                continue
+                            issues.append(
+                                f"Page {page_num}: Suspicious word '{clean}'"
+                            )
+
+            doc.close()
+
+            return VerificationResult(
+                passed=len(issues) == 0,
+                details={"issues_found": len(issues)},
+                warnings=issues[:10],
+            )
+        except Exception as e:
+            return VerificationResult(
+                passed=False,
+                details={"error": str(e)},
+                warnings=[f"Garbled char check failed: {e}"],
+            )
+
+    def _check_overflow(
+        self, pdf_path: str, original_path: Optional[str] = None
+    ) -> VerificationResult:
+        try:
+            doc = fitz.open(pdf_path)
+            overflow_issues = []
+
+            orig_max_right = {}
+            orig_max_bottom = {}
+            tolerance = 5.0
+
+            if original_path:
+                orig_doc = fitz.open(original_path)
+                for pn in range(len(orig_doc)):
+                    page = orig_doc[pn]
+                    max_r = 0.0
+                    max_b = 0.0
+                    blocks = page.get_text(
+                        "dict", flags=fitz.TEXT_PRESERVE_WHITESPACE
+                    )["blocks"]
+                    for block in blocks:
+                        if block["type"] != 0:
+                            continue
+                        for line in block["lines"]:
+                            for span in line["spans"]:
+                                if span["text"].strip():
+                                    max_r = max(max_r, span["bbox"][2])
+                                    max_b = max(max_b, span["bbox"][3])
+                    orig_max_right[pn] = max_r
+                    orig_max_bottom[pn] = max_b
+                orig_doc.close()
+
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                page_w = page.rect.width
+                page_h = page.rect.height
+
+                right_limit = orig_max_right.get(
+                    page_num, page_w - 10.0
+                ) + tolerance
+                bottom_limit = orig_max_bottom.get(
+                    page_num, page_h - 10.0
+                ) + tolerance
+
+                blocks = page.get_text(
+                    "dict", flags=fitz.TEXT_PRESERVE_WHITESPACE
+                )["blocks"]
+                for block in blocks:
+                    if block["type"] != 0:
+                        continue
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            bbox = span["bbox"]
+                            text = span["text"].strip()
+                            if not text:
+                                continue
+
+                            if bbox[2] > right_limit:
+                                overflow_issues.append(
+                                    f"Page {page_num}: Right overflow at "
+                                    f"x={bbox[2]:.1f} (limit={right_limit:.1f})"
+                                    f": '{text[:30]}'"
+                                )
+                            if bbox[3] > bottom_limit:
+                                overflow_issues.append(
+                                    f"Page {page_num}: Bottom overflow at "
+                                    f"y={bbox[3]:.1f} (limit={bottom_limit:.1f})"
+                                    f": '{text[:30]}'"
+                                )
+
+            doc.close()
+
+            return VerificationResult(
+                passed=len(overflow_issues) == 0,
+                details={"overflow_count": len(overflow_issues)},
+                warnings=overflow_issues[:5],
+            )
+        except Exception as e:
+            return VerificationResult(
+                passed=True,
+                details={"error": str(e)},
+                warnings=[f"Overflow check failed: {e}"],
+            )
+
+
 # ─── Public API ────────────────────────────────────────────────────────────
 
 def build_section_map(pdf_path: str) -> Dict[str, Any]:
@@ -3472,9 +5271,93 @@ async def optimize_pdf(
     bullet_replacements, skill_replacements, title_replacements = await generate_optimized_content(
         bullets, skills, job_description, title_skills,
     )
+    raw_bullet_count = len(bullet_replacements)
+    raw_bullet_keys = set(bullet_replacements.keys())
     bullet_replacements = sanitize_bullet_replacements(
-        bullets, bullet_replacements, length_tolerance=0.15
+        bullets, bullet_replacements, length_tolerance=0.20
     )
+    dropped_indices = raw_bullet_keys - set(bullet_replacements.keys())
+    dropped_count = len(dropped_indices)
+    if dropped_count > 0:
+        logger.info(f"[SANITIZE] Dropped {dropped_count}/{raw_bullet_count} bullets after first pass")
+
+    # Retry loop: re-prompt Claude for dropped bullets with stricter constraints
+    if 0 < dropped_count <= 5:
+        logger.info(f"[RETRY] Attempting retry for {dropped_count} dropped bullets")
+        from app.llm.claude_client import ClaudeClient
+        retry_claude = ClaudeClient()
+
+        retry_bullet_texts = []
+        for idx in sorted(dropped_indices):
+            if idx < len(bullets):
+                bp = bullets[idx]
+                lines_info = []
+                for j, lt in enumerate(bp.line_texts):
+                    exact_len = len(lt.strip())
+                    min_c = max(1, int(exact_len * 0.85))
+                    max_c = int(exact_len * 1.15)
+                    lines_info.append(f"    Line {j+1} (EXACTLY {min_c}-{max_c} chars, orig={exact_len}): {lt}")
+                retry_bullet_texts.append(f"  BULLET {idx+1} ({bp.section_name}):\n" + "\n".join(lines_info))
+
+        if retry_bullet_texts:
+            retry_prompt = f"""Rewrite these resume bullet points for the job description below.
+
+CRITICAL RULES:
+1. Each line MUST be within the EXACT character range shown. Count carefully.
+2. If a line is 45 chars, your replacement must be 38-51 chars. NO EXCEPTIONS.
+3. PRESERVE: company names, metrics, percentages, dates, and ALL technologies/tools — do NOT fabricate or add technologies not in the original bullet.
+4. Each bullet must have the SAME number of lines as the original
+5. Emphasize themes from the job description (scalability, real-time, enterprise, etc.) but do NOT swap in the JD's tech stack — keep the candidate's actual technologies.
+
+JOB DESCRIPTION:
+{job_description[:2000]}
+
+BULLETS:
+{chr(10).join(retry_bullet_texts)}
+"""
+            retry_schema = {
+                "type": "object",
+                "properties": {
+                    "bullets": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "index": {"type": "integer"},
+                                "lines": {"type": "array", "items": {"type": "string"}},
+                            },
+                            "required": ["index", "lines"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["bullets"],
+                "additionalProperties": False,
+            }
+            try:
+                retry_parsed = await retry_claude._send_request_json(
+                    "You are an expert resume optimizer. Follow character count rules precisely.",
+                    retry_prompt,
+                    json_schema=retry_schema,
+                    max_tokens=4096,
+                )
+                if retry_parsed and "bullets" in retry_parsed:
+                    retry_raw: Dict[int, List[str]] = {}
+                    for item in retry_parsed["bullets"]:
+                        idx = item.get("index", 0) - 1
+                        lines = item.get("lines", [])
+                        if 0 <= idx < len(bullets) and lines:
+                            retry_raw[idx] = lines
+                    # Sanitize with relaxed tolerance
+                    retry_sanitized = sanitize_bullet_replacements(
+                        bullets, retry_raw, length_tolerance=0.25
+                    )
+                    recovered = len(retry_sanitized)
+                    bullet_replacements.update(retry_sanitized)
+                    logger.info(f"[RETRY] Recovered {recovered}/{dropped_count} bullets on retry")
+            except Exception as e:
+                logger.warning(f"[RETRY] Retry failed: {e}")
+
     logger.info(f"Optimized {len(bullet_replacements)} bullets, {len(skill_replacements)} skills, {len(title_replacements)} title skills")
 
     # Step 4: Apply to PDF

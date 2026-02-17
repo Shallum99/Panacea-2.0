@@ -173,7 +173,7 @@ def analyze_pdf_structure(pdf_path: str) -> dict:
     return info
 
 
-def test_pdf_extraction(pdf_path: str) -> Tuple[int, int, int, int, int, List[str]]:
+def run_pdf_extraction(pdf_path: str) -> Tuple[int, int, int, int, int, List[str]]:
     """Test span extraction + classification on a PDF. Returns counts and errors."""
     errors = []
     try:
@@ -203,7 +203,7 @@ def test_pdf_extraction(pdf_path: str) -> Tuple[int, int, int, int, int, List[st
     return len(spans), len(lines), len(bullets), len(skills), len(title_skills), errors
 
 
-def test_content_stream_engine(pdf_path: str) -> PDFAnalysis:
+def run_content_stream_engine(pdf_path: str) -> PDFAnalysis:
     """Full content stream engine test on a single PDF."""
     filename = os.path.basename(pdf_path)
     file_size = os.path.getsize(pdf_path)
@@ -647,7 +647,7 @@ def run_all_tests(pdf_dir: str = None):
     for pdf_path in sorted(pdf_files):
         print(f"\nTesting: {os.path.basename(pdf_path)}...")
         try:
-            analysis = test_content_stream_engine(pdf_path)
+            analysis = run_content_stream_engine(pdf_path)
             results.append(analysis)
             print_analysis(analysis)
         except Exception as e:
