@@ -5,8 +5,14 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.config import settings
 
-# Create database engine
-engine = create_engine(settings.DATABASE_URL)
+# Create database engine with conservative pool for Supabase session mode
+engine = create_engine(
+    settings.DATABASE_URL,
+    pool_size=3,
+    max_overflow=2,
+    pool_pre_ping=True,
+    pool_recycle=300,
+)
 
 # Create session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
