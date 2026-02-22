@@ -138,6 +138,24 @@ def migrate_db():
             conn.execute(text(
                 "CREATE INDEX IF NOT EXISTS ix_chat_messages_conversation_id ON chat_messages (conversation_id)"
             ))
+            # Resume editor: form_map column
+            conn.execute(text("ALTER TABLE resumes ADD COLUMN IF NOT EXISTS form_map TEXT"))
+            # Resume versions table
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS resume_versions (
+                    id SERIAL PRIMARY KEY,
+                    resume_id INTEGER NOT NULL REFERENCES resumes(id) ON DELETE CASCADE,
+                    version_number INTEGER NOT NULL DEFAULT 1,
+                    file_path VARCHAR,
+                    storage_path VARCHAR,
+                    content TEXT,
+                    change_summary VARCHAR,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_resume_versions_resume_id ON resume_versions (resume_id)"
+            ))
             conn.commit()
             logger.info("DB migration: all columns + tables ensured")
     except Exception as e:
