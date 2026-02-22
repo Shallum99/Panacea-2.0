@@ -337,3 +337,12 @@ Return a valid JSON object with the fields above. Use null for any field not fou
         except Exception as e:
             logger.error(f"Error generating message: {str(e)}")
             return "I apologize, but I encountered an issue generating your message. Please try again or adjust your inputs."
+
+
+# ── Provider swap ──────────────────────────────────────────────────────────
+# When LLM_PROVIDER=gemini, replace ClaudeClient with GeminiClient so every
+# `from app.llm.claude_client import ClaudeClient` gets Gemini automatically.
+_provider = os.environ.get("LLM_PROVIDER", "anthropic").lower()
+if _provider == "gemini":
+    from app.llm.gemini_client import GeminiClient as ClaudeClient  # noqa: F811
+    logger.info("LLM_PROVIDER=gemini — using GeminiClient as ClaudeClient")

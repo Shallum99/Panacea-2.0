@@ -519,11 +519,15 @@ class TestSanitizeBullets:
         if 0 in result:
             assert len(result[0][0]) <= int(5 * 1.30) + 1
 
-    def test_line_count_mismatch_dropped(self):
+    def test_line_count_mismatch_redistributed(self):
         bp = self._make_bullet(["Line one", "Line two"])
-        reps = {0: ["Only one line"]}  # 2 orig lines, 1 new
+        reps = {0: ["Only one line"]}  # 2 orig lines, 1 new → redistributed to 2 lines
         result = sanitize_bullet_replacements([bp], reps, length_tolerance=0.30)
-        assert 0 not in result
+        # New behavior: redistribute text across original line count
+        assert 0 in result
+        assert len(result[0]) == 2  # Still 2 lines after redistribution
+        full_text = " ".join(result[0])
+        assert "Only" in full_text and "line" in full_text
 
     def test_empty_line_dropped(self):
         bp = self._make_bullet(["Line one"])

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { Download, ArrowRight, Loader2 } from "lucide-react";
+import { Download, ArrowRight, Loader2, ShieldCheck } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 
 interface TailorData {
@@ -13,6 +13,7 @@ interface TailorData {
   changes?: Array<{ section: string; type: string; original: string; optimized: string }>;
   ats_score_before?: number;
   ats_score_after?: number;
+  font_coverage_pct?: number;
 }
 
 interface Props {
@@ -175,6 +176,16 @@ export default function InlineResumeViewer({ data }: Props) {
                   (+{scoreDelta})
                 </span>
               )}
+            </div>
+          )}
+
+          {/* Font coverage */}
+          {data.font_coverage_pct != null && (
+            <div className="flex items-center gap-1.5 text-[11px]">
+              <ShieldCheck size={11} className={data.font_coverage_pct >= 80 ? "text-[#50e3c2]" : "text-[#f5a623]"} />
+              <span className={data.font_coverage_pct >= 80 ? "text-[#50e3c2]" : "text-[#f5a623]"}>
+                {Math.round(data.font_coverage_pct)}%
+              </span>
             </div>
           )}
 

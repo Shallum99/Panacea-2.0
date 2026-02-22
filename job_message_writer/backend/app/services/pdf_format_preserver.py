@@ -143,20 +143,292 @@ class TitleSkillLine:
     full_text: str                 # "Software Engineer (React, Node, AWS)"
 
 
+def _redistribute_text(text: str, target_line_count: int, orig_char_counts: List[int]) -> List[str]:
+    """Split text into target_line_count lines, distributing words proportionally
+    to match original char counts per line."""
+    words = text.split()
+    if not words or target_line_count <= 0:
+        return [text]
+    if target_line_count == 1:
+        return [text]
+
+    total_orig = sum(orig_char_counts) or 1
+    # Target chars per line based on original proportions
+    targets = [max(1, int(c / total_orig * len(text))) for c in orig_char_counts]
+
+    result_lines: List[str] = []
+    word_idx = 0
+    for line_i in range(target_line_count):
+        if line_i == target_line_count - 1:
+            # Last line gets remaining words
+            result_lines.append(" ".join(words[word_idx:]))
+            break
+        target_len = targets[line_i]
+        line_words: List[str] = []
+        current_len = 0
+        while word_idx < len(words):
+            w = words[word_idx]
+            new_len = current_len + len(w) + (1 if line_words else 0)
+            if line_words and new_len > target_len:
+                break
+            line_words.append(w)
+            current_len = new_len
+            word_idx += 1
+        result_lines.append(" ".join(line_words) if line_words else "")
+
+    # Fill any empty trailing lines (shouldn't happen but safety)
+    while len(result_lines) < target_line_count:
+        result_lines.append("")
+
+    return result_lines
+
+
+# ─── Smart truncation utilities ─────────────────────────────────────────────
+
+# ── POS-based incomplete-ending detection ──
+#
+# Instead of maintaining huge word lists (fragile, always misses edge cases),
+# use NLTK POS tagging to determine if the last word is a valid sentence ending.
+#
+# TWO-TIER system:
+#   strict=False (trim path): Only checks a tiny set of ~25 unambiguous function
+#     words (articles, prepositions, conjunctions).  NO POS tagging overhead.
+#     Must be conservative — the trimmer needs valid stopping points.
+#   strict=True (quality gate): Full POS-based analysis.  Catches adjectives,
+#     adverbs, dangling gerunds, incomplete noun phrases.  False positives OK
+#     because the consequence is just an LLM re-prompt.
+
+import nltk as _nltk
+
+_NLTK_POS_READY = False
+
+def _ensure_nltk_pos():
+    """Download POS tagger data on first use (fast, cached after first call)."""
+    global _NLTK_POS_READY
+    if _NLTK_POS_READY:
+        return
+    try:
+        _nltk.data.find('taggers/averaged_perceptron_tagger_eng')
+    except LookupError:
+        _nltk.download('averaged_perceptron_tagger_eng', quiet=True)
+    try:
+        _nltk.data.find('taggers/averaged_perceptron_tagger')
+    except LookupError:
+        _nltk.download('averaged_perceptron_tagger', quiet=True)
+    _NLTK_POS_READY = True
+
+# Tiny set of UNAMBIGUOUS function words — these NEVER end a valid sentence.
+# Used by strict=False (trim path) where we need speed and zero false positives.
+_FUNCTION_WORDS = frozenset({
+    # Articles
+    'a', 'an', 'the',
+    # Prepositions
+    'to', 'for', 'by', 'at', 'in', 'on', 'with', 'from', 'of', 'as',
+    'into', 'onto', 'through', 'across', 'during', 'before', 'after',
+    'between', 'among', 'over', 'under', 'within', 'without', 'upon',
+    'against', 'about', 'toward', 'along', 'above', 'below', 'near',
+    # Conjunctions
+    'and', 'or', 'but', 'nor', 'yet', 'so', 'both', 'either', 'neither',
+    # Subordinators / relative
+    'that', 'which', 'who', 'whom', 'whose', 'where', 'when',
+    'while', 'although', 'because', 'since', 'unless', 'until', 'if',
+    # Determiners
+    'this', 'these', 'those', 'such', 'each', 'every',
+    'some', 'any', 'all', 'no', 'more', 'most', 'several',
+})
+
+# Backward-compat aliases (some code references these directly)
+_TRIM_DANGLING_WORDS = _FUNCTION_WORDS
+_DANGLING_WORDS = _FUNCTION_WORDS
+
+
+def _has_incomplete_ending(text: str, strict: bool = True) -> bool:
+    """Check if text ends with an incomplete thought.
+
+    strict=False → fast path: only checks unambiguous function words.
+                   Used by _trim_text_to_fit where speed matters and
+                   we need valid stopping points.
+    strict=True  → full POS-based analysis using NLTK.  Catches
+                   adjectives, adverbs, dangling gerunds, incomplete
+                   noun phrases like "an automated seller whitelisting".
+                   Used by quality gate / re-prompt decisions.
+    """
+    clean = text.rstrip(' ,;:.!?')
+    if not clean:
+        return True
+
+    words = clean.split()
+    if len(words) < 2:
+        return True
+
+    last = words[-1].lower()
+
+    # ── Quick short-circuits (no POS needed) ──
+
+    # Ends with number/metric → always complete
+    if re.match(r'^[\d,.]+%?$', last.rstrip('.')):
+        return False
+
+    # Unambiguous function words → always incomplete
+    if last in _FUNCTION_WORDS:
+        return True
+
+    # ── strict=False stops here (fast path for trimmer) ──
+    if not strict:
+        return False
+
+    # ── strict=True: full POS-based analysis ──
+    _ensure_nltk_pos()
+
+    # POS tag last 8 words for sentence context
+    context = words[-8:] if len(words) > 8 else words
+    try:
+        tagged = _nltk.pos_tag(context)
+    except Exception:
+        # NLTK failed — fall back to function-word check only
+        return False
+
+    last_tag = tagged[-1][1]
+
+    # Tags that ALWAYS indicate incomplete ending
+    # DT=determiner, IN=preposition, CC=conjunction, TO=to-infinitive
+    # RB/RBR/RBS=adverb, WDT/WP/WRB=wh-words, PDT=predeterminer, EX=existential
+    if last_tag in ('DT', 'IN', 'CC', 'TO', 'RB', 'RBR', 'RBS',
+                     'WDT', 'WP', 'WRB', 'PDT', 'EX'):
+        return True
+
+    # Adjectives — incomplete in resume context (need a following noun)
+    # JJ="fast-paced", "manual", "deep", "critical"
+    # JJR="better", JJS="best" — comparative/superlative always need a noun
+    if last_tag in ('JJ', 'JJR', 'JJS'):
+        return True
+
+    # Gerunds (VBG) at end of multi-word text → usually dangling
+    # "...and reducing", "...by improving", "...successfully cutting"
+    # Exception: VBG after a proper noun (NNP) is likely a compound noun
+    # e.g. "Salesforce logging", "Jenkins scripting", "Kafka streaming"
+    if last_tag == 'VBG' and len(words) > 2:
+        if len(tagged) >= 2 and tagged[-2][1] in ('NNP', 'NNPS'):
+            pass  # Compound noun — "Salesforce logging" is complete
+        else:
+            return True
+
+    # Base verbs without objects → incomplete
+    # "...to solve", "...and reduce", "...to optimize"
+    if last_tag in ('VB', 'VBP') and len(words) >= 2:
+        return True
+
+    # ── Supplementary: incomplete noun phrases ending in -ing ──
+    # POS tagger marks "whitelisting" as NN, but in context like
+    # "an automated seller whitelisting" it's a modifier missing its head noun.
+    # Detect: DT + 2+ modifiers + NN-ending-in-ing → incomplete NP
+    if (last_tag in ('NN', 'NNS') and last.endswith('ing')
+            and len(last) > 4 and len(tagged) >= 3):
+        for i in range(len(tagged) - 2, max(0, len(tagged) - 6) - 1, -1):
+            if tagged[i][1] == 'DT':
+                between = tagged[i + 1:-1]
+                if len(between) >= 2 and all(
+                    t[1] in ('JJ', 'VBN', 'NN', 'NNS', 'NNP')
+                    for t in between
+                ):
+                    return True
+                break
+
+    return False
+
+
+def _has_joined_sentences(text: str) -> bool:
+    """Detect two sentences jammed together without proper punctuation.
+
+    Looks for patterns like "recommendations This strategic" where a lowercase
+    word is followed by a capitalized word mid-sentence (not a proper noun/acronym).
+    """
+    # Pattern: lowercase letter + space + uppercase letter followed by lowercase
+    # This catches "recommendations This strategic" but not "using Docker and"
+    matches = re.findall(r'[a-z]\s+([A-Z][a-z]{2,})', text)
+    if not matches:
+        return False
+    # Filter out common proper nouns / tech names that appear mid-sentence
+    _PROPER_NOUNS = frozenset({
+        'Java', 'Python', 'Docker', 'Kubernetes', 'Jenkins', 'React',
+        'Angular', 'Redux', 'Spring', 'Django', 'Flask', 'Node',
+        'Linux', 'Windows', 'Azure', 'Google', 'Amazon', 'Oracle',
+        'Kafka', 'Redis', 'Mongo', 'Postgres', 'MySQL', 'Jira',
+        'Github', 'Bitbucket', 'Terraform', 'Ansible', 'Datadog',
+        'Splunk', 'Grafana', 'Elasticsearch', 'Dynatrace',
+        'English', 'Hindi', 'Spanish', 'French', 'German',
+    })
+    for match in matches:
+        if match not in _PROPER_NOUNS:
+            return True
+    return False
+
+
+def _bullet_similarity(text_a: str, text_b: str) -> float:
+    """Compute word-level Jaccard similarity between two bullet texts."""
+    words_a = set(text_a.lower().split())
+    words_b = set(text_b.lower().split())
+    if not words_a or not words_b:
+        return 0.0
+    intersection = words_a & words_b
+    union = words_a | words_b
+    return len(intersection) / len(union) if union else 0.0
+
+
+def _smart_truncate(text: str, max_chars: int) -> str:
+    """Truncate text at semantic boundaries, never leaving dangling words.
+
+    Strategy:
+      1. Try clause boundary (period / semicolon / comma) within budget
+      2. Fall back to word boundary with dangling-word removal
+    """
+    if len(text) <= max_chars:
+        return text
+
+    truncated = text[:max_chars]
+
+    # Strategy 1: clause boundary
+    for delim in ['. ', '; ', ', ']:
+        idx = truncated.rfind(delim)
+        if idx > max_chars // 3:
+            candidate = truncated[:idx].strip()
+            if len(candidate.split()) >= 4:
+                return candidate
+
+    # Strategy 2: word boundary + incomplete-ending cleanup
+    last_space = truncated.rfind(' ')
+    if last_space > 0:
+        truncated = truncated[:last_space]
+
+    words = truncated.split()
+    while len(words) > 3 and _has_incomplete_ending(' '.join(words), strict=False):
+        words.pop()
+
+    result = ' '.join(words).rstrip(' ,;:')
+
+    # Close unclosed parentheses
+    open_p = result.count('(') - result.count(')')
+    if open_p > 0:
+        result += ')' * open_p
+
+    return result
+
+
 def sanitize_bullet_replacements(
     bullets: List[BulletPoint],
     bullet_replacements: Dict[int, List[str]],
     length_tolerance: float = 0.20,
+    bullet_budgets: Optional[Dict[int, Dict]] = None,
 ) -> Dict[int, List[str]]:
     """
     Keep only bullet replacements that preserve shape closely enough for safe PDF reflow.
 
     Rules enforced:
     - replacement index must exist
-    - same number of lines as original bullet
+    - line count mismatches are auto-fixed by redistributing text
     - no empty replacement lines
-    - each replacement line length within tolerance of original line length
-    - lines that are too long get smart-truncated at word boundary instead of dropping the entire bullet
+    - lines that are too long get smart-truncated at word boundary
+    - Tc character spacing handles shorter text, so no min-length rejection
     """
     sanitized: Dict[int, List[str]] = {}
 
@@ -168,63 +440,62 @@ def sanitize_bullet_replacements(
         original_lines = bullets[idx].line_texts
         normalized = [line.strip() for line in lines]
 
+        # Strip leading bullet characters that Claude may have included —
+        # the PDF already has the bullet marker as a separate span/inline char.
+        _STRIP_BULLETS = ("•", "●", "◦", "○", "■", "▪", "·", "▸", "▹", "–", "—")
+        cleaned = []
+        for line in normalized:
+            for bc in _STRIP_BULLETS:
+                if line.startswith(bc + " ") or line.startswith(bc + "\t"):
+                    line = line[len(bc):].strip()
+                    break
+                if line.startswith(bc) and len(line) > len(bc):
+                    line = line[len(bc):].strip()
+                    break
+            cleaned.append(line)
+        normalized = cleaned
+
+        # Auto-fix line count mismatch by redistributing text
         if len(normalized) != len(original_lines):
-            logger.warning(
+            full_text = " ".join(n for n in normalized if n)
+            orig_char_counts = [len(l.strip()) for l in original_lines]
+            logger.info(
                 f"[SANITIZE] Bullet {idx}: line count mismatch "
-                f"(orig={len(original_lines)}, new={len(normalized)}), dropping"
+                f"(orig={len(original_lines)}, new={len(normalized)}), redistributing"
             )
-            continue
+            normalized = _redistribute_text(full_text, len(original_lines), orig_char_counts)
 
         if any(not line for line in normalized):
             logger.warning(f"[SANITIZE] Bullet {idx}: empty replacement line, dropping")
             continue
 
-        # Smart truncation: if a line is too long, truncate at word boundary
-        # instead of dropping the entire bullet.
-        fixed_lines = []
-        bullet_ok = True
-        for line_idx, (orig, new) in enumerate(zip(original_lines, normalized)):
-            orig_len = len(orig.strip())
-            if orig_len == 0:
-                fixed_lines.append(new)
-                continue
-            new_len = len(new)
-            max_len = int(orig_len * (1 + length_tolerance))
-            min_len = int(orig_len * (1 - length_tolerance))
+        # Total-length check: compare combined text length (not per-line).
+        # The PDF engine joins all lines and re-wraps, so per-line length
+        # doesn't matter — only total content length.
+        #
+        # Use pixel-based budget if available — it's much larger than
+        # orig_total for bullets where the continuation line is short in the
+        # original (e.g., "and reducing API latency by 40%." is only 32 chars
+        # but the pixel budget allows ~98 chars on that line).
+        orig_total = sum(len(l.strip()) for l in original_lines)
+        new_total = sum(len(n) for n in normalized)
+        if bullet_budgets and idx in bullet_budgets:
+            # Use pixel budget — the PDF engine can handle this much text.
+            # Add 20% tolerance since pixel budget is an approximation.
+            max_total = int(bullet_budgets[idx]["total"] * 1.2)
+        else:
+            max_total = int(orig_total * (1 + length_tolerance))
 
-            if new_len > max_len:
-                # Smart truncate at word boundary
-                truncated = new[:max_len]
-                # Find last space to break at word boundary
-                last_space = truncated.rfind(" ")
-                if last_space > min_len:
-                    truncated = truncated[:last_space]
-                # Remove trailing punctuation artifacts
-                truncated = truncated.rstrip(" ,;:")
-                if len(truncated) < min_len:
-                    logger.warning(
-                        f"[SANITIZE] Bullet {idx} line {line_idx}: too long ({new_len} chars) "
-                        f"and truncation below min ({len(truncated)} < {min_len}), dropping bullet"
-                    )
-                    bullet_ok = False
-                    break
-                logger.debug(
-                    f"[SANITIZE] Bullet {idx} line {line_idx}: truncated {new_len} → {len(truncated)} chars"
-                )
-                fixed_lines.append(truncated)
-            elif new_len < min_len:
-                logger.warning(
-                    f"[SANITIZE] Bullet {idx} line {line_idx}: too short ({new_len} < {min_len}), dropping bullet"
-                )
-                bullet_ok = False
-                break
-            else:
-                fixed_lines.append(new)
+        if new_total > max_total:
+            full_text = " ".join(normalized)
+            full_text = _smart_truncate(full_text, max_total)
+            orig_char_counts = [len(l.strip()) for l in original_lines]
+            normalized = _redistribute_text(full_text, len(original_lines), orig_char_counts)
+            logger.debug(
+                f"[SANITIZE] Bullet {idx}: total truncated {new_total} → {len(full_text)} chars"
+            )
 
-        if not bullet_ok:
-            continue
-
-        sanitized[idx] = fixed_lines
+        sanitized[idx] = normalized
 
     return sanitized
 
@@ -790,6 +1061,73 @@ def group_bullet_points(
     return bullets, skills, title_skills
 
 
+# ─── Pixel-based character budget computation ────────────────────────────
+
+def _compute_bullet_char_budgets(
+    bullets: List[BulletPoint],
+    classified_lines: List[ClassifiedLine],
+) -> Dict[int, Dict]:
+    """Compute smart character budgets per bullet based on available pixel space.
+
+    Uses span bounding boxes to estimate how many characters fit on each line
+    up to the right margin, instead of relying on original text length.
+
+    Returns {bullet_idx: {"total": int, "per_line": [int, ...]}}
+    """
+    # Compute per-page right margin from all classified lines
+    page_margins: Dict[int, float] = {}
+    for cl in classified_lines:
+        pn = cl.page_num
+        for s in cl.spans:
+            if s.text.strip():
+                page_margins.setdefault(pn, 0.0)
+                page_margins[pn] = max(page_margins[pn], s.bbox[2])
+
+    budgets: Dict[int, Dict] = {}
+
+    for bp_idx, bp in enumerate(bullets):
+        per_line: List[int] = []
+
+        for tl in bp.text_lines:
+            # Get text spans (excluding bullet markers and ZWS)
+            text_spans = [s for s in tl.spans
+                          if not s.is_bullet_char and not s.is_zwsp_only
+                          and s.text.strip()]
+
+            if not text_spans:
+                # Fallback: use original text length
+                per_line.append(len(tl.clean_text))
+                continue
+
+            # x0 = left edge of first text span
+            x0 = text_spans[0].bbox[0]
+            # Right margin for this page
+            right_margin = page_margins.get(tl.page_num, 580.0)
+
+            available_width_pts = max(0, right_margin - x0)
+
+            # Compute average character width from this line's spans
+            total_text_width = sum(s.bbox[2] - s.bbox[0] for s in text_spans)
+            total_chars = sum(len(s.text) for s in text_spans)
+
+            if total_chars > 0 and total_text_width > 0:
+                avg_char_w = total_text_width / total_chars
+                char_budget = int(available_width_pts / avg_char_w)
+            else:
+                char_budget = len(tl.clean_text)
+
+            # Ensure budget is at least the original text length
+            char_budget = max(char_budget, len(tl.clean_text))
+            per_line.append(char_budget)
+
+        budgets[bp_idx] = {
+            "total": sum(per_line),
+            "per_line": per_line,
+        }
+
+    return budgets
+
+
 # ─── Step 5: Claude optimization ──────────────────────────────────────────
 
 async def generate_optimized_content(
@@ -797,6 +1135,7 @@ async def generate_optimized_content(
     skills: List[SkillLine],
     job_description: str,
     title_skills: Optional[List[TitleSkillLine]] = None,
+    bullet_budgets: Optional[Dict[int, Dict]] = None,
 ) -> Tuple[Dict[int, List[str]], Dict[int, str], Dict[int, str]]:
     """
     Send bullet points, skills, and title tech stacks to Claude for optimization.
@@ -829,21 +1168,39 @@ async def generate_optimized_content(
                 continue
             lines_info = []
             for j, lt in enumerate(bp.line_texts):
-                orig_len = len(lt.strip())
-                min_chars = max(1, int(orig_len * 0.80))
-                max_chars = int(orig_len * 1.20)
-                lines_info.append(f"    Line {j+1} (MUST be {min_chars}-{max_chars} chars): {lt}")
-            bullet_texts.append(f"  BULLET {i+1} ({bp.section_name}):\n" + "\n".join(lines_info))
+                lines_info.append(f"    Line {j+1}: {lt}")
+
+            # Compute total character budget from pixel-based budgets.
+            # chars ≠ pixels: proportional fonts have variable char widths,
+            # so the avg_char_w estimate has ~8-15% error.  A 0.92x safety
+            # factor prevents most pixel overflows while keeping fill high.
+            # A slightly short bullet (small whitespace gap) is far better
+            # than a long one that gets trimmed into a broken sentence.
+            if bullet_budgets and i in bullet_budgets:
+                total_budget = bullet_budgets[i]["total"]
+                min_total = int(total_budget * 0.80)
+                max_total = int(total_budget * 0.92)  # 8% safety for char→pixel noise
+            else:
+                # Fallback: sum of original line lengths
+                total_chars = sum(len(lt.strip()) for lt in bp.line_texts)
+                min_total = max(20, int(total_chars * 0.80))
+                max_total = int(total_chars * 0.92)
+
+            bullet_texts.append(
+                f"  BULLET {i+1} ({bp.section_name}) "
+                f"[{len(bp.line_texts)} lines, total {min_total}-{max_total} chars]:\n"
+                + "\n".join(lines_info)
+            )
 
         if not bullet_texts:
             return replacements
 
         sys_prompt = (
-            "You are an expert resume optimizer. You tailor resume bullet points to match "
-            "specific job descriptions by incorporating relevant keywords, rephrasing to "
-            "emphasize relevant experience, and using terminology from the job posting. "
-            "You must make REAL, MEANINGFUL changes that make the resume clearly targeted "
-            "to the specific job."
+            "You are an expert resume optimizer specializing in ATS-optimized, metric-driven tailoring. "
+            "You tailor resume bullet points to match specific job descriptions by incorporating relevant "
+            "keywords, rephrasing to emphasize relevant experience, and using terminology from the job posting. "
+            "Every bullet must be a COMPLETE, MEANINGFUL statement — never leave fragments or dangling phrases. "
+            "You must make REAL, MEANINGFUL changes that make the resume clearly targeted to the specific job."
         )
 
         async def _process_bullet_batch(batch_texts: List[str], batch_max_tokens: int) -> Dict[int, List[str]]:
@@ -857,9 +1214,25 @@ RULES:
 3. PRESERVE: company names, metrics, percentages, dates, and all factual claims — do NOT fabricate
 4. NEVER add technologies, tools, frameworks, or platforms that are NOT already mentioned in the bullet. You may rephrase existing tech to match JD terminology (e.g., "AWS Lambda" → "serverless Lambda functions"), but NEVER introduce completely new technologies the candidate didn't use. If the JD asks for "Node.js" but the bullet mentions "Python/Django", keep "Python/Django" — do NOT swap it for Node.js.
 5. Each bullet must have EXACTLY the same number of lines as the original
-6. CRITICAL: Each line MUST stay within the character range shown (min-max). Going over the max will cause the bullet to be REJECTED. Trim words if needed to stay in range.
-7. Every bullet MUST be modified — do not return any bullet unchanged
-8. Focus on transferable themes: if the JD emphasizes "backend scalability" and the bullet describes building scalable services (in any tech), emphasize the scalability angle — do NOT change the tech stack
+6. CHARACTER BUDGET: Total characters across ALL lines must be within [min-max]. Write a COMPLETE sentence that fits within the budget. A shorter complete sentence is ALWAYS better than a longer fragment. If your sentence exceeds the max, SHORTEN IT — do not leave it incomplete. The PDF engine joins all lines and re-wraps, so per-line length doesn't matter — only the TOTAL.
+7. SEMANTIC COMPLETENESS — THE MOST IMPORTANT RULE:
+   - Each bullet (ALL lines combined) must be exactly ONE complete, grammatically correct sentence
+   - NEVER write two separate thoughts in one bullet. BAD: "...product recommendations This strategic enhancement improved the user" — this is TWO sentences jammed together
+   - The LAST LINE is especially critical — it must complete the thought, not trail off
+   - NEVER end with: a preposition (to, for, by, with, from, across, through), conjunction (and, or), article (a, an, the), adjective without a noun (critical, robust, secure, seamless, scalable, efficient, fast-paced), adverb (highly, efficiently, effectively), or a transitive verb without its object (solve, reduce, improve, enhance, create, develop, address, prevent)
+   - BAD: "...optimizing 60% of data flow through efficient Jenkins" (Jenkins WHAT?)
+   - BAD: "...system rollbacks, eliminating critical" (critical WHAT?)
+   - BAD: "...to reduce downtime and solve" (solve WHAT?)
+   - BAD: "...to support fast-paced" (fast-paced WHAT?)
+   - GOOD: "...optimizing 60% of data flow through efficient Jenkins CI/CD pipelines"
+   - GOOD: "...system rollbacks, eliminating critical downtime risks"
+   - GOOD: "...to reduce downtime and solve production issues"
+   - GOOD: "...to support fast-paced development cycles"
+   - End every bullet with a CONCRETE NOUN, METRIC, or DELIVERABLE
+8. NO DUPLICATE CONTENT: Each bullet must describe a DIFFERENT accomplishment. Never repeat the same action, tool, or outcome across multiple bullets. If two original bullets are similar, differentiate them by emphasizing different aspects.
+9. Every bullet MUST be modified — do not return any bullet unchanged
+10. NEVER include bullet point characters (•, ●, ◦, ■, -, –, —) at the start of your text. The PDF already has bullet markers. Return ONLY the text content.
+11. Focus on transferable themes: if the JD emphasizes "backend scalability" and the bullet describes building scalable services (in any tech), emphasize the scalability angle — do NOT change the tech stack
 
 JOB DESCRIPTION:
 {job_description[:3000]}
@@ -901,6 +1274,23 @@ IMPORTANT: Tailor by emphasizing RELEVANT THEMES from the JD (scalability, real-
                         idx = item.get("index", 0) - 1  # Original 0-based index
                         lines = item.get("lines", [])
                         if 0 <= idx < len(bullets) and lines:
+                            # Validate semantic completeness: combined text
+                            # must not end with an incomplete thought
+                            combined = " ".join(l.strip() for l in lines if l.strip())
+                            if _has_incomplete_ending(combined, strict=False):
+                                last_word = combined.rstrip(" ,;:.").split()[-1].lower() if combined.strip() else ""
+                                logger.warning(
+                                    f"[BULLET OPT] Bullet {idx+1} has incomplete ending "
+                                    f"'{last_word}': ...{combined[-60:]}"
+                                )
+                                # Trim incomplete ending words (conservative set only)
+                                words = combined.rstrip(" ,;:.").split()
+                                while len(words) > 3 and _has_incomplete_ending(' '.join(words), strict=False):
+                                    words.pop()
+                                combined = " ".join(words)
+                                # Redistribute back to original line count
+                                orig_counts = [len(l.strip()) for l in bullets[idx].line_texts]
+                                lines = _redistribute_text(combined, len(orig_counts), orig_counts)
                             batch_result[idx] = lines
             except Exception as e:
                 logger.error(f"Failed to optimize bullet batch: {e}", exc_info=True)
@@ -917,8 +1307,9 @@ IMPORTANT: Tailor by emphasizing RELEVANT THEMES from the JD (scalability, real-
                 bullet_texts[i:i + BULLET_BATCH_SIZE]
                 for i in range(0, len(bullet_texts), BULLET_BATCH_SIZE)
             ]
-            # Scale max_tokens per batch proportionally
-            tokens_per_batch = max(4096, 8192 // len(batches) * 2)
+            # Each bullet can produce ~300 tokens of JSON output; generous buffer
+            # prevents mid-JSON truncation that loses entire batches.
+            tokens_per_batch = 8192
             logger.info(f"[BULLET OPT] Splitting {len(bullet_texts)} bullets into {len(batches)} parallel batches")
 
             batch_results = await asyncio.gather(
@@ -927,6 +1318,212 @@ IMPORTANT: Tailor by emphasizing RELEVANT THEMES from the JD (scalability, real-
             for batch_result in batch_results:
                 replacements.update(batch_result)
             logger.info(f"[BULLET OPT] Parsed {len(replacements)} bullet replacements from {len(batches)} batches")
+
+        # ── LLM-based quality gate: intelligent semantic validation ──
+        # Instead of regex/word-set heuristics, use a fast LLM call to check
+        # each bullet for completeness, coherence, grammar, and uniqueness.
+        # This catches issues like "improved the user" (semantically incomplete
+        # even though "user" is a valid noun) that heuristics miss.
+        all_combined = {}
+        for idx, lines in replacements.items():
+            all_combined[idx] = " ".join(l.strip() for l in lines if l.strip())
+
+        incomplete_idxs: Dict[int, str] = {}
+
+        if all_combined:
+            # Build validation prompt
+            bullet_list = []
+            for idx in sorted(all_combined.keys()):
+                bullet_list.append(f"  {idx+1}. {all_combined[idx]}")
+
+            validate_sys = (
+                "You are a strict resume quality checker. You ONLY flag bullets that are BROKEN — "
+                "do not flag bullets that are merely imperfect or could be worded better. "
+                "A bullet passes if it is a complete, grammatically correct sentence that makes sense on its own."
+            )
+            validate_usr = f"""Check each resume bullet for quality issues. Flag ONLY bullets that are BROKEN.
+
+CHECK FOR:
+1. INCOMPLETE: Sentence trails off — ends with an adjective needing a noun ("fast-paced", "high-quality", "critical"), a preposition ("to", "for", "with"), a conjunction ("and", "or"), a verb missing its object ("solve", "reduce", "improve the user"), or any fragment that leaves the reader asking "...what?"
+2. INCOHERENT: Two separate sentences jammed together without proper punctuation or transition. Look for abrupt topic changes or capitalized words mid-sentence that start a new thought.
+3. DUPLICATE: Two or more bullets describe essentially the same accomplishment with very similar wording.
+4. NONSENSICAL: Text that doesn't make grammatical sense or has garbled wording.
+
+A bullet PASSES if it is ONE complete sentence that makes full sense. Minor stylistic imperfections are NOT failures.
+
+BULLETS:
+{chr(10).join(bullet_list)}
+
+Return the indices (1-based) of ONLY the bullets that FAIL, with the specific issue. Return empty array if all pass."""
+
+            validate_schema = {
+                "type": "object",
+                "properties": {
+                    "failed_bullets": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "index": {"type": "integer"},
+                                "issue": {"type": "string", "enum": ["INCOMPLETE", "INCOHERENT", "DUPLICATE", "NONSENSICAL"]},
+                                "explanation": {"type": "string"},
+                            },
+                            "required": ["index", "issue", "explanation"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["failed_bullets"],
+                "additionalProperties": False,
+            }
+
+            try:
+                validate_result = await claude._send_request_json(
+                    validate_sys, validate_usr,
+                    json_schema=validate_schema,
+                    max_tokens=2048,
+                    model=claude.fast_model,
+                )
+                if validate_result and "failed_bullets" in validate_result:
+                    for item in validate_result["failed_bullets"]:
+                        vidx = item.get("index", 0) - 1  # Convert to 0-based
+                        issue = item.get("issue", "UNKNOWN")
+                        explanation = item.get("explanation", "")
+                        if vidx in all_combined:
+                            incomplete_idxs[vidx] = all_combined[vidx]
+                            logger.info(
+                                f"[BULLET QA] Bullet {vidx+1} FAILED ({issue}): {explanation}"
+                            )
+                    logger.info(
+                        f"[BULLET QA] LLM validation: {len(incomplete_idxs)}/{len(all_combined)} "
+                        f"bullets flagged for re-prompt"
+                    )
+            except Exception as e:
+                logger.warning(f"[BULLET QA] LLM validation failed, falling back to heuristics: {e}")
+
+            # ALWAYS run heuristic checks as supplement (not just fallback).
+            # The LLM quality gate can miss obvious issues like joined
+            # sentences ("...scripts. This critical initiative...") or
+            # incomplete endings that heuristics catch reliably.
+            for idx, combined in all_combined.items():
+                if idx in incomplete_idxs:
+                    continue  # Already flagged
+                if _has_incomplete_ending(combined):
+                    incomplete_idxs[idx] = combined
+                    logger.info(f"[BULLET QA] Bullet {idx+1} flagged by heuristic: incomplete ending")
+                elif _has_joined_sentences(combined):
+                    incomplete_idxs[idx] = combined
+                    logger.info(f"[BULLET QA] Bullet {idx+1} flagged by heuristic: joined sentences")
+
+            # Also check for near-duplicate bullets (heuristic supplement)
+            sorted_idxs = sorted(all_combined.keys())
+            for i in range(len(sorted_idxs)):
+                for j in range(i + 1, len(sorted_idxs)):
+                    idx_a, idx_b = sorted_idxs[i], sorted_idxs[j]
+                    sim = _bullet_similarity(all_combined[idx_a], all_combined[idx_b])
+                    if sim > 0.55:
+                        if idx_b not in incomplete_idxs:
+                            incomplete_idxs[idx_b] = all_combined[idx_b]
+                            logger.info(
+                                f"[BULLET QA] Bullet {idx_b+1} flagged: "
+                                f"near-duplicate of bullet {idx_a+1} (sim={sim:.2f})"
+                            )
+
+        if incomplete_idxs:
+            logger.info(
+                f"[BULLET QA] {len(incomplete_idxs)} bullets need fixing, re-prompting"
+            )
+            retry_texts = []
+            for idx, text in incomplete_idxs.items():
+                bp = bullets[idx]
+                if bullet_budgets and idx in bullet_budgets:
+                    tight_budget = int(bullet_budgets[idx]["total"] * 0.90)
+                else:
+                    tight_budget = int(len(text) * 0.85)
+
+                retry_texts.append(
+                    f"  BULLET {idx+1} ({bp.section_name}) "
+                    f"[{len(bp.line_texts)} lines, max {tight_budget} chars]:\n"
+                    f"    CURRENT: {text}\n"
+                    f"    REWRITE as ONE complete sentence in ≤{tight_budget} chars."
+                )
+
+            retry_sys = (
+                "You are a resume editor. These bullet points have quality issues — "
+                "some are incomplete, some are incoherent, some are duplicates. "
+                "Rewrite each as a SINGLE, COMPLETE, self-contained sentence that ends with "
+                "a concrete noun, metric, or deliverable — NEVER an adjective, adverb, or preposition. "
+                "Each bullet must express exactly ONE clear idea."
+            )
+            retry_usr = f"""Fix these resume bullets.
+
+RULES:
+- Every bullet must be exactly ONE complete sentence ending with a concrete noun, metric, or outcome
+- NEVER end with an adjective ("fast-paced", "high-quality"), adverb ("efficiently"), preposition ("to", "with"), or dangling verb ("solve", "reduce", "improve")
+- Keep the same meaning, metrics, and facts — just make it a COMPLETE, COHERENT sentence
+- Stay within the character budget shown
+- Do NOT add technologies not already mentioned
+- Each bullet must have EXACTLY the number of lines shown
+- If a bullet is similar to another, rewrite to emphasize a DIFFERENT aspect
+
+{chr(10).join(retry_texts)}
+
+JOB DESCRIPTION (for context):
+{job_description[:1500]}"""
+
+            try:
+                retry_schema = {
+                    "type": "object",
+                    "properties": {
+                        "bullets": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "index": {"type": "integer"},
+                                    "lines": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                },
+                                "required": ["index", "lines"],
+                                "additionalProperties": False,
+                            },
+                        }
+                    },
+                    "required": ["bullets"],
+                    "additionalProperties": False,
+                }
+                retry_parsed = await claude._send_request_json(
+                    retry_sys, retry_usr, json_schema=retry_schema, max_tokens=4096,
+                )
+                if retry_parsed and "bullets" in retry_parsed:
+                    fixed_count = 0
+                    for item in retry_parsed["bullets"]:
+                        ridx = item.get("index", 0) - 1
+                        rlines = item.get("lines", [])
+                        if ridx in incomplete_idxs and rlines:
+                            r_combined = " ".join(l.strip() for l in rlines if l.strip())
+                            # Quick sanity check: at least no obvious dangling words
+                            still_bad = _has_incomplete_ending(r_combined, strict=False)
+                            if not still_bad and len(r_combined.split()) >= 4:
+                                # Fix line count if needed
+                                orig_count = len(bullets[ridx].line_texts)
+                                if len(rlines) != orig_count:
+                                    orig_counts = [len(l.strip()) for l in bullets[ridx].line_texts]
+                                    rlines = _redistribute_text(r_combined, orig_count, orig_counts)
+                                replacements[ridx] = [l.strip() for l in rlines]
+                                fixed_count += 1
+                                logger.info(
+                                    f"[BULLET QA] Fixed bullet {ridx+1}: ...{r_combined[-50:]}"
+                                )
+                            else:
+                                logger.warning(
+                                    f"[BULLET QA] Retry still bad for bullet {ridx+1}, keeping original"
+                                )
+                    logger.info(f"[BULLET QA] Re-prompt fixed {fixed_count}/{len(incomplete_idxs)} bullets")
+            except Exception as e:
+                logger.warning(f"[BULLET OPT] Re-prompt failed: {e}")
 
         return replacements
 
@@ -1355,6 +1952,8 @@ class _CMapManager:
         self.font_cmaps: Dict[str, Dict] = {}
         # font_tag → font_name (e.g., "F5" → "TimesNewRomanPSMT")
         self.font_names: Dict[str, str] = {}
+        # font_tag → font_xref (PDF object number for the font dictionary)
+        self.font_xrefs: Dict[str, int] = {}
         self._build_all_cmaps(doc)
 
     def _build_all_cmaps(self, doc):
@@ -1367,6 +1966,7 @@ class _CMapManager:
                 if font_tag in self.font_cmaps:
                     continue
                 self.font_names[font_tag] = font_name
+                self.font_xrefs[font_tag] = font_xref
                 tounicode_stream = self._get_tounicode_stream(doc, font_xref)
                 if tounicode_stream:
                     fwd, rev, byte_width = self._parse_tounicode(tounicode_stream)
@@ -2477,6 +3077,304 @@ class _WidthCalculator:
         return total * font_size / 1000.0
 
 
+def _load_embedded_ttfont(doc, font_xref: int):
+    """Load the embedded TTFont from a PDF font's FontFile2 stream.
+
+    Handles both Type0/CID fonts (via DescendantFonts) and simple TrueType.
+    Returns (TTFont, basefont_name, ff2_xref, is_simple_truetype) or (None, "", -1, False).
+    """
+    try:
+        from fontTools.ttLib import TTFont
+        from io import BytesIO
+
+        fd_xref = None
+        basefont_name = ""
+        is_simple_truetype = False
+
+        # Strategy 1: Type0/CID font (via DescendantFonts)
+        desc_val = doc.xref_get_key(font_xref, "DescendantFonts")
+        if desc_val[0] != "null" and desc_val[1]:
+            desc_text = desc_val[1].strip().strip("[]").strip()
+            ref_match = re.match(r'(\d+)\s+0\s+R', desc_text)
+            if ref_match:
+                cidfont_xref = int(ref_match.group(1))
+                fd_val = doc.xref_get_key(cidfont_xref, "FontDescriptor")
+                if fd_val[0] != "null":
+                    fd_match = re.match(r'(\d+)\s+0\s+R', fd_val[1].strip())
+                    if fd_match:
+                        fd_xref = int(fd_match.group(1))
+                bf_val = doc.xref_get_key(cidfont_xref, "BaseFont")
+                if bf_val[0] != "null":
+                    basefont_name = bf_val[1].strip().lstrip("/")
+                    if "+" in basefont_name:
+                        basefont_name = basefont_name.split("+", 1)[1]
+
+        # Strategy 2: Simple TrueType (FontDescriptor directly on font dict)
+        if fd_xref is None:
+            fd_val = doc.xref_get_key(font_xref, "FontDescriptor")
+            if fd_val[0] == "null":
+                return None, "", -1, False
+            fd_match = re.match(r'(\d+)\s+0\s+R', fd_val[1].strip())
+            if not fd_match:
+                return None, "", -1, False
+            fd_xref = int(fd_match.group(1))
+            is_simple_truetype = True
+            bf_val = doc.xref_get_key(font_xref, "BaseFont")
+            if bf_val[0] != "null":
+                basefont_name = bf_val[1].strip().lstrip("/")
+                if "+" in basefont_name:
+                    basefont_name = basefont_name.split("+", 1)[1]
+
+        # Get FontFile2
+        ff2_val = doc.xref_get_key(fd_xref, "FontFile2")
+        if ff2_val[0] == "null":
+            return None, "", -1, False
+        ff2_match = re.match(r'(\d+)\s+0\s+R', ff2_val[1].strip())
+        if not ff2_match:
+            return None, "", -1, False
+        ff2_xref = int(ff2_match.group(1))
+
+        # Read and parse the embedded font
+        font_bytes = doc.xref_stream(ff2_xref)
+        ttfont = TTFont(BytesIO(font_bytes))
+        return ttfont, basefont_name, ff2_xref, is_simple_truetype
+
+    except ImportError:
+        return None, "", -1, False
+    except Exception as e:
+        logger.debug(f"[FONT] Failed to load embedded TTFont for xref {font_xref}: {e}")
+        return None, "", -1, False
+
+
+class _KerningReader:
+    """Reads GPOS/kern tables from embedded or system fonts for per-pair kerning.
+
+    Provides TJ array adjustment values (in 1/1000 text space units) for
+    consecutive character pairs, enabling natural typographic spacing instead
+    of uniform Tc character spacing.
+    """
+
+    def __init__(self, doc, cmap_mgr: '_CMapManager'):
+        self._doc = doc
+        self._cmap_mgr = cmap_mgr
+        # font_tag → {(cid_a, cid_b): tj_adjustment_value}
+        self._font_kerns: Dict[str, Dict[tuple, float]] = {}
+        # Fonts we already know have no kerning data
+        self._no_kern_fonts: set = set()
+
+    def get_pair_kern(self, font_tag: str, cid_a: int, cid_b: int) -> float:
+        """Get TJ adjustment value for a CID pair (in 1/1000 text space units).
+
+        Positive = shift left (tighter), negative = shift right (looser).
+        Returns 0.0 if no kerning data exists.
+        """
+        if font_tag in self._no_kern_fonts:
+            return 0.0
+        if font_tag not in self._font_kerns:
+            self._load_font_kerning(font_tag)
+        return self._font_kerns.get(font_tag, {}).get((cid_a, cid_b), 0.0)
+
+    def _load_font_kerning(self, font_tag: str):
+        """Load kerning pairs for a font from its GPOS/kern tables."""
+        font_xref = self._cmap_mgr.font_xrefs.get(font_tag)
+        if font_xref is None:
+            self._no_kern_fonts.add(font_tag)
+            return
+
+        # Try embedded font first
+        ttfont, basefont_name, _, _ = _load_embedded_ttfont(self._doc, font_xref)
+
+        # Fall back to system font if embedded has no kerning tables
+        if ttfont is not None:
+            has_kern = ("GPOS" in ttfont) or ("kern" in ttfont)
+            if not has_kern:
+                ttfont = None
+
+        if ttfont is None:
+            font_name = self._cmap_mgr.font_names.get(font_tag, basefont_name or "")
+            augmentor = _FontAugmentor()
+            ttfont = augmentor._load_system_font(font_name)
+
+        if ttfont is None:
+            self._no_kern_fonts.add(font_tag)
+            logger.debug(f"[KERN] No kerning data available for font {font_tag}")
+            return
+
+        pairs = self._extract_kern_pairs(font_tag, ttfont)
+        if pairs:
+            self._font_kerns[font_tag] = pairs
+            logger.info(f"[KERN] Font {font_tag}: loaded {len(pairs)} kerning pairs")
+        else:
+            self._no_kern_fonts.add(font_tag)
+            logger.debug(f"[KERN] Font {font_tag}: no kerning pairs found")
+
+    def _extract_kern_pairs(self, font_tag: str, ttfont) -> Dict[tuple, float]:
+        """Extract kerning pairs from a TTFont and map to CID pairs.
+
+        Returns {(cid_a, cid_b): tj_value} where tj_value is in 1/1000 text space units.
+        """
+        try:
+            upm = ttfont["head"].unitsPerEm if "head" in ttfont else 1000
+
+            # Build glyph_name → CID mapping via:
+            #   ttfont cmap: unicode_codepoint → glyph_name
+            #   cmap_mgr rev: unicode_char → cid
+            ttfont_cmap = ttfont.getBestCmap()
+            if not ttfont_cmap:
+                return {}
+
+            # Invert ttfont cmap: glyph_name → unicode_codepoint
+            glyph_to_unicode: Dict[str, int] = {}
+            for codepoint, glyph_name in ttfont_cmap.items():
+                if glyph_name not in glyph_to_unicode:
+                    glyph_to_unicode[glyph_name] = codepoint
+
+            # Get CMap manager's reverse map (char → cid)
+            font_data = self._cmap_mgr.font_cmaps.get(font_tag, {})
+            char_to_cid = font_data.get("rev", {})
+            if not char_to_cid:
+                return {}
+
+            # Build glyph_name → cid
+            glyph_to_cid: Dict[str, int] = {}
+            for glyph_name, codepoint in glyph_to_unicode.items():
+                ch = chr(codepoint)
+                cid = char_to_cid.get(ch)
+                if cid is not None:
+                    glyph_to_cid[glyph_name] = cid
+
+            # Extract raw kerning pairs from GPOS (preferred) or kern table
+            raw_pairs: Dict[tuple, float] = {}  # (glyph_a, glyph_b) → kern_value_font_units
+
+            if "GPOS" in ttfont:
+                raw_pairs = self._extract_gpos_kerning(ttfont, glyph_to_cid)
+
+            if not raw_pairs and "kern" in ttfont:
+                raw_pairs = self._extract_legacy_kerning(ttfont)
+
+            if not raw_pairs:
+                return {}
+
+            # Convert glyph-name pairs → CID pairs with TJ values
+            cid_pairs: Dict[tuple, float] = {}
+            for (glyph_a, glyph_b), kern_val in raw_pairs.items():
+                cid_a = glyph_to_cid.get(glyph_a)
+                cid_b = glyph_to_cid.get(glyph_b)
+                if cid_a is not None and cid_b is not None:
+                    # Convert: positive font kern = looser → negative TJ = looser
+                    # TJ positive = shift left = tighter
+                    tj_val = -kern_val * 1000.0 / upm
+                    if abs(tj_val) >= 1.0:  # Skip sub-unit adjustments
+                        cid_pairs[(cid_a, cid_b)] = round(tj_val, 1)
+
+            return cid_pairs
+
+        except Exception as e:
+            logger.debug(f"[KERN] Failed to extract kern pairs for {font_tag}: {e}")
+            return {}
+
+    def _extract_gpos_kerning(self, ttfont, glyph_to_cid: Dict[str, int]) -> Dict[tuple, float]:
+        """Extract kerning from GPOS PairPos subtables (Format 1 and 2)."""
+        pairs: Dict[tuple, float] = {}
+        try:
+            gpos = ttfont["GPOS"].table
+            if not gpos.LookupList:
+                return pairs
+
+            for lookup in gpos.LookupList.Lookup:
+                subtables = lookup.SubTable
+                # Handle Extension lookups (type 9) — unwrap to actual subtable
+                if lookup.LookupType == 9:
+                    subtables = [st.ExtSubTable for st in subtables
+                                 if hasattr(st, 'ExtSubTable')]
+
+                for subtable in subtables:
+                    if not hasattr(subtable, 'Format'):
+                        continue
+
+                    # Only process PairPos (type 2)
+                    if getattr(subtable, 'LookupType', 0) not in (0, 2) and lookup.LookupType != 2:
+                        continue
+                    if not hasattr(subtable, 'Format'):
+                        continue
+
+                    if subtable.Format == 1:
+                        # Individual pair positioning
+                        self._extract_pairpos_format1(subtable, pairs)
+                    elif subtable.Format == 2:
+                        # Class-based pair positioning
+                        self._extract_pairpos_format2(subtable, pairs)
+
+        except Exception as e:
+            logger.debug(f"[KERN] GPOS extraction error: {e}")
+        return pairs
+
+    def _extract_pairpos_format1(self, subtable, pairs: Dict[tuple, float]):
+        """Extract Format 1 (individual) pair positioning."""
+        try:
+            coverage_glyphs = subtable.Coverage.glyphs
+            for i, first_glyph in enumerate(coverage_glyphs):
+                if i >= len(subtable.PairSet):
+                    break
+                for pvr in subtable.PairSet[i].PairValueRecord:
+                    second_glyph = pvr.SecondGlyph
+                    val = pvr.Value1
+                    if val and hasattr(val, 'XAdvance') and val.XAdvance:
+                        pairs[(first_glyph, second_glyph)] = val.XAdvance
+        except Exception:
+            pass
+
+    def _extract_pairpos_format2(self, subtable, pairs: Dict[tuple, float]):
+        """Extract Format 2 (class-based) pair positioning."""
+        try:
+            # Build class → glyph list mappings
+            class1_glyphs: Dict[int, list] = {}
+            class2_glyphs: Dict[int, list] = {}
+
+            if subtable.ClassDef1 and hasattr(subtable.ClassDef1, 'classDefs'):
+                for glyph, cls in subtable.ClassDef1.classDefs.items():
+                    class1_glyphs.setdefault(cls, []).append(glyph)
+            # Class 0 = all glyphs NOT in ClassDef1 (coverage glyphs)
+            if subtable.Coverage:
+                for g in subtable.Coverage.glyphs:
+                    if subtable.ClassDef1 and g not in subtable.ClassDef1.classDefs:
+                        class1_glyphs.setdefault(0, []).append(g)
+
+            if subtable.ClassDef2 and hasattr(subtable.ClassDef2, 'classDefs'):
+                for glyph, cls in subtable.ClassDef2.classDefs.items():
+                    class2_glyphs.setdefault(cls, []).append(glyph)
+
+            # Extract values for each class pair
+            for c1_idx, c1_record in enumerate(subtable.Class1Record):
+                c1_list = class1_glyphs.get(c1_idx, [])
+                if not c1_list:
+                    continue
+                for c2_idx, c2_record in enumerate(c1_record.Class2Record):
+                    val = c2_record.Value1
+                    if not val or not hasattr(val, 'XAdvance') or not val.XAdvance:
+                        continue
+                    c2_list = class2_glyphs.get(c2_idx, [])
+                    for g1 in c1_list:
+                        for g2 in c2_list:
+                            pairs[(g1, g2)] = val.XAdvance
+        except Exception:
+            pass
+
+    def _extract_legacy_kerning(self, ttfont) -> Dict[tuple, float]:
+        """Extract kerning from legacy kern table."""
+        pairs: Dict[tuple, float] = {}
+        try:
+            kern = ttfont["kern"]
+            for subtable in kern.kernTables:
+                if hasattr(subtable, 'kernTable') and subtable.kernTable:
+                    for (left, right), value in subtable.kernTable.items():
+                        if value != 0:
+                            pairs[(left, right)] = value
+        except Exception as e:
+            logger.debug(f"[KERN] Legacy kern extraction error: {e}")
+        return pairs
+
+
 class _FontAugmentor:
     """Handles missing characters by loading system fonts and creating new CMap entries."""
 
@@ -2927,58 +3825,9 @@ def _augment_font_file(doc, font_xref: int, font_tag: str, new_mappings: Dict[st
         from fontTools.ttLib import TTFont
         from io import BytesIO
 
-        # Strategy 1: Type0/CID font (via DescendantFonts)
-        # Strategy 2: Simple TrueType font (FontDescriptor directly on font dict)
-        fd_xref = None
-        basefont_name = ""
-        is_simple_truetype = False
-
-        desc_val = doc.xref_get_key(font_xref, "DescendantFonts")
-        if desc_val[0] != "null" and desc_val[1]:
-            # Type0/CID path
-            desc_text = desc_val[1].strip().strip("[]").strip()
-            ref_match = re.match(r'(\d+)\s+0\s+R', desc_text)
-            if ref_match:
-                cidfont_xref = int(ref_match.group(1))
-                fd_val = doc.xref_get_key(cidfont_xref, "FontDescriptor")
-                if fd_val[0] != "null":
-                    fd_match = re.match(r'(\d+)\s+0\s+R', fd_val[1].strip())
-                    if fd_match:
-                        fd_xref = int(fd_match.group(1))
-                bf_val = doc.xref_get_key(cidfont_xref, "BaseFont")
-                if bf_val[0] != "null":
-                    basefont_name = bf_val[1].strip().lstrip("/")
-                    if "+" in basefont_name:
-                        basefont_name = basefont_name.split("+", 1)[1]
-
-        if fd_xref is None:
-            # Simple TrueType path — FontDescriptor directly on font dict
-            fd_val = doc.xref_get_key(font_xref, "FontDescriptor")
-            if fd_val[0] == "null":
-                return
-            fd_match = re.match(r'(\d+)\s+0\s+R', fd_val[1].strip())
-            if not fd_match:
-                return
-            fd_xref = int(fd_match.group(1))
-            is_simple_truetype = True
-            bf_val = doc.xref_get_key(font_xref, "BaseFont")
-            if bf_val[0] != "null":
-                basefont_name = bf_val[1].strip().lstrip("/")
-                if "+" in basefont_name:
-                    basefont_name = basefont_name.split("+", 1)[1]
-
-        # Get FontFile2
-        ff2_val = doc.xref_get_key(fd_xref, "FontFile2")
-        if ff2_val[0] == "null":
+        embedded_font, basefont_name, ff2_xref, is_simple_truetype = _load_embedded_ttfont(doc, font_xref)
+        if embedded_font is None:
             return
-        ff2_match = re.match(r'(\d+)\s+0\s+R', ff2_val[1].strip())
-        if not ff2_match:
-            return
-        ff2_xref = int(ff2_match.group(1))
-
-        # Read the embedded font
-        font_bytes = doc.xref_stream(ff2_xref)
-        embedded_font = TTFont(BytesIO(font_bytes))
 
         augmentor = _FontAugmentor()
         system_font = augmentor._load_system_font(basefont_name)
@@ -3090,7 +3939,7 @@ def _augment_font_file(doc, font_xref: int, font_tag: str, new_mappings: Dict[st
             doc.update_stream(ff2_xref, new_font_bytes)
             # Update Length1 if present
             doc.xref_set_key(ff2_xref, "Length1", str(len(new_font_bytes)))
-            logger.info(f"[FONT_AUG] Updated FontFile2 ({len(font_bytes)} → {len(new_font_bytes)} bytes)")
+            logger.info(f"[FONT_AUG] Updated FontFile2 → {len(new_font_bytes)} bytes")
         except Exception as e:
             logger.warning(f"[FONT_AUG] Failed to save augmented font: {e}")
 
@@ -3314,6 +4163,222 @@ def _texts_match(text_a: str, text_b: str) -> bool:
     return False
 
 
+def replace_text_in_pdf(pdf_path: str, replacements: Dict[str, str]) -> bool:
+    """Replace arbitrary text in a PDF using content-stream-level patching.
+
+    Unlike fitz redaction, this preserves:
+    - Original fonts (no font substitution)
+    - Adjacent text on the same line
+    - Exact positioning
+
+    Uses fitz for reading/parsing (CMap, widths, content streams) and
+    pikepdf for the actual byte-level patching.
+
+    Args:
+        pdf_path: Path to PDF file (modified in place)
+        replacements: Dict of {original_text: new_text}
+
+    Returns:
+        True if any replacements were made.
+    """
+    import fitz
+    import pikepdf
+
+    # Phase 1: Use fitz to build CMap/width data and parse content blocks
+    fitz_doc = fitz.open(pdf_path)
+    cmap_mgr = _CMapManager(fitz_doc)
+    width_calc = _WidthCalculator(fitz_doc)
+
+    if not cmap_mgr.font_cmaps:
+        fitz_doc.close()
+        return False
+
+    # Phase 2: Use pikepdf for content stream parsing and patching
+    pike_doc = pikepdf.open(pdf_path, allow_overwriting_input=True)
+    modified = False
+
+    for page_num in range(len(pike_doc.pages)):
+        pike_page = pike_doc.pages[page_num]
+
+        # Parse content streams for this page
+        all_blocks: List[ContentBlock] = []
+        if hasattr(pike_page, "Contents"):
+            contents = pike_page.Contents
+            if isinstance(contents, pikepdf.Array):
+                for item in contents:
+                    xref = item.objgen[0]
+                    raw = item.read_bytes()
+                    blocks = _parse_content_stream(raw, cmap_mgr, page_num, xref)
+                    all_blocks.extend(blocks)
+            else:
+                xref = contents.objgen[0]
+                raw = contents.read_bytes()
+                all_blocks = _parse_content_stream(raw, cmap_mgr, page_num, xref)
+
+        if not all_blocks:
+            continue
+
+        used_indices: set = set()
+        stream_patches: Dict[int, List[Tuple[int, int, bytes]]] = {}
+
+        for orig_text, new_text in replacements.items():
+            block_indices = _find_blocks_for_text(
+                all_blocks, orig_text, "", used_indices
+            )
+            if not block_indices:
+                continue
+
+            first_block = all_blocks[block_indices[0]]
+            actual_font = first_block.font_tag
+            font_data = cmap_mgr.font_cmaps.get(actual_font, {})
+            byte_width = font_data.get("byte_width", 2)
+            hex_per_char = byte_width * 2
+
+            # Encode new text
+            hex_encoded, missing = cmap_mgr.encode_text(actual_font, new_text)
+            if missing:
+                # Try font augmentation for missing chars
+                font_aug = _FontAugmentor()
+                font_name = cmap_mgr.font_names.get(actual_font, "")
+                fitz_page = fitz_doc[page_num]
+                resolved = font_aug.resolve_missing_chars(
+                    fitz_doc, fitz_page, actual_font, font_name, missing,
+                    cmap_mgr, width_calc,
+                )
+                if resolved:
+                    hex_encoded, still_missing = cmap_mgr.encode_text(actual_font, new_text)
+                    if still_missing:
+                        logger.warning(f"[HEADER] Still missing chars for '{orig_text}' → '{new_text}', skipping")
+                        continue
+                else:
+                    logger.warning(f"[HEADER] Font augmentation failed for '{orig_text}' → '{new_text}', skipping")
+                    continue
+
+            if not hex_encoded:
+                continue
+
+            # Collect original hex from matched blocks
+            orig_hex_parts = []
+            for bi in block_indices:
+                for op in all_blocks[bi].text_ops:
+                    orig_hex_parts.append(op.hex_string)
+            orig_hex = "".join(orig_hex_parts)
+
+            # Calculate width adjustment (Tc)
+            widths_map = width_calc.font_widths.get(actual_font, {})
+            default_w = width_calc._default_widths.get(actual_font, 1000.0)
+
+            def _calc_w(h: str) -> float:
+                t = 0.0
+                for ci in range(0, len(h), hex_per_char):
+                    if ci + hex_per_char > len(h):
+                        break
+                    cid = int(h[ci:ci + hex_per_char], 16)
+                    t += widths_map.get(cid, default_w)
+                return t
+
+            orig_w = _calc_w(orig_hex)
+            new_w = _calc_w(hex_encoded)
+            font_size = first_block.font_size or 12.0
+            n_chars = max(1, len(hex_encoded) // hex_per_char)
+
+            tc_val = 0.0
+            if n_chars > 0 and orig_w > 0:
+                tc_val = font_size * (orig_w - new_w) / (1000.0 * n_chars)
+                # Tight clamp matching the main distribution path.
+                # Only negative Tc (squeeze) — never stretch shorter text.
+                tc_limit = 0.02 * font_size
+                tc_val = max(-tc_limit, min(0, tc_val))
+
+            # Trim trailing words if replacement is too wide for Tc to handle
+            if n_chars > 0 and orig_w > 0 and new_w > orig_w:
+                budget_w = orig_w + tc_limit * n_chars * 1000.0 / font_size
+                if new_w > budget_w:
+                    trim_words = new_text.split()
+                    while len(trim_words) > 1:
+                        trim_words.pop()
+                        trimmed = " ".join(trim_words)
+                        t_hex, _ = cmap_mgr.encode_text(actual_font, trimmed)
+                        if t_hex:
+                            t_w = _calc_w(t_hex)
+                            if t_w <= budget_w:
+                                new_text = trimmed
+                                hex_encoded = t_hex
+                                new_w = t_w
+                                n_chars = max(1, len(hex_encoded) // hex_per_char)
+                                tc_val = font_size * (orig_w - new_w) / (1000.0 * n_chars)
+                                tc_val = max(-tc_limit, min(0, tc_val))
+                                break
+
+            # Build replacement bytes
+            tc_prefix = f"{tc_val:.4f} Tc ".encode() if abs(tc_val) > 0.001 else b""
+            tc_reset = b"0 Tc " if abs(tc_val) > 0.001 else b""
+            uses_literal = first_block.text_ops[0].is_literal if first_block.text_ops else False
+
+            if uses_literal:
+                # Type1 literal string replacement
+                words = new_text.split()
+                if len(words) <= 1:
+                    w_hex, _ = cmap_mgr.encode_text(actual_font, new_text)
+                    lit_bytes = b"(" + bytes(
+                        int(w_hex[i:i+2], 16) for i in range(0, len(w_hex), 2)
+                    ) + b")"
+                else:
+                    parts = []
+                    for wi, word in enumerate(words):
+                        w_hex, _ = cmap_mgr.encode_text(actual_font, word)
+                        if w_hex:
+                            parts.append(b"(" + bytes(
+                                int(w_hex[i:i+2], 16) for i in range(0, len(w_hex), 2)
+                            ) + b")")
+                            if wi < len(words) - 1:
+                                parts.append(b" -333 ")
+                    lit_bytes = b"".join(parts) if parts else b"()"
+
+                first_op = first_block.text_ops[0]
+                new_content = tc_prefix + lit_bytes + b" " + tc_reset
+                xref = first_block.stream_xref
+                if xref not in stream_patches:
+                    stream_patches[xref] = []
+                stream_patches[xref].append((first_op.byte_offset, first_op.byte_length, new_content))
+            else:
+                # Hex string replacement
+                new_hex_bytes = tc_prefix + b"<" + hex_encoded.encode() + b">" + b" " + tc_reset
+
+                first_op = first_block.text_ops[0]
+                xref = first_block.stream_xref
+                if xref not in stream_patches:
+                    stream_patches[xref] = []
+                stream_patches[xref].append((first_op.byte_offset, first_op.byte_length, new_hex_bytes))
+
+                # Zero out subsequent blocks
+                for bi in block_indices[1:]:
+                    blk = all_blocks[bi]
+                    for op in blk.text_ops:
+                        empty = b"<" + b"0" * len(op.hex_string) + b">"
+                        if blk.stream_xref not in stream_patches:
+                            stream_patches[blk.stream_xref] = []
+                        stream_patches[blk.stream_xref].append((op.byte_offset, op.byte_length, empty))
+
+            used_indices.update(block_indices)
+            modified = True
+            logger.info(f"[HEADER] Replaced '{orig_text}' → '{new_text}' using font {actual_font}")
+
+        # Apply all patches for this page
+        for xref, patches in stream_patches.items():
+            raw = bytes(pike_doc.get_object(xref).read_bytes())
+            patches.sort(key=lambda p: p[0], reverse=True)
+            for offset, old_len, new_bytes in patches:
+                raw = raw[:offset] + new_bytes + raw[offset + old_len:]
+            pike_doc.get_object(xref).write(raw, filter=pikepdf.Name("/FlateDecode"))
+
+    fitz_doc.close()
+    if modified:
+        pike_doc.save(pdf_path)
+    pike_doc.close()
+    return modified
+
+
 def _patch_content_stream(
     doc,
     page_num: int,
@@ -3328,6 +4393,8 @@ def _patch_content_stream(
     font_aug: _FontAugmentor,
     title_skills: Optional[List[TitleSkillLine]] = None,
     title_replacements: Optional[Dict[int, str]] = None,
+    kern_reader: Optional[_KerningReader] = None,
+    header_replacements: Optional[Dict[str, str]] = None,
 ) -> None:
     """
     Core patching function. Modifies content stream in-place.
@@ -3343,6 +4410,34 @@ def _patch_content_stream(
     # Collect all patches grouped by stream xref
     stream_patches: Dict[int, List[Tuple[int, int, bytes]]] = {}
     used_block_indices: set = set()
+
+    # ── Compute right text margin from PyMuPDF bboxes (accurate) ──
+    # PyMuPDF's text extraction accounts for actual font metrics, CTM
+    # transforms, and all rendering details — far more accurate than
+    # computing from our content stream width maps (which can overestimate
+    # by 30%+ due to default_w fallback and missing CID-to-width mappings).
+    page_w = page.rect.width
+    right_margin_pts = page_w - 36.0  # Default: 0.5" right margin
+
+    _max_right_pymupdf = 0.0
+    try:
+        text_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+        for tblock in text_dict.get("blocks", []):
+            if tblock.get("type") != 0:  # Skip image blocks
+                continue
+            for tline in tblock.get("lines", []):
+                for tspan in tline.get("spans", []):
+                    if tspan.get("text", "").strip():
+                        span_right = tspan["bbox"][2]
+                        # Sanity: must be within page bounds
+                        if 0 < span_right <= page_w + 1:
+                            _max_right_pymupdf = max(_max_right_pymupdf, span_right)
+    except Exception as e:
+        logger.warning(f"[PATCH] PyMuPDF text extraction failed: {e}")
+
+    if _max_right_pymupdf > 0:
+        right_margin_pts = _max_right_pymupdf
+    logger.info(f"[PATCH] Page {page_num}: right_margin_pts={right_margin_pts:.1f} (page_w={page_w:.1f})")
 
     def queue_patch(stream_xref: int, offset: int, old_len: int, new_bytes: bytes):
         if stream_xref not in stream_patches:
@@ -3509,16 +4604,16 @@ def _patch_content_stream(
         def _trim_text_to_fit(
             text: str, orig_hex: str, font_tag: str, font_size: float,
             orig_w_override: float = 0.0,
+            use_kerned_tj: bool = False,
         ) -> str:
-            """Trim words from text end if too wide for Tc to compensate.
+            """Smart-trim text to fit within width budget.
 
-            When replacement text is significantly wider than original,
-            Tc clamp can't prevent overflow. Removes trailing words until
-            the text fits within the width budget.
+            Zero-Tc policy: text must fit within budget (no Tc squeeze).
+            Uses clause-level truncation (prefer commas/semicolons) and
+            dangling-word removal so the result is always a complete thought.
 
             If orig_w_override > 0, use that as the target width instead
-            of computing from orig_hex (for multi-font lines where the
-            full visual width spans multiple fonts).
+            of computing from orig_hex.
             """
             if not text or (not orig_hex and orig_w_override <= 0):
                 return text
@@ -3527,74 +4622,169 @@ def _patch_content_stream(
                 return text
             orig_w = orig_w_override if orig_w_override > 0 else _calc_hex_width(orig_hex)
             new_w = _calc_hex_width(full_hex)
-            n = max(1, len(full_hex) // hex_per_char)
             if orig_w <= 0:
                 return text
-            tc_needed = font_size * (orig_w - new_w) / (1000.0 * n)
-            tc_limit = 0.02 * font_size
-            if tc_needed >= -tc_limit:
+            # Zero-Tc policy: text must fit within original width.
+            # Allow 3% tolerance for per-pair kerning TJ adjustments.
+            tolerance = orig_w * 0.03 if use_kerned_tj else 0
+            if new_w <= orig_w + tolerance:
                 return text  # Fits fine
+            def _fits(t: str) -> bool:
+                h, _ = cmap_mgr.encode_text(font_tag, t)
+                return bool(h) and _calc_hex_width(h) <= orig_w + tolerance
+
+            # Strategy 1: clause boundary (only if preserves >60% of text)
+            # Cuts at the last comma/semicolon that produces a complete thought.
+            text_len = len(text)
+            for delim in ['; ', ', ']:
+                didx = text.rfind(delim)
+                if didx > text_len * 0.6:  # Must preserve >60%
+                    candidate = text[:didx].strip()
+                    if len(candidate.split()) >= 4 and not _has_incomplete_ending(candidate, strict=False):
+                        if _fits(candidate):
+                            logger.debug(f"[TRIM] Clause boundary: {text_len}→{len(candidate)}")
+                            return candidate
+
+            # Strategy 2: word-by-word removal with CONSERVATIVE dangling cleanup
+            # Uses strict=False so only true function words (prepositions, articles,
+            # conjunctions) are stripped.  This prevents the trimmer from rejecting
+            # valid stopping points like "...data transfer process" or "...technical support".
+            best_fit = None
             words = text.split()
             while len(words) > 1:
                 words.pop()
-                trimmed = " ".join(words)
-                # Clean trailing punctuation left after word removal
-                trimmed = trimmed.rstrip(" ,;:")
-                # Close unclosed parentheses/brackets
+                # Remove trailing function words only (conservative set)
+                while len(words) > 2 and _has_incomplete_ending(' '.join(words), strict=False):
+                    words.pop()
+                trimmed = " ".join(words).rstrip(" ,;:")
+                # Close unclosed parentheses
                 open_parens = trimmed.count("(") - trimmed.count(")")
                 if open_parens > 0:
                     trimmed += ")" * open_parens
+                if not trimmed or len(trimmed.split()) < 2:
+                    continue
+                if _fits(trimmed):
+                    logger.debug(f"[TRIM] Word removal: {text_len}→{len(trimmed)}")
+                    return trimmed
+
+            # Strategy 3: HARD fallback with best-effort completeness.
+            # Pop words until text fits, but still try to avoid dangling
+            # prepositions/articles at the end.
+            words = text.split()
+            while len(words) > 1:
+                words.pop()
+                # Try to clean up the ending (best effort, not mandatory)
+                candidate_words = list(words)
+                while (len(candidate_words) > 2
+                       and candidate_words[-1].lower().rstrip(" ,;:") in _TRIM_DANGLING_WORDS):
+                    candidate_words.pop()
+                trimmed = " ".join(candidate_words).rstrip(" ,;:")
+                if trimmed and _fits(trimmed):
+                    logger.warning(f"[TRIM] Hard fallback (cleaned): {text_len}→{len(trimmed)}")
+                    return trimmed
+                # If cleaned version doesn't fit, try uncleaned
+                trimmed = " ".join(words).rstrip(" ,;:")
                 if not trimmed:
                     continue
-                trimmed_hex, _ = cmap_mgr.encode_text(font_tag, trimmed)
-                if not trimmed_hex:
-                    continue
-                trimmed_w = _calc_hex_width(trimmed_hex)
-                n_t = max(1, len(trimmed_hex) // hex_per_char)
-                tc_check = font_size * (orig_w - trimmed_w) / (1000.0 * n_t)
-                if tc_check >= -tc_limit:
+                if _fits(trimmed):
+                    logger.warning(f"[TRIM] Hard fallback: {text_len}→{len(trimmed)}")
                     return trimmed
             return text
+
+        def _build_kerned_hex_content(
+            text: str, font_tag: str, hex_encoded: str,
+            orig_width_1000: float, font_size: float,
+        ) -> tuple:
+            """Build TJ array content with per-pair kerning from GPOS/kern tables.
+
+            Instead of a monolithic <hex_blob>, produces content like:
+              <seg1> 25 <seg2> -10 <seg3>
+            where numbers are TJ adjustment values (1/1000 text space units).
+
+            Returns (content_bytes, used_kerning: bool).
+            If used_kerning is False, caller should fall back to Tc approach.
+            """
+            if kern_reader is None:
+                return f"<{hex_encoded}>".encode("latin-1"), False
+
+            # Split hex into per-character CID chunks
+            chars = [hex_encoded[i:i + hex_per_char]
+                     for i in range(0, len(hex_encoded), hex_per_char)]
+            if len(chars) <= 1:
+                return f"<{hex_encoded}>".encode("latin-1"), False
+
+            # Look up per-pair kerning values
+            kern_values = []
+            has_any_kern = False
+            for i in range(len(chars) - 1):
+                cid_a = int(chars[i], 16)
+                cid_b = int(chars[i + 1], 16)
+                k = kern_reader.get_pair_kern(font_tag, cid_a, cid_b)
+                kern_values.append(k)
+                if abs(k) > 0.01:
+                    has_any_kern = True
+
+            # If font has NO kerning data at all, return monolithic hex blob.
+            # Splitting into per-character segments with synthetic residual
+            # kerning destroys the natural glyph spacing and causes visual
+            # squeeze/expansion artifacts.  Let the font's built-in /Widths
+            # handle spacing naturally (zero-Tc policy trims text to fit).
+            if not has_any_kern:
+                return f"<{hex_encoded}>".encode("latin-1"), False
+
+            # Calculate natural width (in 1/1000 text space units)
+            glyph_widths = [widths_map.get(int(c, 16), default_w) for c in chars]
+            # TJ positive = shift left = reduces rendered width
+            natural_width = sum(glyph_widths) - sum(kern_values)
+
+            # Distribute residual across gaps
+            num_gaps = len(chars) - 1
+            if orig_width_1000 > 0 and num_gaps > 0:
+                residual = (natural_width - orig_width_1000) / num_gaps
+                # Clamp per-gap adjustment: ±30 in 1/1000 units (~0.3pt at 10pt)
+                residual = max(-30.0, min(30.0, residual))
+            else:
+                residual = 0.0
+
+            # Build compact TJ content: merge consecutive near-zero-kern chars
+            # into single hex segments for compactness
+            segments = []  # list of (hex_chunk, kern_after_or_None)
+            current_hex = chars[0]
+            for i in range(num_gaps):
+                total_k = kern_values[i] + residual
+                if abs(total_k) < 5:
+                    # Near-zero: merge into same segment
+                    current_hex += chars[i + 1]
+                else:
+                    segments.append((current_hex, int(round(total_k))))
+                    current_hex = chars[i + 1]
+            segments.append((current_hex, None))  # Last segment, no trailing kern
+
+            # Serialize to bytes
+            parts = []
+            for hex_chunk, kern_after in segments:
+                parts.append(f"<{hex_chunk}>")
+                if kern_after is not None:
+                    parts.append(str(kern_after))
+            content = " ".join(parts)
+            return content.encode("latin-1"), True
 
         def _inject_width_adjustment(
             op: TextOp, xref: int, orig_hex: str, new_hex: str,
             content_bytes: bytes, font_size: float = 10.0,
             orig_w_override: float = 0.0,
+            use_kerned_content: bool = False,
         ) -> bytes:
-            """Inject Tc (character spacing) to match replacement width to original.
+            """Reset Tc to zero for all replacements (zero-squeeze policy).
 
-            Tc adjusts gaps between characters uniformly. This is far less visible
-            than Tz (horizontal scaling) because character shapes are preserved —
-            only the inter-character spacing changes.
+            Text is pre-trimmed by _trim_text_to_fit() to fit within original
+            width. Per-pair kerning (when available) handles natural spacing
+            via TJ array values. No Tc compensation is ever applied.
 
-            If orig_w_override > 0, use that as the target width instead of
-            computing from orig_hex (for multi-font lines).
-
-            PDF displacement formula (ISO 32000 Table 105):
-              tx = (w0/1000 * Tfs + Tc) * Th
-            Formula: Tc = Tfs * (orig_width - new_width) / (1000 * num_chars)
+            The 0 Tc reset prevents any inherited Tc from the original content
+            stream from affecting our replacement text.
             """
-            if not orig_hex or not new_hex:
-                adj_bytes = b" 0 Tc "
-            else:
-                orig_w = orig_w_override if orig_w_override > 0 else _calc_hex_width(orig_hex)
-                new_w = _calc_hex_width(new_hex)
-                num_new_chars = max(1, len(new_hex) // hex_per_char)
-
-                if orig_w <= 0 or abs(new_w - orig_w) < orig_w * 0.01:
-                    adj_bytes = b" 0 Tc "  # <1% difference, no adjustment
-                else:
-                    # Tc = Tfs * (orig_width - new_width) / (1000 * num_chars)
-                    # font_size (Tfs) multiplier is critical per ISO 32000.
-                    tc_val = font_size * (orig_w - new_w) / (1000.0 * num_new_chars)
-                    # Only apply NEGATIVE Tc (squeeze longer text to fit).
-                    # Never apply positive Tc — stretching shorter text creates
-                    # visible gaps between characters/words.
-                    # Keep clamp tight (0.02) to minimize visible character overlap.
-                    # Wider text relies on trimming instead of aggressive squeezing.
-                    tc_limit = 0.02 * font_size
-                    tc_val = max(-tc_limit, min(0, tc_val))
-                    adj_bytes = f" {tc_val:.4f} Tc ".encode("latin-1")
+            adj_bytes = b" 0 Tc "
             if op.operator == "TJ" and op.tj_array_start >= 0:
                 queue_patch(xref, op.tj_array_start, 0, adj_bytes)
                 return content_bytes
@@ -3728,39 +4918,147 @@ def _patch_content_stream(
                 fs = write_blk.font_size if write_blk.text_ops else 10.0
                 needs_font_switch = (write_blk.font_tag != actual_font)
 
-                # Width budget = full line width + Tc headroom.
-                # Tc headroom based on estimated character count for the full line.
-                avg_char_w = max(primary_w / max(1, len(line_orig_hex) // hex_per_char), 300) if line_orig_hex else 500
-                est_chars = max(1, int(full_line_w / avg_char_w))
-                tc_headroom = 20 * est_chars  # 20 font units per char of Tc capacity
-                max_w = full_line_w + tc_headroom
-
                 y_budgets.append({
                     "y_key": y_key,
                     "blocks": group_blocks,
                     "orig_hex": line_orig_hex,
                     "primary_w": primary_w,
                     "full_line_w": full_line_w,
-                    "max_w": max_w,
                     "fs": fs,
                     "write_bi": write_bi,
                     "needs_font_switch": needs_font_switch,
                 })
 
+            # ── Compute width budgets ──
+            # We compute margin_w_real from PyMuPDF right margin (accurate).
+            # We also have full_line_w from content stream hex (may over- or
+            # under-estimate due to default_w fallback).
+            #
+            # The ratio = full_line_w / margin_w_real tells us the width map
+            # distortion:
+            #   ratio > 1 → width map overestimates → word measurements also
+            #     overestimate → budget must be inflated to match
+            #   ratio <= 1 → width map is accurate or underestimates →
+            #     margin_w_real is trustworthy, use it directly
+            #
+            # CRITICAL: Use MAX ratio across ALL y-groups, not just the first.
+            # The first line often doesn't fill to the margin (natural word-wrap),
+            # giving a misleadingly low ratio (e.g. 0.76 instead of 0.91).
+            # The fullest line gives the most accurate width calibration.
+            if y_budgets:
+                _width_ratio = 0.0
+                for _ref in y_budgets:
+                    _ref_x = all_content_blocks[_ref["write_bi"]].x
+                    _ref_margin_real = (right_margin_pts - _ref_x) * 1000.0 / max(_ref["fs"], 1.0)
+                    if _ref_margin_real > 0 and _ref["full_line_w"] > 0:
+                        _ratio = _ref["full_line_w"] / _ref_margin_real
+                        if _ratio > _width_ratio:
+                            _width_ratio = _ratio
+                if _width_ratio <= 0:
+                    _width_ratio = 1.0
+            else:
+                _width_ratio = 1.0
+
+            for _bud in y_budgets:
+                _bud_x = all_content_blocks[_bud["write_bi"]].x
+                _bud_avail = max(0, right_margin_pts - _bud_x)
+                _margin_w_real = _bud_avail * 1000.0 / max(_bud["fs"], 1.0)
+                if _width_ratio > 1.0:
+                    # Width map overestimates — inflate budget to match
+                    _inflation = min(_width_ratio, 2.0)
+                    _bud["max_w"] = max(_bud["full_line_w"], _margin_w_real * _inflation)
+                else:
+                    # ratio <= 1.0 means the CID width map is accurate (or slightly
+                    # under-reports).  The original text not filling to the margin is
+                    # normal word-wrap, NOT a width calibration signal.
+                    # Use full margin_w_real so the greedy fill can use all available
+                    # space.  Downstream Tc correction (±0.15/char) and _trim_text_to_fit
+                    # handle any minor overflows.
+                    _bud["max_w"] = _margin_w_real
+
+            # Log budget summary
+            if y_budgets:
+                logger.info(
+                    f"[PATCH] {label}: {len(y_budgets)} y-groups, "
+                    f"max_w=[{', '.join(str(int(b['max_w'])) for b in y_budgets)}], "
+                    f"width_ratio={_width_ratio:.2f}"
+                )
+
             # ── Step 2: Measure space width in font units ──
             space_hex, _ = cmap_mgr.encode_text(actual_font, " ")
             space_w = _calc_hex_width(space_hex) if space_hex else default_w
 
+            # ── Step 2b: Pre-distribution pixel check ──
+            # The LLM generates text based on CHARACTER budget, but character
+            # count is a poor proxy for pixel width (proportional fonts).
+            # BEFORE greedy fill, measure the full text's pixel width and
+            # compare to total available budget.  If it overflows, truncate
+            # at a sentence/clause boundary to preserve a complete thought.
+            _total_budget = sum(b["max_w"] for b in y_budgets)
+            _full_hex, _ = cmap_mgr.encode_text(actual_font, new_text)
+            _full_w = _calc_hex_width(_full_hex) if _full_hex else 0
+            if _full_w > _total_budget and _total_budget > 0:
+                _overflow_pct = (_full_w / _total_budget - 1) * 100
+                logger.info(
+                    f"[PRE-TRIM] {label}: text pixel width {_full_w:.0f} exceeds "
+                    f"total budget {_total_budget:.0f} by {_overflow_pct:.1f}%, "
+                    f"truncating to clause boundary"
+                )
+                # Try sentence boundary first (period followed by space or end)
+                _best = None
+                for _delim in ['. ', '; ', ', ']:
+                    _pos = new_text.rfind(_delim)
+                    while _pos > len(new_text) * 0.3:
+                        _candidate = new_text[:_pos].rstrip(" ,;:")
+                        if _delim == '. ':
+                            _candidate = new_text[:_pos + 1]  # Keep the period
+                        _c_hex, _ = cmap_mgr.encode_text(actual_font, _candidate)
+                        _c_w = _calc_hex_width(_c_hex) if _c_hex else 0
+                        if (_c_w <= _total_budget
+                                and len(_candidate.split()) >= 4
+                                and not _has_incomplete_ending(_candidate, strict=False)):
+                            _best = _candidate
+                            break
+                        # Try next occurrence of this delimiter
+                        _pos = new_text.rfind(_delim, 0, _pos)
+                    if _best:
+                        break
+                if _best:
+                    logger.info(
+                        f"[PRE-TRIM] {label}: truncated {len(new_text)}→{len(_best)} chars: "
+                        f"'...{_best[-40:]}'"
+                    )
+                    new_text = _best
+                else:
+                    # Fallback: word-by-word removal with dangling cleanup
+                    _words = new_text.split()
+                    while len(_words) > 3:
+                        _words.pop()
+                        while (len(_words) > 2
+                               and _has_incomplete_ending(' '.join(_words), strict=False)):
+                            _words.pop()
+                        _try = " ".join(_words).rstrip(" ,;:")
+                        _t_hex, _ = cmap_mgr.encode_text(actual_font, _try)
+                        _t_w = _calc_hex_width(_t_hex) if _t_hex else 0
+                        if _t_w <= _total_budget:
+                            new_text = _try
+                            logger.info(
+                                f"[PRE-TRIM] {label}: word-trim {len(new_text)}→{len(_try)} chars"
+                            )
+                            break
+
             # ── Step 3: Greedy word-fill distribution ──
+            # Uses _calc_hex_width for per-word measurement (CID-based, same
+            # coordinate system as _trim_text_to_fit). The budget max_w is
+            # also in CID units (inflated by _width_ratio when > 1.0).
             words = new_text.split()
-            # line_assignments[i] = text for y-group i, or None
             line_assignments: List[Optional[str]] = [None] * len(y_budgets)
             word_idx = 0
             num_groups = len(y_budgets)
 
             for gi in range(num_groups):
                 if word_idx >= len(words):
-                    break  # No more words; remaining y-groups will be zeroed.
+                    break
                 budget = y_budgets[gi]
                 is_last = (gi == num_groups - 1)
                 line_words: List[str] = []
@@ -3772,8 +5070,6 @@ def _patch_content_stream(
                     word_w = _calc_hex_width(w_hex) if w_hex else default_w * len(word)
 
                     if not line_words:
-                        # First word: always accept (even if overflows —
-                        # trimming will handle it downstream).
                         line_words.append(word)
                         line_w = word_w
                         word_idx += 1
@@ -3783,24 +5079,187 @@ def _patch_content_stream(
                             line_words.append(word)
                             line_w = test_w
                             word_idx += 1
-                        elif is_last:
-                            # Last available line — absorb all remaining words.
-                            line_words.append(word)
-                            line_w = test_w
-                            word_idx += 1
                         else:
-                            break  # Next word goes to next y-group.
+                            break  # Budget exceeded — stop filling this line
 
                 if line_words:
                     line_assignments[gi] = " ".join(line_words)
+                    logger.debug(
+                        f"[GREEDY] {label} line {gi}: {len(line_words)} words, "
+                        f"line_w={line_w:.0f}, max_w={budget['max_w']:.0f}, "
+                        f"fill={line_w/budget['max_w']*100:.1f}%"
+                    )
 
-            # If words remain after all groups filled, append to last used line
+            # If words remain after all groups filled, drop them.
+            # Blindly appending overflow to the last line caused 25-135%
+            # width overflow → _trim_text_to_fit chopped sentences mid-thought.
+            # Dropping overflow words loses a few words at the end, but
+            # _trim_text_to_fit can handle minor adjustments without
+            # destroying sentence completeness.
             if word_idx < len(words):
+                dropped = words[word_idx:]
+                logger.info(
+                    f"[GREEDY] {label}: dropping {len(dropped)} overflow words "
+                    f"({' '.join(dropped[:5])}{'...' if len(dropped) > 5 else ''})"
+                )
+                # Clean up the last used line's ending — dropping words may
+                # leave it ending mid-sentence.
                 for gi in range(num_groups - 1, -1, -1):
                     if line_assignments[gi] is not None:
-                        remaining = " ".join(words[word_idx:])
-                        line_assignments[gi] += " " + remaining
+                        _last_text = line_assignments[gi]
+                        if len(dropped) > 3:
+                            # Heavy overflow (>3 words dropped): sentence is badly
+                            # broken.  Cut at last clause boundary (comma/semicolon)
+                            # which produces a shorter but COMPLETE thought.
+                            for _delim in ['; ', ', ']:
+                                _cidx = _last_text.rfind(_delim)
+                                if _cidx > len(_last_text) * 0.3:
+                                    _candidate = _last_text[:_cidx].rstrip(" ,;:")
+                                    if (len(_candidate.split()) >= 3
+                                            and not _has_incomplete_ending(_candidate, strict=False)):
+                                        _last_text = _candidate
+                                        logger.info(
+                                            f"[GREEDY] {label}: clause-cut last line "
+                                            f"after {len(dropped)} words dropped"
+                                        )
+                                        break
+                        # Always clean up dangling words as final pass
+                        _last_words = _last_text.split()
+                        while (len(_last_words) > 2
+                               and _has_incomplete_ending(' '.join(_last_words), strict=False)):
+                            _last_words.pop()
+                        line_assignments[gi] = " ".join(_last_words).rstrip(" ,;:")
                         break
+
+            # ── Step 3b: Balanced redistribution if text underflows ──
+            # If greedy fill left empty y-groups, the zeroed lines create
+            # visible vertical gaps (their positioning operators still
+            # occupy space).  Redistribute text across ALL y-groups so
+            # every line gets content and no phantom gaps appear.
+            #
+            # BUT: don't redistribute if it would create orphan lines
+            # (< 3 words on any line).  A 1-word orphan ("improvements",
+            # "50%") looks far worse than a small vertical gap.
+            MIN_WORDS_PER_LINE = 3
+            used_count = sum(1 for la in line_assignments if la is not None)
+            # Also check: is there enough total text to fill at least 60% of
+            # each line? If not, redistribution spreads thin text even thinner
+            # (e.g., 15 words → 12 + 3, where line 1 gets "microservices workflows").
+            # In that case, keep text on line 0 where it at least fills one line fully.
+            _total_text_w = sum(
+                (_calc_hex_width(cmap_mgr.encode_text(actual_font, w)[0])
+                 if cmap_mgr.encode_text(actual_font, w)[0] else default_w * len(w))
+                for w in words
+            ) + space_w * max(0, len(words) - 1)
+            _total_budget_w = sum(b["max_w"] for b in y_budgets)
+            _fill_ratio = _total_text_w / _total_budget_w if _total_budget_w > 0 else 0
+            if (used_count < num_groups
+                    and len(words) >= num_groups * MIN_WORDS_PER_LINE
+                    and _fill_ratio >= 0.60):
+                # Pre-compute per-word widths (CID-based, same as greedy fill)
+                word_widths_list: List[float] = []
+                for w in words:
+                    w_hex, _ = cmap_mgr.encode_text(actual_font, w)
+                    word_widths_list.append(
+                        _calc_hex_width(w_hex) if w_hex else default_w * len(w)
+                    )
+                total_available_w = sum(b["max_w"] for b in y_budgets)
+                target_per_line = total_available_w / num_groups
+
+                line_assignments = [None] * num_groups
+                word_idx = 0
+                for gi in range(num_groups):
+                    if word_idx >= len(words):
+                        break
+                    is_last_group = (gi == num_groups - 1)
+                    line_words_b: List[str] = []
+                    line_w_b = 0.0
+
+                    while word_idx < len(words):
+                        ww = word_widths_list[word_idx]
+
+                        if not line_words_b:
+                            line_words_b.append(words[word_idx])
+                            line_w_b = ww
+                            word_idx += 1
+                            continue
+
+                        if is_last_group:
+                            line_words_b.append(words[word_idx])
+                            line_w_b += space_w + ww
+                            word_idx += 1
+                            continue
+
+                        # Must save at least MIN_WORDS_PER_LINE words per future line
+                        words_left = len(words) - word_idx
+                        lines_after = num_groups - gi - 1
+                        if words_left <= lines_after * MIN_WORDS_PER_LINE:
+                            break
+
+                        # Break when past target width for this line
+                        new_w = line_w_b + space_w + ww
+                        if new_w > target_per_line:
+                            break
+
+                        line_words_b.append(words[word_idx])
+                        line_w_b = new_w
+                        word_idx += 1
+
+                    if line_words_b:
+                        line_assignments[gi] = " ".join(line_words_b)
+
+                logger.info(
+                    f"[PATCH] {label}: Balanced redistribution — "
+                    f"{used_count}/{num_groups} lines used → "
+                    f"{sum(1 for la in line_assignments if la is not None)}"
+                    f"/{num_groups} lines"
+                )
+
+            # ── Step 3c: Rebalance orphan last lines ──
+            # After greedy fill, the last line may have just 1-2 words
+            # (e.g. "reliability.") while the previous line is packed.
+            # Move words from earlier lines to the last to balance.
+            last_used = -1
+            for gi in range(num_groups - 1, -1, -1):
+                if line_assignments[gi] is not None:
+                    last_used = gi
+                    break
+            if last_used > 0 and line_assignments[last_used] is not None:
+                last_words = line_assignments[last_used].split()
+                prev_words = (line_assignments[last_used - 1] or "").split()
+                # If last line has < 3 words and previous line has > 5 words,
+                # shift words from prev to last to balance
+                if len(last_words) < 3 and len(prev_words) > 5:
+                    # Target: move enough words so last line has >= 3 words
+                    # but prev line keeps >= 4 words
+                    words_to_move = min(3, len(prev_words) - 4)
+                    if words_to_move > 0:
+                        moved = prev_words[-words_to_move:]
+                        prev_words = prev_words[:-words_to_move]
+                        line_assignments[last_used - 1] = " ".join(prev_words)
+                        line_assignments[last_used] = " ".join(moved + last_words)
+                        logger.info(
+                            f"[PATCH] {label}: Rebalanced orphan last line — "
+                            f"moved {words_to_move} words, "
+                            f"prev={len(prev_words)} words, last={len(moved + last_words)} words"
+                        )
+
+            # ── Step 3d: Dangling-word cleanup on last used line ──
+            # After distribution, the last line may end with a dangling
+            # preposition/conjunction/article. Strip it so bullets
+            # always end with a complete thought.
+            for gi in range(num_groups - 1, -1, -1):
+                if line_assignments[gi] is not None:
+                    _la_words = line_assignments[gi].split()
+                    changed = False
+                    while (len(_la_words) > 2
+                           and _has_incomplete_ending(' '.join(_la_words), strict=False)):
+                        _la_words.pop()
+                        changed = True
+                    if changed:
+                        line_assignments[gi] = " ".join(_la_words).rstrip(" ,;:")
+                        logger.debug(f"[PATCH] {label}: Removed dangling word from last line")
+                    break
 
             # ── Step 4: Apply patches ──
             for gi, budget in enumerate(y_budgets):
@@ -3823,13 +5282,46 @@ def _patch_content_stream(
                 full_line_w = budget["full_line_w"]
                 needs_font_switch = budget["needs_font_switch"]
 
-                # Trim text if too wide for FULL line width.
-                # Use full_line_w so text can fill the entire visual line
-                # (including space freed by zeroed incompatible-font blocks).
+                # Trim text if too wide for margin-based budget.
+                # Use max_w (margin-based) so continuation lines can fill
+                # available space to the right margin.
+                _will_use_kerned = (
+                    not uses_literal and write_blk.text_ops
+                    and write_blk.text_ops[0].operator == "TJ" and kern_reader is not None
+                )
+                # Debug: check if greedy fill sum matches full-text encoding
+                _pre_hex, _ = cmap_mgr.encode_text(actual_font, line_text)
+                _pre_w = _calc_hex_width(_pre_hex) if _pre_hex else 0
+                if _pre_w > budget["max_w"] * 1.01:
+                    logger.info(
+                        f"[TRIM-PRE] {label} line {gi}: greedy assigned text that's TOO WIDE: "
+                        f"full_encode_w={_pre_w:.0f} > max_w={budget['max_w']:.0f} "
+                        f"(overflow={(_pre_w/budget['max_w']-1)*100:.1f}%), "
+                        f"chars={len(line_text)}, text='{line_text[:60]}...'"
+                    )
+                _pre_text = line_text
                 line_text = _trim_text_to_fit(
                     line_text, line_orig_hex, actual_font, fs_line,
-                    orig_w_override=full_line_w,
+                    orig_w_override=budget["max_w"],
+                    use_kerned_tj=_will_use_kerned,
                 )
+                if line_text != _pre_text:
+                    logger.debug(
+                        f"[TRIM-CUT] {label} line {gi}: "
+                        f"{len(_pre_text)}→{len(line_text)} chars"
+                    )
+                    # If this is the last line with content, clean up
+                    # incomplete endings caused by trimming.
+                    is_last_content = all(
+                        line_assignments[k] is None
+                        for k in range(gi + 1, num_groups)
+                    ) if gi < num_groups - 1 else True
+                    if is_last_content or gi == num_groups - 1:
+                        _trim_words = line_text.split()
+                        while (len(_trim_words) > 2
+                               and _has_incomplete_ending(' '.join(_trim_words), strict=False)):
+                            _trim_words.pop()
+                        line_text = " ".join(_trim_words).rstrip(" ,;:")
 
                 # Encode this line's text
                 line_hex, line_missing = cmap_mgr.encode_text(actual_font, line_text)
@@ -3842,7 +5334,13 @@ def _patch_content_stream(
                     continue
 
                 # Build content bytes for this line.
-                if uses_literal:
+                # Use per-pair kerned TJ content for TJ operators (hex fonts)
+                use_kerned = False
+                if not uses_literal and write_blk.text_ops and write_blk.text_ops[0].operator == "TJ":
+                    line_content, use_kerned = _build_kerned_hex_content(
+                        line_text, actual_font, line_hex, full_line_w, fs_line,
+                    )
+                elif uses_literal:
                     line_content = _build_literal_content(line_text, actual_font)
                 else:
                     line_content = f"<{line_hex}>".encode("latin-1")
@@ -3868,6 +5366,7 @@ def _patch_content_stream(
                         line_orig_hex, line_hex, line_content,
                         font_size=fs_line,
                         orig_w_override=full_line_w,
+                        use_kerned_content=use_kerned,
                     )
                     queue_patch(write_blk.stream_xref, first_op.byte_offset,
                                 first_op.byte_length, line_content)
@@ -3923,15 +5422,50 @@ def _patch_content_stream(
             needs_font_switch_single = (write_blk.font_tag != actual_font)
 
             fs_single = write_blk.font_size if write_blk.text_ops else 10.0
+
+            # Margin-based width budget for single-line path
+            write_x_pts = write_blk.x
+            available_pts = max(0, right_margin_pts - write_x_pts)
+            margin_w_real = available_pts * 1000.0 / max(fs_single, 1.0)
+            # Same ratio-based logic as multi-line path
+            if margin_w_real > 0 and full_line_w_single > 0:
+                _sl_ratio = full_line_w_single / margin_w_real
+            else:
+                _sl_ratio = 1.0
+            if _sl_ratio > 1.0:
+                # Width map overestimates — inflate to match
+                effective_w = max(full_line_w_single, margin_w_real * min(_sl_ratio, 2.0))
+            else:
+                # Width map accurate — trust margin_w_real
+                effective_w = max(full_line_w_single, margin_w_real)
+
+            _will_use_kerned = (
+                not uses_literal and write_blk.text_ops
+                and write_blk.text_ops[0].operator == "TJ" and kern_reader is not None
+            )
             trimmed_text = _trim_text_to_fit(
                 new_text, all_orig_hex, actual_font, fs_single,
-                orig_w_override=full_line_w_single,
+                orig_w_override=effective_w,
+                use_kerned_tj=_will_use_kerned,
             )
+            # Incomplete-ending cleanup on single-line result
+            _sl_words = trimmed_text.split()
+            while (len(_sl_words) > 2
+                   and _has_incomplete_ending(' '.join(_sl_words), strict=False)):
+                _sl_words.pop()
+            trimmed_text = " ".join(_sl_words).rstrip(" ,;:")
+
             if trimmed_text != new_text:
                 hex_encoded, _ = cmap_mgr.encode_text(actual_font, trimmed_text)
                 new_text = trimmed_text
 
-            if uses_literal:
+            # Use per-pair kerned TJ content for TJ operators (hex fonts)
+            use_kerned = False
+            if not uses_literal and write_blk.text_ops and write_blk.text_ops[0].operator == "TJ":
+                new_content_bytes, use_kerned = _build_kerned_hex_content(
+                    new_text, actual_font, hex_encoded, effective_w, fs_single,
+                )
+            elif uses_literal:
                 new_content_bytes = _build_literal_content(new_text, actual_font)
             else:
                 new_content_bytes = f"<{hex_encoded}>".encode("latin-1")
@@ -3951,7 +5485,8 @@ def _patch_content_stream(
                     first_op, write_blk.stream_xref,
                     all_orig_hex, hex_encoded, new_content_bytes,
                     font_size=fs_single,
-                    orig_w_override=full_line_w_single,
+                    orig_w_override=effective_w,
+                    use_kerned_content=use_kerned,
                 )
                 queue_patch(write_blk.stream_xref, first_op.byte_offset,
                             first_op.byte_length, new_content_bytes)
@@ -4092,6 +5627,19 @@ def _patch_content_stream(
             except Exception as e:
                 logger.warning(f"[PATCH] Failed to process title {t_idx}: {e}")
 
+    # ── Process header replacements (arbitrary text) ──
+    if header_replacements:
+        for orig_text, new_text in header_replacements.items():
+            try:
+                if not orig_text or not new_text:
+                    continue
+                # Headers don't have a known font — pass empty to let
+                # _do_replacement discover the font from matched blocks.
+                if _do_replacement(orig_text, new_text, "", f"header '{orig_text[:30]}'"):
+                    replacements_applied += 1
+            except Exception as e:
+                logger.warning(f"[PATCH] Failed to process header '{orig_text[:30]}': {e}")
+
     # Apply all patches per stream (sorted descending by offset)
     for xref, patches in stream_patches.items():
         try:
@@ -4140,6 +5688,7 @@ def apply_changes_to_pdf(
     skill_replacements: Dict[int, str],
     title_skills: Optional[List[TitleSkillLine]] = None,
     title_replacements: Optional[Dict[int, str]] = None,
+    header_replacements: Optional[Dict[str, str]] = None,
 ) -> str:
     """Apply optimized text back to the PDF using content stream patching.
 
@@ -4153,6 +5702,7 @@ def apply_changes_to_pdf(
     cmap_mgr = _CMapManager(doc)
     width_calc = _WidthCalculator(doc)
     font_aug = _FontAugmentor()
+    kern_reader = _KerningReader(doc, cmap_mgr)
 
     # Rebuild classified lines from the input bullets/skills for matching
     # We need the full list of classified lines to map to content blocks
@@ -4172,6 +5722,10 @@ def apply_changes_to_pdf(
         for ts in title_skills:
             if ts.full_spans:
                 pages_with_content.add(ts.full_spans[0].page_num)
+    if header_replacements:
+        # Headers can be on any page — include all pages
+        for pg in range(len(doc)):
+            pages_with_content.add(pg)
 
     for page_num in sorted(pages_with_content):
         page = doc[page_num]
@@ -4198,6 +5752,8 @@ def apply_changes_to_pdf(
                 bullet_replacements, skill_replacements,
                 cmap_mgr, width_calc, font_aug,
                 title_skills, title_replacements,
+                kern_reader,
+                header_replacements,
             )
         except Exception as e:
             logger.error(f"[APPLY] Failed to patch page {page_num}: {e}", exc_info=True)
@@ -5267,19 +6823,121 @@ async def optimize_pdf(
     bullets, skills, title_skills = group_bullet_points(classified)
     logger.info(f"Found {len(bullets)} bullet points, {len(skills)} skill lines, {len(title_skills)} title skill lines")
 
-    # Step 3: Optimize with Claude
+    # Step 3: Compute pixel-based budgets and optimize with Claude
+    bullet_budgets = _compute_bullet_char_budgets(bullets, classified)
+    logger.info(f"Computed budgets for {len(bullet_budgets)} bullets (total chars: {sum(b['total'] for b in bullet_budgets.values())})")
     bullet_replacements, skill_replacements, title_replacements = await generate_optimized_content(
         bullets, skills, job_description, title_skills,
+        bullet_budgets=bullet_budgets,
     )
     raw_bullet_count = len(bullet_replacements)
     raw_bullet_keys = set(bullet_replacements.keys())
     bullet_replacements = sanitize_bullet_replacements(
-        bullets, bullet_replacements, length_tolerance=0.20
+        bullets, bullet_replacements, length_tolerance=0.20,
+        bullet_budgets=bullet_budgets,
     )
     dropped_indices = raw_bullet_keys - set(bullet_replacements.keys())
     dropped_count = len(dropped_indices)
     if dropped_count > 0:
         logger.info(f"[SANITIZE] Dropped {dropped_count}/{raw_bullet_count} bullets after first pass")
+
+    # Retry for bullets that are too SHORT — the LLM generated too little text
+    # to fill the available pixel space. These bullets would leave ugly half-empty
+    # continuation lines. Re-prompt with explicit "write MORE text" instruction.
+    short_indices: List[int] = []
+    if bullet_budgets:
+        for idx, lines in bullet_replacements.items():
+            if idx in bullet_budgets:
+                budget_total = bullet_budgets[idx]["total"]
+                actual_total = sum(len(l.strip()) for l in lines)
+                if actual_total < budget_total * 0.80:  # Less than 80% of pixel budget
+                    short_indices.append(idx)
+                    logger.info(
+                        f"[SHORT] Bullet {idx}: {actual_total} chars but budget allows {budget_total} "
+                        f"({actual_total/budget_total*100:.0f}% fill)"
+                    )
+
+    if short_indices and len(short_indices) <= 8:
+        logger.info(f"[SHORT-RETRY] Retrying {len(short_indices)} short bullets")
+        from app.llm.claude_client import ClaudeClient
+        short_claude = ClaudeClient()
+        short_bullet_texts = []
+        for idx in sorted(short_indices):
+            bp = bullets[idx]
+            budget_total = bullet_budgets[idx]["total"]
+            current_text = " ".join(l.strip() for l in bullet_replacements[idx])
+            short_bullet_texts.append(
+                f"  BULLET {idx+1} ({bp.section_name}) "
+                f"[{len(bp.line_texts)} lines, total {budget_total}-{int(budget_total * 1.3)} chars]:\n"
+                f"    Current (TOO SHORT at {len(current_text)} chars): {current_text}\n"
+                f"    Original:\n" + "\n".join(f"      {lt}" for lt in bp.line_texts)
+            )
+        if short_bullet_texts:
+            short_prompt = f"""The following resume bullet points are TOO SHORT. They need to be LONGER to fill the available space in the PDF.
+Each bullet MUST be within the character range shown in brackets. AIM FOR THE MAXIMUM.
+
+RULES:
+1. EXPAND the bullet — add more detail, context, impact, or metrics. Do NOT just pad with filler words.
+2. The TOTAL character count across ALL lines must be within the range in brackets. COUNT CAREFULLY.
+3. Each bullet must have the SAME number of lines as the original.
+4. Every bullet MUST be a COMPLETE, MEANINGFUL statement — no fragments.
+5. PRESERVE all technologies, metrics, and factual claims from the current text.
+6. NEVER include bullet point characters at the start.
+
+JOB DESCRIPTION:
+{job_description[:2000]}
+
+BULLETS TO EXPAND:
+{chr(10).join(short_bullet_texts)}
+"""
+            short_schema = {
+                "type": "object",
+                "properties": {
+                    "bullets": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "index": {"type": "integer"},
+                                "lines": {"type": "array", "items": {"type": "string"}},
+                            },
+                            "required": ["index", "lines"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["bullets"],
+                "additionalProperties": False,
+            }
+            try:
+                short_parsed = await short_claude._send_request_json(
+                    "You are an expert resume optimizer. Bullets are too short — EXPAND them to fill the character budget.",
+                    short_prompt,
+                    json_schema=short_schema,
+                    max_tokens=8192,
+                )
+                if short_parsed and "bullets" in short_parsed:
+                    short_raw: Dict[int, List[str]] = {}
+                    for item in short_parsed["bullets"]:
+                        s_idx = item.get("index", 0) - 1
+                        s_lines = item.get("lines", [])
+                        if 0 <= s_idx < len(bullets) and s_lines:
+                            short_raw[s_idx] = s_lines
+                    short_sanitized = sanitize_bullet_replacements(
+                        bullets, short_raw, length_tolerance=0.30,
+                        bullet_budgets=bullet_budgets,
+                    )
+                    # Only accept if actually longer
+                    for s_idx, s_lines in short_sanitized.items():
+                        new_total = sum(len(l.strip()) for l in s_lines)
+                        old_total = sum(len(l.strip()) for l in bullet_replacements.get(s_idx, []))
+                        if new_total > old_total:
+                            bullet_replacements[s_idx] = s_lines
+                            logger.info(f"[SHORT-RETRY] Bullet {s_idx}: expanded {old_total}→{new_total} chars")
+                        else:
+                            logger.info(f"[SHORT-RETRY] Bullet {s_idx}: retry not longer ({new_total} vs {old_total}), keeping original")
+            except Exception as e:
+                logger.warning(f"[SHORT-RETRY] Retry failed: {e}")
 
     # Retry loop: re-prompt Claude for dropped bullets with stricter constraints
     if 0 < dropped_count <= 5:
@@ -5293,21 +6951,33 @@ async def optimize_pdf(
                 bp = bullets[idx]
                 lines_info = []
                 for j, lt in enumerate(bp.line_texts):
-                    exact_len = len(lt.strip())
-                    min_c = max(1, int(exact_len * 0.85))
-                    max_c = int(exact_len * 1.15)
-                    lines_info.append(f"    Line {j+1} (EXACTLY {min_c}-{max_c} chars, orig={exact_len}): {lt}")
-                retry_bullet_texts.append(f"  BULLET {idx+1} ({bp.section_name}):\n" + "\n".join(lines_info))
+                    lines_info.append(f"    Line {j+1}: {lt}")
+
+                # Use pixel-based budget if available (inflated)
+                if bullet_budgets and idx in bullet_budgets:
+                    total_budget = bullet_budgets[idx]["total"]
+                    min_total = total_budget  # MINIMUM = actual pixel budget
+                    max_total = int(total_budget * 1.3)
+                else:
+                    total_chars = sum(len(lt.strip()) for lt in bp.line_texts)
+                    min_total = max(20, int(total_chars * 0.85))
+                    max_total = int(total_chars * 1.15)
+
+                retry_bullet_texts.append(
+                    f"  BULLET {idx+1} ({bp.section_name}) "
+                    f"[{len(bp.line_texts)} lines, total {min_total}-{max_total} chars]:\n"
+                    + "\n".join(lines_info)
+                )
 
         if retry_bullet_texts:
             retry_prompt = f"""Rewrite these resume bullet points for the job description below.
 
 CRITICAL RULES:
-1. Each line MUST be within the EXACT character range shown. Count carefully.
-2. If a line is 45 chars, your replacement must be 38-51 chars. NO EXCEPTIONS.
-3. PRESERVE: company names, metrics, percentages, dates, and ALL technologies/tools — do NOT fabricate or add technologies not in the original bullet.
-4. Each bullet must have the SAME number of lines as the original
-5. Emphasize themes from the job description (scalability, real-time, enterprise, etc.) but do NOT swap in the JD's tech stack — keep the candidate's actual technologies.
+1. The TOTAL character count across ALL lines must be within the range in brackets.
+2. Each bullet must have the SAME number of lines as the original. Split text evenly.
+3. PRESERVE: company names, metrics, percentages, dates, and ALL technologies/tools — do NOT fabricate.
+4. Every bullet must be a COMPLETE, MEANINGFUL statement — no dangling words or fragments.
+5. Emphasize themes from the job description (scalability, real-time, enterprise, etc.) but do NOT swap in the JD's tech stack.
 
 JOB DESCRIPTION:
 {job_description[:2000]}
@@ -5350,7 +7020,8 @@ BULLETS:
                             retry_raw[idx] = lines
                     # Sanitize with relaxed tolerance
                     retry_sanitized = sanitize_bullet_replacements(
-                        bullets, retry_raw, length_tolerance=0.25
+                        bullets, retry_raw, length_tolerance=0.25,
+                        bullet_budgets=bullet_budgets,
                     )
                     recovered = len(retry_sanitized)
                     bullet_replacements.update(retry_sanitized)

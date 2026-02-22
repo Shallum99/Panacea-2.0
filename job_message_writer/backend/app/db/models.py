@@ -140,8 +140,14 @@ class Resume(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     owner_id = Column(Integer, ForeignKey("users.id"))
     
+    # Cached form map for editor
+    form_map = Column(Text, nullable=True)
+    font_quality = Column(String, nullable=True)
+
     owner = relationship("User", back_populates="resumes")
     applications = relationship("Application", back_populates="resume")
+    versions = relationship("ResumeVersion", back_populates="resume", cascade="all, delete-orphan",
+                            order_by="ResumeVersion.version_number")
 
 
 class Application(Base):
@@ -237,3 +243,21 @@ class ChatMessage(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     conversation = relationship("ChatConversation", back_populates="messages")
+
+
+class ResumeVersion(Base):
+    __tablename__ = "resume_versions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    resume_id = Column(Integer, ForeignKey("resumes.id", ondelete="CASCADE"), nullable=False, index=True)
+    version_number = Column(Integer, nullable=False)
+    download_id = Column(String, nullable=False)
+    diff_download_id = Column(String, nullable=True)
+    parent_version_id = Column(Integer, ForeignKey("resume_versions.id"), nullable=True)
+    prompt_used = Column(Text, nullable=False)
+    changes_json = Column(Text, nullable=True)
+    source_download_id = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    resume = relationship("Resume", back_populates="versions")
+    parent_version = relationship("ResumeVersion", remote_side=[id])

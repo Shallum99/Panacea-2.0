@@ -224,12 +224,13 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "edit_tailored_resume",
-        "description": "Make targeted text edits to a previously tailored resume PDF. Use when the user wants to change specific bullets, skills, or sections after tailoring. Takes the download_id of the current version and edit instructions, returns a new version.",
+        "description": "Make targeted text edits to a previously tailored resume PDF. Use when the user wants to change specific bullets, skills, sections, header text (name, contact info, LinkedIn URL), or any other content after tailoring. Takes the download_id of the current version and edit instructions, returns a new version.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "download_id": {"type": "string", "description": "download_id of the current tailored resume version"},
                 "instructions": {"type": "string", "description": "What to change (e.g. 'change the second bullet in Experience to emphasize Python and add Kubernetes')"},
+                "resume_id": {"type": "integer", "description": "Original resume ID (pass through from the tailor result for original PDF access)"},
             },
             "required": ["download_id", "instructions"],
         },
@@ -557,6 +558,21 @@ async def _tool_tailor_resume(args: Dict, user: models.User, db: Session) -> Tup
             doc = fitz.open(out_path)
             optimized_text = "".join(page.get_text() for page in doc)
             doc.close()
+
+            # Compute font coverage from input PDF
+            try:
+                src_doc = fitz.open(input_path)
+                total_fonts = 0
+                fonts_with_enc = 0
+                for pg in src_doc:
+                    for fi in pg.get_fonts(full=True):
+                        total_fonts += 1
+                        if fi[3]:
+                            fonts_with_enc += 1
+                src_doc.close()
+                result["font_coverage_pct"] = round(fonts_with_enc / total_fonts * 100, 1) if total_fonts else 100.0
+            except Exception:
+                result["font_coverage_pct"] = 100.0
             # Upload tailored PDF to storage
             with open(out_path, "rb") as f:
                 output_bytes = f.read()
@@ -650,6 +666,7 @@ async def _tool_tailor_resume(args: Dict, user: models.User, db: Session) -> Tup
         "changes": result.get("changes", []),
         "ats_score_before": original_score,
         "ats_score_after": optimized_score,
+        "font_coverage_pct": result.get("font_coverage_pct", 100.0),
     }, "resume_tailored"
 
 
@@ -948,9 +965,12 @@ async def _tool_set_context(args: Dict, user: models.User, db: Session) -> Tuple
 
 
 async def _tool_edit_tailored_resume(args: Dict, user: models.User, db: Session) -> Tuple[Dict, str]:
-    """Make targeted text edits to a previously tailored resume PDF."""
+    """Make targeted text edits to a previously tailored resume PDF.
+    Supports bullets, skills, title skills, AND header text (name, contact info)."""
     import os
+    import re
     import uuid
+    import shutil
     import tempfile
     import difflib
     import fitz
@@ -961,6 +981,7 @@ async def _tool_edit_tailored_resume(args: Dict, user: models.User, db: Session)
         group_bullet_points,
         sanitize_bullet_replacements,
         apply_changes_to_pdf,
+        LineType,
     )
     from app.services.storage import download_file, upload_file, TAILORED_BUCKET
     from app.llm.claude_client import ClaudeClient
@@ -991,8 +1012,33 @@ async def _tool_edit_tailored_resume(args: Dict, user: models.User, db: Session)
         classified, _ = classify_lines(visual_lines)
         bullets, skills, title_skills = group_bullet_points(classified)
 
-        # 4. Build human-readable resume map for Claude
+        # 3b. Extract header texts (name, contact info, etc.)
+        # Include ALL structure lines — section headers like "EXPERIENCE" are
+        # included too, but Claude's prompt says to only change what the user asks for.
+        _SECTION_LABELS = {
+            "experience", "education", "skills", "projects", "work experience",
+            "professional experience", "technical skills", "certifications",
+            "summary", "objective", "awards", "publications", "references",
+            "volunteer", "interests", "activities", "leadership", "languages",
+            "core competencies", "professional summary", "additional",
+        }
+        header_texts = []
+        for cl in classified:
+            if cl.line_type != LineType.STRUCTURE:
+                continue
+            clean = "".join(s.text for s in cl.spans).replace("\u200b", "").strip()
+            if not clean or len(clean) < 2:
+                continue
+            # Skip obvious section headers like "EXPERIENCE", "EDUCATION"
+            if clean.strip().lower() in _SECTION_LABELS:
+                continue
+            header_texts.append(clean)
+
+        # 4. Build resume map for Claude — includes headers
         resume_map_parts = []
+
+        for i, ht in enumerate(header_texts):
+            resume_map_parts.append(f'HEADER {i}: "{ht}"')
 
         for i, bp in enumerate(bullets):
             section = bp.section_name or "Unknown"
@@ -1020,7 +1066,7 @@ async def _tool_edit_tailored_resume(args: Dict, user: models.User, db: Session)
 
         # 5. Send to Claude for targeted edits
         claude = ClaudeClient()
-        edit_prompt = f"""You are editing a resume PDF. Below is the current content organized by type (bullets, skills, title skills).
+        edit_prompt = f"""You are editing a resume PDF. Below is the current content organized by type.
 
 The user wants to make this change:
 {instructions}
@@ -1030,20 +1076,23 @@ CURRENT RESUME CONTENT:
 
 RULES:
 - Only change what the user asked for. Leave everything else untouched.
+- For HEADER fields: you CAN change names, contact info, LinkedIn URLs, etc. Return a single replacement string.
 - For bullets: each replacement MUST have the SAME number of lines as the original.
-- For bullets: each line MUST be SIMILAR length (±15% chars) as the original line to fit the PDF layout.
+- For bullets: each line should be SIMILAR length to the original line (some variation is OK, the PDF engine handles width).
+- NEVER include bullet point characters (•, ●, ◦, ■, ▪, -, –, —) at the start of replacement text. The PDF already has the bullet marker. Return only the text content.
 - For skills: return only the content part (not the bold label).
 - For title skills: return only the skills part (not the title itself).
 - Preserve all metrics, dates, company names unless the user explicitly asked to change them.
 
 Return a JSON object with ONLY the items you changed:
 {{
+  "header_replacements": {{"<header_index>": "new header text"}},
   "bullet_replacements": {{"<bullet_index>": ["line 1 text", "line 2 text", ...]}},
   "skill_replacements": {{"<skill_index>": "new content without label"}},
   "title_replacements": {{"<title_index>": "new skills part"}}
 }}
 
-Return ONLY the JSON. If nothing should change, return {{"bullet_replacements": {{}}, "skill_replacements": {{}}, "title_replacements": {{}}}}"""
+Return ONLY the JSON. If nothing should change, return {{"header_replacements": {{}}, "bullet_replacements": {{}}, "skill_replacements": {{}}, "title_replacements": {{}}}}"""
 
         edit_text = await claude._send_request(
             system_prompt="You make precise, targeted edits to resume text. Return only valid JSON.",
@@ -1051,12 +1100,19 @@ Return ONLY the JSON. If nothing should change, return {{"bullet_replacements": 
             max_tokens=4096,
         )
 
-        import re
         match = re.search(r'\{[\s\S]*\}', edit_text)
         if match:
             edits = json.loads(match.group())
         else:
             edits = json.loads(edit_text)
+
+        # Parse header replacements: {index: new_text} → {orig_text: new_text}
+        header_replacements = {}
+        for k, v in edits.get("header_replacements", {}).items():
+            idx = int(k)
+            new_text = str(v).strip()
+            if 0 <= idx < len(header_texts) and new_text:
+                header_replacements[header_texts[idx]] = new_text
 
         bullet_replacements = {int(k): v for k, v in edits.get("bullet_replacements", {}).items()}
         skill_replacements = {
@@ -1069,8 +1125,10 @@ Return ONLY the JSON. If nothing should change, return {{"bullet_replacements": 
             for k, v in edits.get("title_replacements", {}).items()
             if str(v).strip()
         }
+
+        # Sanitize with relaxed tolerance — Tc character spacing handles width
         bullet_replacements = sanitize_bullet_replacements(
-            bullets, bullet_replacements, length_tolerance=0.15
+            bullets, bullet_replacements, length_tolerance=0.50
         )
         skill_replacements = {
             idx: content for idx, content in skill_replacements.items()
@@ -1081,10 +1139,13 @@ Return ONLY the JSON. If nothing should change, return {{"bullet_replacements": 
             if 0 <= idx < len(title_skills)
         }
 
-        if not bullet_replacements and not skill_replacements and not title_replacements:
+        has_body_changes = bool(bullet_replacements) or bool(skill_replacements) or bool(title_replacements)
+        has_header_changes = bool(header_replacements)
+
+        if not has_body_changes and not has_header_changes:
             return {"error": "No valid edits could be applied while preserving layout constraints."}, "error"
 
-        # 6. Apply changes to PDF
+        # 6. Apply ALL changes to PDF via unified pipeline (including headers)
         fd2, output_path = tempfile.mkstemp(suffix=".pdf")
         os.close(fd2)
         try:
@@ -1093,6 +1154,7 @@ Return ONLY the JSON. If nothing should change, return {{"bullet_replacements": 
                 bullets, skills,
                 bullet_replacements, skill_replacements,
                 title_skills, title_replacements,
+                header_replacements=header_replacements if has_header_changes else None,
             )
 
             # Read output
@@ -1167,6 +1229,13 @@ Return ONLY the JSON. If nothing should change, return {{"bullet_replacements": 
 
             # 9. Build changes list
             changes = []
+            for orig_text, new_text in header_replacements.items():
+                changes.append({
+                    "section": "Header",
+                    "type": "header",
+                    "original": orig_text,
+                    "optimized": new_text,
+                })
             for idx, new_lines in bullet_replacements.items():
                 if idx < len(bullets):
                     changes.append({
@@ -1202,13 +1271,33 @@ Return ONLY the JSON. If nothing should change, return {{"bullet_replacements": 
                 if c.get("section")
             })
 
-            return {
+            # Compute font coverage from input PDF
+            try:
+                cov_doc = fitz.open(input_path)
+                _total = 0
+                _with_enc = 0
+                for pg in cov_doc:
+                    for fi in pg.get_fonts(full=True):
+                        _total += 1
+                        if fi[3]:
+                            _with_enc += 1
+                cov_doc.close()
+                _font_cov = round(_with_enc / _total * 100, 1) if _total else 100.0
+            except Exception:
+                _font_cov = 100.0
+
+            result_data = {
                 "resume_title": "Edited Resume",
                 "download_id": new_download_id,
                 "diff_download_id": diff_download_id,
                 "sections_optimized": optimized_sections,
                 "changes": changes,
-            }, "resume_tailored"
+                "font_coverage_pct": _font_cov,
+            }
+            # Pass through resume_id so the frontend can load the original PDF
+            if args.get("resume_id"):
+                result_data["resume_id"] = args["resume_id"]
+            return result_data, "resume_tailored"
 
         finally:
             try:
@@ -1221,3 +1310,101 @@ Return ONLY the JSON. If nothing should change, return {{"bullet_replacements": 
             os.unlink(input_path)
         except OSError:
             pass
+
+
+def _apply_header_replacements_fitz(pdf_path: str, replacements: Dict[str, str]):
+    """Apply header text replacements using PyMuPDF redaction with font matching."""
+    import fitz
+    import tempfile
+    import shutil
+
+    doc = fitz.open(pdf_path)
+    modified = False
+
+    for page in doc:
+        for orig_text, new_text in replacements.items():
+            rects = page.search_for(orig_text)
+            if not rects:
+                continue
+
+            # Detect font info from the text location
+            font_name = "helv"
+            font_size = 12.0
+            text_color = (0, 0, 0)
+
+            blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
+            for block in blocks:
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines", []):
+                    line_text = "".join(s["text"] for s in line.get("spans", []))
+                    if orig_text in line_text:
+                        for span in line.get("spans", []):
+                            if span["text"].strip() and any(
+                                c in orig_text for c in span["text"].strip()[:5]
+                            ):
+                                font_name = span.get("font", "helv")
+                                font_size = span.get("size", 12.0)
+                                color_int = span.get("color", 0)
+                                text_color = (
+                                    ((color_int >> 16) & 0xFF) / 255.0,
+                                    ((color_int >> 8) & 0xFF) / 255.0,
+                                    (color_int & 0xFF) / 255.0,
+                                )
+                                break
+                        break
+
+            fitz_font = _map_to_fitz_font(font_name)
+            for rect in rects:
+                page.add_redact_annot(
+                    rect,
+                    text=new_text,
+                    fontname=fitz_font,
+                    fontsize=font_size,
+                    text_color=text_color,
+                    fill=(1, 1, 1),
+                )
+
+            page.apply_redactions()
+            modified = True
+            logger.info(f"[EDIT] Header replaced: '{orig_text}' → '{new_text}' (font={font_name}, size={font_size})")
+
+    if modified:
+        fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+        import os as _os
+        _os.close(fd)
+        doc.save(tmp_path, garbage=4, deflate=True)
+        doc.close()
+        shutil.move(tmp_path, pdf_path)
+    else:
+        doc.close()
+
+
+def _map_to_fitz_font(pdf_font_name: str) -> str:
+    """Map PDF font name to a fitz built-in font name for redaction."""
+    name = pdf_font_name.lower()
+    if "times" in name:
+        if "bold" in name and "italic" in name:
+            return "tibi"
+        if "bold" in name:
+            return "tibo"
+        if "italic" in name:
+            return "tiit"
+        return "tiro"
+    if "arial" in name or "helvetica" in name:
+        if "bold" in name and ("italic" in name or "oblique" in name):
+            return "hebi"
+        if "bold" in name:
+            return "hebo"
+        if "italic" in name or "oblique" in name:
+            return "heit"
+        return "helv"
+    if "courier" in name:
+        if "bold" in name and ("italic" in name or "oblique" in name):
+            return "cobi"
+        if "bold" in name:
+            return "cobo"
+        if "italic" in name or "oblique" in name:
+            return "coit"
+        return "cour"
+    return "helv"

@@ -99,7 +99,7 @@ export default function ChatArea({
           </div>
         ) : (
           <div className="max-w-2xl mx-auto px-4 py-6 space-y-5">
-            {messages.map((msg) => (
+            {messages.map((msg, msgIdx) => (
               <div key={msg.id}>
                 {msg.role === "user" ? (
                   <UserBubble content={msg.content} />
@@ -117,7 +117,14 @@ export default function ChatArea({
                     />
                   )
                 ) : (
-                  <AssistantBubble content={msg.content} />
+                  <AssistantBubble
+                    content={msg.content}
+                    onOptionClick={!sending ? sendMessage : undefined}
+                    isLastAssistant={
+                      msgIdx === messages.length - 1 ||
+                      messages.slice(msgIdx + 1).every((m) => m.role !== "assistant")
+                    }
+                  />
                 )}
               </div>
             ))}
@@ -180,7 +187,86 @@ function UserBubble({ content }: { content: string }) {
   );
 }
 
-function AssistantBubble({ content }: { content: string }) {
+/** Detect numbered options (1. Foo\n2. Bar) or dash options (- Foo\n- Bar) at end of message */
+function parseOptions(content: string): { text: string; options: string[] } | null {
+  const lines = content.split("\n");
+  const optionRegex = /^\s*(\d+)[\.\)]\s+(.+)/;
+  const dashRegex = /^\s*[-–—]\s+(.+)/;
+
+  // Find where options start (scan backwards from end)
+  let optionStartIdx = lines.length;
+  let usesDash = false;
+
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const trimmed = lines[i].trim();
+    if (!trimmed) {
+      // Allow blank lines within options block
+      if (optionStartIdx < lines.length) continue;
+      break;
+    }
+    if (optionRegex.test(trimmed)) {
+      optionStartIdx = i;
+    } else if (dashRegex.test(trimmed)) {
+      optionStartIdx = i;
+      usesDash = true;
+    } else {
+      break;
+    }
+  }
+
+  // Need at least 2 options
+  const optionLines = lines.slice(optionStartIdx).filter((l) => l.trim());
+  if (optionLines.length < 2) return null;
+
+  const options = optionLines.map((l) => {
+    const numMatch = l.trim().match(optionRegex);
+    if (numMatch) return numMatch[2].trim();
+    const dashMatch = l.trim().match(dashRegex);
+    if (dashMatch) return dashMatch[1].trim();
+    return l.trim();
+  }).filter(Boolean);
+
+  if (options.length < 2) return null;
+
+  const textPart = lines.slice(0, optionStartIdx).join("\n").trimEnd();
+  return { text: textPart, options };
+}
+
+function AssistantBubble({
+  content,
+  onOptionClick,
+  isLastAssistant,
+}: {
+  content: string;
+  onOptionClick?: (text: string) => void;
+  isLastAssistant: boolean;
+}) {
+  // Only show interactive buttons on the LAST assistant message
+  const parsed = isLastAssistant && onOptionClick ? parseOptions(content) : null;
+
+  if (parsed && onOptionClick) {
+    return (
+      <div>
+        {parsed.text && (
+          <div className="text-[13px] text-[#ededed] leading-relaxed whitespace-pre-wrap">
+            {parsed.text}
+          </div>
+        )}
+        <div className="flex flex-wrap gap-2 mt-2.5">
+          {parsed.options.map((opt, i) => (
+            <button
+              key={i}
+              onClick={() => onOptionClick(opt)}
+              className="px-3 py-1.5 rounded-lg border border-[#333] bg-[#0a0a0a] text-[12px] text-[#ccc] hover:text-[#ededed] hover:border-[#555] hover:bg-[#111] transition-colors text-left"
+            >
+              {opt}
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="text-[13px] text-[#ededed] leading-relaxed whitespace-pre-wrap">
       {content}

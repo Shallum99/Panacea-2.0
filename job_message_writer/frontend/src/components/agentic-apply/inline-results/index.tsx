@@ -23,8 +23,10 @@ function getArtifactTitle(richType: string, data: Record<string, unknown>): stri
   switch (richType) {
     case "message_preview":
       return (data.subject as string) || "Generated Message";
-    case "resume_tailored":
-      return `Tailored: ${(data.resume_title as string) || "Resume"}`;
+    case "resume_tailored": {
+      const name = (data.resume_title as string) || "Resume";
+      return `${name}`;
+    }
     case "resume_score":
       return `ATS Score${data.resume_title ? ` \u2014 ${data.resume_title}` : ""}`;
     default:
@@ -65,13 +67,18 @@ export default function InlineRichResult({
   ) {
     const d = data as Record<string, unknown>;
     return (
-      <ArtifactCard
-        type={richType as "message_preview" | "resume_tailored" | "resume_score"}
-        title={getArtifactTitle(richType, d)}
-        subtitle={getArtifactSubtitle(richType, d)}
-        isActive={activeArtifactMessageId === messageId}
-        onClick={() => onOpenArtifact(messageId)}
-      />
+      <div className="space-y-2">
+        <ArtifactCard
+          type={richType as "message_preview" | "resume_tailored" | "resume_score"}
+          title={getArtifactTitle(richType, d)}
+          subtitle={getArtifactSubtitle(richType, d)}
+          isActive={activeArtifactMessageId === messageId}
+          onClick={() => onOpenArtifact(messageId)}
+        />
+        {richType === "resume_tailored" && onSendMessage && (
+          <QuickEditChips onSendMessage={onSendMessage} />
+        )}
+      </div>
     );
   }
 
@@ -294,6 +301,29 @@ function GenericInline({ data }: { data: unknown }) {
       <pre className="whitespace-pre-wrap max-h-32 overflow-y-auto">
         {JSON.stringify(data, null, 2)}
       </pre>
+    </div>
+  );
+}
+
+const QUICK_EDITS = [
+  { label: "More technical", prompt: "Make the bullet points more technical with specific technologies and methodologies" },
+  { label: "Add metrics", prompt: "Add quantifiable metrics and numbers to the bullet points where possible" },
+  { label: "Shorten bullets", prompt: "Make the bullet points more concise — each should be one line" },
+  { label: "Emphasize leadership", prompt: "Emphasize leadership, ownership, and cross-team collaboration in the bullet points" },
+];
+
+function QuickEditChips({ onSendMessage }: { onSendMessage: (text: string) => void }) {
+  return (
+    <div className="flex flex-wrap gap-1.5 pl-1">
+      {QUICK_EDITS.map((edit) => (
+        <button
+          key={edit.label}
+          onClick={() => onSendMessage(edit.prompt)}
+          className="px-2.5 py-1 rounded-md border border-[#222] bg-[#0a0a0a] text-[11px] text-[#888] hover:text-[#ededed] hover:border-[#444] transition-colors"
+        >
+          {edit.label}
+        </button>
+      ))}
     </div>
   );
 }

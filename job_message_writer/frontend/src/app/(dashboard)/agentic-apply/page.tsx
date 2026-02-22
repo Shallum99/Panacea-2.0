@@ -13,13 +13,15 @@ import { PanelLeft } from "lucide-react";
 
 const ARTIFACT_TYPES = new Set(["message_preview", "resume_tailored", "resume_score"]);
 
-function extractArtifactTitle(richType: string, data: unknown): string {
+function extractArtifactTitle(richType: string, data: unknown, versionNum: number): string {
   const d = data as Record<string, unknown>;
   switch (richType) {
     case "message_preview":
       return (d.subject as string) || "Generated Message";
-    case "resume_tailored":
-      return `Tailored: ${(d.resume_title as string) || "Resume"}`;
+    case "resume_tailored": {
+      const name = (d.resume_title as string) || "Resume";
+      return `${name} v${versionNum}`;
+    }
     case "resume_score":
       return `ATS Score${d.resume_title ? ` \u2014 ${d.resume_title}` : ""}`;
     default:
@@ -52,11 +54,54 @@ function AgenticApplyInner() {
         msg.richType &&
         ARTIFACT_TYPES.has(msg.richType)
       ) {
-        // addArtifact internally dedupes via trackedIdsRef
+        // For resume_tailored, stack versions in the same artifact instead of creating new tabs
+        if (msg.richType === "resume_tailored") {
+          const existingArtifact = artifactPanel.artifacts.find(
+            (a) => a.type === "resume_tailored"
+          );
+          const existingCount = existingArtifact?.versions?.length ?? 0;
+          const versionNum = existingCount + 1;
+
+          const newArtifact: Artifact = {
+            id: `artifact-${msg.id}`,
+            type: "resume_tailored",
+            title: extractArtifactTitle("resume_tailored", msg.richData, versionNum),
+            data: msg.richData,
+            messageId: msg.id,
+            createdAt: Date.now(),
+          };
+
+          console.log("[ARTIFACT] resume_tailored msg:", msg.id, "existing:", existingArtifact?.id, "existingVersions:", existingCount);
+
+          // Try stacking onto existing. If no existing, addArtifact creates the first one.
+          const stacked = artifactPanel.addVersionToExisting("resume_tailored", newArtifact);
+          console.log("[ARTIFACT] addVersionToExisting returned:", stacked);
+          if (stacked) continue;
+
+          // First version — create with version info initialized
+          const firstTitle = extractArtifactTitle("resume_tailored", msg.richData, 1);
+          artifactPanel.addArtifact({
+            ...newArtifact,
+            title: firstTitle,
+            versions: [
+              {
+                data: msg.richData,
+                messageId: msg.id,
+                createdAt: Date.now(),
+                title: firstTitle,
+              },
+            ],
+            activeVersionIdx: 0,
+          });
+          console.log("[ARTIFACT] Created first artifact via addArtifact");
+          continue;
+        }
+
+        // Other artifact types: normal add
         artifactPanel.addArtifact({
           id: `artifact-${msg.id}`,
           type: msg.richType as Artifact["type"],
-          title: extractArtifactTitle(msg.richType, msg.richData),
+          title: extractArtifactTitle(msg.richType, msg.richData, 1),
           data: msg.richData,
           messageId: msg.id,
           createdAt: Date.now(),
@@ -67,11 +112,20 @@ function AgenticApplyInner() {
 
   const handleOpenArtifact = useCallback(
     (messageId: string) => {
-      const artifact = artifactPanel.artifacts.find(
-        (a) => a.messageId === messageId
-      );
-      if (artifact) {
-        artifactPanel.openArtifact(artifact.id);
+      // Check if this messageId is in any artifact's versions
+      for (const artifact of artifactPanel.artifacts) {
+        if (artifact.messageId === messageId) {
+          artifactPanel.openArtifact(artifact.id);
+          return;
+        }
+        if (artifact.versions) {
+          const vIdx = artifact.versions.findIndex((v) => v.messageId === messageId);
+          if (vIdx !== -1) {
+            artifactPanel.setArtifactVersion(artifact.id, vIdx);
+            artifactPanel.openArtifact(artifact.id);
+            return;
+          }
+        }
       }
     },
     [artifactPanel.artifacts]
@@ -182,6 +236,7 @@ function AgenticApplyInner() {
               onClose={artifactPanel.closePanel}
               onSwitchArtifact={artifactPanel.openArtifact}
               onSendMessage={state.sendMessage}
+              onSetVersion={artifactPanel.setArtifactVersion}
             />
           )}
         </div>
