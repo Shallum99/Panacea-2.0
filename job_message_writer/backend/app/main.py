@@ -138,6 +138,7 @@ def migrate_db():
             ))
             # Resume editor: form_map column
             conn.execute(text("ALTER TABLE resumes ADD COLUMN IF NOT EXISTS form_map TEXT"))
+            conn.execute(text("ALTER TABLE resumes ADD COLUMN IF NOT EXISTS font_quality VARCHAR"))
             # Resume versions table
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS resume_versions (
