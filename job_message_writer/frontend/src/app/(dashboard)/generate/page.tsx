@@ -40,6 +40,7 @@ const MESSAGE_TYPES = [
   { value: "linkedin_connection", label: "LinkedIn Connection" },
   { value: "linkedin_inmail", label: "LinkedIn InMail" },
   { value: "ycombinator", label: "Y Combinator" },
+  { value: "custom", label: "Custom" },
 ];
 
 const WIZARD_STEPS = ["Job Details", "Review", "Send"];
@@ -107,6 +108,7 @@ function GeneratePage() {
   // Inputs
   const [jobDescription, setJobDescription] = useState("");
   const [messageType, setMessageType] = useState("email_detailed");
+  const [customInstructions, setCustomInstructions] = useState("");
   const [recruiterName, setRecruiterName] = useState("");
   const [recipientEmail, setRecipientEmail] = useState("");
   const [positionTitle, setPositionTitle] = useState("");
@@ -281,6 +283,7 @@ function GeneratePage() {
           job_description: jobDescription, message_type: messageType, resume_id: selectedResumeId,
           recruiter_name: recruiterName || undefined, recipient_email: recipientEmail || undefined,
           position_title: positionTitle || undefined, job_url: jobUrl || undefined,
+          custom_instructions: messageType === "custom" && customInstructions ? customInstructions : undefined,
         },
         (text) => setStreamedText((prev) => prev + text),
         (app) => {
@@ -358,7 +361,7 @@ function GeneratePage() {
     setStep(1);
     setResult(null); setStreamedText(""); setEditedMessage(""); setEditedSubject(""); setEditedRecipient("");
     setTailorResult(null); setAttachTailored(false); setActiveTab("message"); setPdfView("tailored");
-    setJobDescription(""); setPositionTitle(""); setRecruiterName(""); setRecipientEmail(""); setJobUrl("");
+    setJobDescription(""); setPositionTitle(""); setRecruiterName(""); setRecipientEmail(""); setJobUrl(""); setCustomInstructions("");
     lastGeneratedJdRef.current = "";
     jobLoadedRef.current = false;
     autoTriggeredRef.current = false;
@@ -522,6 +525,14 @@ function GeneratePage() {
                   </button>
                 ))}
               </div>
+              {messageType === "custom" && (
+                <textarea
+                  value={customInstructions}
+                  onChange={(e) => setCustomInstructions(e.target.value)}
+                  placeholder="Describe the message you want, e.g. 'A thank-you follow-up after an interview, 3 paragraphs, mention the project we discussed...'"
+                  className="w-full mt-2 min-h-[80px] px-3 py-2.5 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-accent/50 placeholder:text-muted-foreground/50 resize-y"
+                />
+              )}
             </div>
 
             {/* Optional fields */}
