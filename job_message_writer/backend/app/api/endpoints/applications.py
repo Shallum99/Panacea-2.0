@@ -37,6 +37,7 @@ def build_message_prompts(
     recruiter_name: Optional[str],
     user: Optional[models.User] = None,
     writing_samples: Optional[list] = None,
+    custom_instructions: Optional[str] = None,
 ) -> tuple:
     """Return (system_prompt, user_prompt, max_tokens) for message generation."""
 
@@ -76,6 +77,12 @@ def build_message_prompts(
             "max_chars": "~500 characters",
             "style": "Contact header, 2-3 dense paragraphs with metrics. Ship fast, move fast energy.",
             "max_tokens": 512,
+        },
+        "custom": {
+            "format": "custom message",
+            "max_chars": "appropriate length for the request",
+            "style": custom_instructions or "Write a professional message tailored to the job description.",
+            "max_tokens": 2048,
         },
     }
 
@@ -283,6 +290,7 @@ async def create_application(
             recruiter_name=request.recruiter_name,
             user=current_user,
             writing_samples=writing_samples,
+            custom_instructions=request.custom_instructions,
         )
 
         # Run company info extraction and message generation in parallel
@@ -415,6 +423,7 @@ async def stream_application(
         recruiter_name=request.recruiter_name,
         user=current_user,
         writing_samples=writing_samples,
+        custom_instructions=request.custom_instructions,
     )
 
     # Capture variables needed inside the generator

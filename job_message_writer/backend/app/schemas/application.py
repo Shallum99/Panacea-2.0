@@ -6,6 +6,7 @@ from datetime import datetime
 class ApplicationCreate(BaseModel):
     job_description: str
     message_type: str = "email_detailed"
+    custom_instructions: Optional[str] = None
     resume_id: Optional[int] = None
     recruiter_name: Optional[str] = None
     recipient_email: Optional[str] = None

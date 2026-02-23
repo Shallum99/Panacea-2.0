@@ -29,6 +29,7 @@ export interface Application {
 export interface CreateApplicationRequest {
   job_description: string;
   message_type?: string;
+  custom_instructions?: string;
   resume_id?: number;
   recruiter_name?: string;
   recipient_email?: string;
