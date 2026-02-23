@@ -1,0 +1,33 @@
+Hostname
+An internal hostname used by your Render services.
+
+dpg-cv3jssdsvqrc73fnksug-a
+
+Port
+5432
+
+Database
+job_message_writer
+
+Username
+job_message_writer_user
+
+Password
+CbvWNVRNKvcH4CwOBnyfhJL9Epd4rHnz
+
+
+Internal Database URL
+postgresql://job_message_writer_user:CbvWNVRNKvcH4CwOBnyfhJL9Epd4rHnz@dpg-cv3jssdsvqrc73fnksug-a/job_message_writer
+
+
+External Database URL
+postgresql://job_message_writer_user:CbvWNVRNKvcH4CwOBnyfhJL9Epd4rHnz@dpg-cv3jssdsvqrc73fnksug-a.ohio-postgres.render.com/job_message_writer
+
+
+PSQL Command
+PGPASSWORD=CbvWNVRNKvcH4CwOBnyfhJL9Epd4rHnz psql -h dpg-cv3jssdsvqrc73fnksug-a.ohio-postgres.render.com -U job_message_writer_user job_message_writer
+
+
+
+
+
