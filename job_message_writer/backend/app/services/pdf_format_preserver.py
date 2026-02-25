@@ -6890,7 +6890,8 @@ async def optimize_pdf(
             if idx in bullet_budgets:
                 budget_total = bullet_budgets[idx]["total"]
                 actual_total = sum(len(l.strip()) for l in lines)
-                if actual_total < budget_total * 0.80:  # Less than 80% of pixel budget
+                min_overflow = bullet_budgets[idx].get("min_overflow", int(budget_total * 0.80))
+                if actual_total < min_overflow:  # Below structural overflow minimum
                     short_indices.append(idx)
                     logger.info(
                         f"[SHORT] Bullet {idx}: {actual_total} chars but budget allows {budget_total} "
