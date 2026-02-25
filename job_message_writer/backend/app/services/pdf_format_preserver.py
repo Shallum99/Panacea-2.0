@@ -4772,19 +4772,12 @@ def _patch_content_stream(
             if not has_any_kern:
                 return f"<{hex_encoded}>".encode("latin-1"), False
 
-            # Calculate natural width (in 1/1000 text space units)
-            glyph_widths = [widths_map.get(int(c, 16), default_w) for c in chars]
-            # TJ positive = shift left = reduces rendered width
-            natural_width = sum(glyph_widths) - sum(kern_values)
-
-            # Distribute residual across gaps
-            num_gaps = len(chars) - 1
-            if orig_width_1000 > 0 and num_gaps > 0:
-                residual = (natural_width - orig_width_1000) / num_gaps
-                # Clamp per-gap adjustment: ±30 in 1/1000 units (~0.3pt at 10pt)
-                residual = max(-30.0, min(30.0, residual))
-            else:
-                residual = 0.0
+            # Use ONLY the font's natural kerning — no artificial residual
+            # squeeze/expand.  The old code spread the width difference across
+            # every character gap, producing visible compression on tailored
+            # lines.  With _trim_text_to_fit ensuring text fits within budget,
+            # there is no need for TJ-level width compensation.
+            residual = 0.0
 
             # Build compact TJ content: merge consecutive near-zero-kern chars
             # into single hex segments for compactness
