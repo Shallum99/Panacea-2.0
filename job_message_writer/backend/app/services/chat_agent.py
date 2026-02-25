@@ -246,10 +246,14 @@ async def run_agent(
 
                 # Save assistant tool_use messages to DB
                 for tu in tool_uses:
+                    # Store input + thought_signature (Gemini 3.x) together
+                    tu_content = {"input": tu["input"]}
+                    if tu.get("thought_signature"):
+                        tu_content["thought_signature"] = tu["thought_signature"]
                     db.add(models.ChatMessage(
                         conversation_id=conversation_id,
                         role="tool_use",
-                        content=json.dumps(tu["input"]),
+                        content=json.dumps(tu_content),
                         tool_name=tu["name"],
                         tool_call_id=tu["id"],
                     ))
