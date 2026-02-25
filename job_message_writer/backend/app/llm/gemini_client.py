@@ -496,12 +496,16 @@ def _anthropic_messages_to_gemini(messages: list) -> list:
                         tool_id = block.get("id", "")
                         tool_name = block.get("name", "")
                         tool_id_to_name[tool_id] = tool_name
-                        parts.append({
+                        fc_part: Dict[str, Any] = {
                             "functionCall": {
                                 "name": tool_name,
                                 "args": block.get("input", {}),
                             }
-                        })
+                        }
+                        # Restore thought_signature for Gemini 3.x replay
+                        if block.get("thought_signature"):
+                            fc_part["thoughtSignature"] = block["thought_signature"]
+                        parts.append(fc_part)
             if parts:
                 contents.append({"role": "model", "parts": parts})
 
