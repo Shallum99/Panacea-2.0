@@ -1069,10 +1069,13 @@ def _compute_bullet_char_budgets(
 ) -> Dict[int, Dict]:
     """Compute smart character budgets per bullet based on available pixel space.
 
-    Uses span bounding boxes to estimate how many characters fit on each line
-    up to the right margin, instead of relying on original text length.
+    Uses font-level average character width (computed from ALL spans in the same
+    font across the document) for a robust estimate independent of any single
+    line's text content.  Also computes a structural minimum that guarantees
+    text overflows onto every visual line of a multi-line bullet.
 
-    Returns {bullet_idx: {"total": int, "per_line": [int, ...]}}
+    Returns {bullet_idx: {"total": int, "per_line": [int, ...],
+                          "min_overflow": int}}
     """
     # Compute per-page right margin from all classified lines
     page_margins: Dict[int, float] = {}
@@ -1082,6 +1085,28 @@ def _compute_bullet_char_budgets(
             if s.text.strip():
                 page_margins.setdefault(pn, 0.0)
                 page_margins[pn] = max(page_margins[pn], s.bbox[2])
+
+    # ── Build font-level average character widths ──
+    # Aggregate pixel width and char count across ALL spans per font_name.
+    # This gives a robust avg_char_w that isn't skewed by one line's content.
+    font_total_px: Dict[str, float] = {}   # font_name → total pixel width
+    font_total_ch: Dict[str, int] = {}     # font_name → total char count
+    for cl in classified_lines:
+        for s in cl.spans:
+            t = s.text.strip()
+            if not t or s.is_bullet_char or s.is_zwsp_only:
+                continue
+            fname = s.font_name
+            w = s.bbox[2] - s.bbox[0]
+            if w > 0 and len(t) > 0:
+                font_total_px[fname] = font_total_px.get(fname, 0.0) + w
+                font_total_ch[fname] = font_total_ch.get(fname, 0) + len(t)
+
+    font_avg_char_w: Dict[str, float] = {}
+    for fname, px in font_total_px.items():
+        ch = font_total_ch.get(fname, 1)
+        if ch > 0:
+            font_avg_char_w[fname] = px / ch
 
     budgets: Dict[int, Dict] = {}
 
@@ -1095,34 +1120,50 @@ def _compute_bullet_char_budgets(
                           and s.text.strip()]
 
             if not text_spans:
-                # Fallback: use original text length
                 per_line.append(len(tl.clean_text))
                 continue
 
             # x0 = left edge of first text span
             x0 = text_spans[0].bbox[0]
-            # Right margin for this page
             right_margin = page_margins.get(tl.page_num, 580.0)
-
             available_width_pts = max(0, right_margin - x0)
 
-            # Compute average character width from this line's spans
-            total_text_width = sum(s.bbox[2] - s.bbox[0] for s in text_spans)
-            total_chars = sum(len(s.text) for s in text_spans)
+            # Use font-level avg_char_w (robust across all document text).
+            # Fall back to this line's own spans if font not found.
+            primary_font = text_spans[0].font_name
+            avg_char_w = font_avg_char_w.get(primary_font, 0.0)
+            if avg_char_w <= 0:
+                total_text_width = sum(s.bbox[2] - s.bbox[0] for s in text_spans)
+                total_chars = sum(len(s.text) for s in text_spans)
+                avg_char_w = (total_text_width / total_chars) if total_chars > 0 else 6.0
 
-            if total_chars > 0 and total_text_width > 0:
-                avg_char_w = total_text_width / total_chars
-                char_budget = int(available_width_pts / avg_char_w)
-            else:
-                char_budget = len(tl.clean_text)
-
-            # Ensure budget is at least the original text length
+            char_budget = int(available_width_pts / avg_char_w)
             char_budget = max(char_budget, len(tl.clean_text))
             per_line.append(char_budget)
 
+        total = sum(per_line)
+        num_lines = len(per_line)
+
+        # ── Structural minimum: guarantee overflow onto every line ──
+        # For multi-line bullets the replacement text must exceed the capacity
+        # of lines 1..N-1 so greedy-fill spills onto the last line.
+        # A narrow-char safety factor accounts for the LLM potentially using
+        # narrower characters than the font average (more i/l/t → more chars
+        # fit per line → need even more chars to force overflow).
+        NARROW_CHAR_FACTOR = 0.78  # assume replacement could be 22% narrower
+        MIN_LAST_LINE_CHARS = 12   # at least a few words on the last line
+        if num_lines > 1:
+            first_n_minus_1 = sum(per_line[:-1])
+            min_overflow = int(first_n_minus_1 / NARROW_CHAR_FACTOR) + MIN_LAST_LINE_CHARS
+            # Don't exceed total capacity
+            min_overflow = min(min_overflow, total)
+        else:
+            min_overflow = max(20, int(total * 0.50))
+
         budgets[bp_idx] = {
-            "total": sum(per_line),
+            "total": total,
             "per_line": per_line,
+            "min_overflow": min_overflow,
         }
 
     return budgets
@@ -1170,21 +1211,20 @@ async def generate_optimized_content(
             for j, lt in enumerate(bp.line_texts):
                 lines_info.append(f"    Line {j+1}: {lt}")
 
-            # Compute total character budget from pixel-based budgets.
-            # chars ≠ pixels: proportional fonts have variable char widths,
-            # so the avg_char_w estimate has ~8-15% error.  A 0.92x safety
-            # factor prevents most pixel overflows while keeping fill high.
-            # A slightly short bullet (small whitespace gap) is far better
-            # than a long one that gets trimmed into a broken sentence.
+            # Compute character budget using structural overflow guarantee.
+            # min_overflow ensures the LLM generates enough text to spill
+            # onto EVERY visual line (preventing empty-line gaps).
+            # max is the full line capacity — the PDF engine's _trim_text_to_fit
+            # and greedy-fill handle any overflow safely with Tc=0 (no squeeze).
             if bullet_budgets and i in bullet_budgets:
-                total_budget = bullet_budgets[i]["total"]
-                min_total = int(total_budget * 0.80)
-                max_total = int(total_budget * 0.92)  # 8% safety for char→pixel noise
+                bb = bullet_budgets[i]
+                min_total = bb["min_overflow"]
+                max_total = bb["total"]
             else:
                 # Fallback: sum of original line lengths
                 total_chars = sum(len(lt.strip()) for lt in bp.line_texts)
-                min_total = max(20, int(total_chars * 0.80))
-                max_total = int(total_chars * 0.92)
+                min_total = max(20, int(total_chars * 0.85))
+                max_total = total_chars
 
             bullet_texts.append(
                 f"  BULLET {i+1} ({bp.section_name}) "
@@ -1214,7 +1254,7 @@ RULES:
 3. PRESERVE: company names, metrics, percentages, dates, and all factual claims — do NOT fabricate
 4. NEVER add technologies, tools, frameworks, or platforms that are NOT already mentioned in the bullet. You may rephrase existing tech to match JD terminology (e.g., "AWS Lambda" → "serverless Lambda functions"), but NEVER introduce completely new technologies the candidate didn't use. If the JD asks for "Node.js" but the bullet mentions "Python/Django", keep "Python/Django" — do NOT swap it for Node.js.
 5. Each bullet must have EXACTLY the same number of lines as the original
-6. CHARACTER BUDGET: Total characters across ALL lines must be within [min-max]. Write a COMPLETE sentence that fits within the budget. A shorter complete sentence is ALWAYS better than a longer fragment. If your sentence exceeds the max, SHORTEN IT — do not leave it incomplete. The PDF engine joins all lines and re-wraps, so per-line length doesn't matter — only the TOTAL.
+6. CHARACTER BUDGET: Total characters across ALL lines must be within [min-max]. AIM FOR THE UPPER END of this range — filling more space is ALWAYS better than leaving it empty. The PDF engine handles overflow safely, but short text creates ugly gaps. Add specific metrics, technologies, scope, or impact details to fill the budget. Per-line length doesn't matter — only the TOTAL.
 7. SEMANTIC COMPLETENESS — THE MOST IMPORTANT RULE:
    - Each bullet (ALL lines combined) must be exactly ONE complete, grammatically correct sentence
    - NEVER write two separate thoughts in one bullet. BAD: "...product recommendations This strategic enhancement improved the user" — this is TWO sentences jammed together
@@ -4624,9 +4664,10 @@ def _patch_content_stream(
             new_w = _calc_hex_width(full_hex)
             if orig_w <= 0:
                 return text
-            # Zero-Tc policy: text must fit within original width.
-            # Allow 3% tolerance for per-pair kerning TJ adjustments.
-            tolerance = orig_w * 0.03 if use_kerned_tj else 0
+            # Zero-Tc, zero-residual policy: text must fit within original
+            # width.  No TJ residual squeeze, so trim strictly.  Allow 0.5%
+            # tolerance only for sub-pixel font-metric rounding.
+            tolerance = orig_w * 0.005
             if new_w <= orig_w + tolerance:
                 return text  # Fits fine
             def _fits(t: str) -> bool:
@@ -4732,19 +4773,13 @@ def _patch_content_stream(
             if not has_any_kern:
                 return f"<{hex_encoded}>".encode("latin-1"), False
 
-            # Calculate natural width (in 1/1000 text space units)
-            glyph_widths = [widths_map.get(int(c, 16), default_w) for c in chars]
-            # TJ positive = shift left = reduces rendered width
-            natural_width = sum(glyph_widths) - sum(kern_values)
-
-            # Distribute residual across gaps
+            # Use ONLY the font's natural kerning — no artificial residual
+            # squeeze/expand.  The old code spread the width difference across
+            # every character gap, producing visible compression on tailored
+            # lines.  With _trim_text_to_fit ensuring text fits within budget,
+            # there is no need for TJ-level width compensation.
+            residual = 0.0
             num_gaps = len(chars) - 1
-            if orig_width_1000 > 0 and num_gaps > 0:
-                residual = (natural_width - orig_width_1000) / num_gaps
-                # Clamp per-gap adjustment: ±30 in 1/1000 units (~0.3pt at 10pt)
-                residual = max(-30.0, min(30.0, residual))
-            else:
-                residual = 0.0
 
             # Build compact TJ content: merge consecutive near-zero-kern chars
             # into single hex segments for compactness
@@ -5140,12 +5175,11 @@ def _patch_content_stream(
             # BUT: don't redistribute if it would create orphan lines
             # (< 3 words on any line).  A 1-word orphan ("improvements",
             # "50%") looks far worse than a small vertical gap.
-            MIN_WORDS_PER_LINE = 3
+            MIN_WORDS_PER_LINE = 2
             used_count = sum(1 for la in line_assignments if la is not None)
-            # Also check: is there enough total text to fill at least 60% of
-            # each line? If not, redistribution spreads thin text even thinner
-            # (e.g., 15 words → 12 + 3, where line 1 gets "microservices workflows").
-            # In that case, keep text on line 0 where it at least fills one line fully.
+            # Check: is there enough total text to put at least 2 words on
+            # each line? With Tc=0 policy, short lines just render left-aligned
+            # (no squeeze) — a short line is always better than an empty gap.
             _total_text_w = sum(
                 (_calc_hex_width(cmap_mgr.encode_text(actual_font, w)[0])
                  if cmap_mgr.encode_text(actual_font, w)[0] else default_w * len(w))
@@ -5155,7 +5189,7 @@ def _patch_content_stream(
             _fill_ratio = _total_text_w / _total_budget_w if _total_budget_w > 0 else 0
             if (used_count < num_groups
                     and len(words) >= num_groups * MIN_WORDS_PER_LINE
-                    and _fill_ratio >= 0.60):
+                    and _fill_ratio >= 0.35):
                 # Pre-compute per-word widths (CID-based, same as greedy fill)
                 word_widths_list: List[float] = []
                 for w in words:
@@ -6850,7 +6884,8 @@ async def optimize_pdf(
             if idx in bullet_budgets:
                 budget_total = bullet_budgets[idx]["total"]
                 actual_total = sum(len(l.strip()) for l in lines)
-                if actual_total < budget_total * 0.80:  # Less than 80% of pixel budget
+                min_overflow = bullet_budgets[idx].get("min_overflow", int(budget_total * 0.80))
+                if actual_total < min_overflow:  # Below structural overflow minimum
                     short_indices.append(idx)
                     logger.info(
                         f"[SHORT] Bullet {idx}: {actual_total} chars but budget allows {budget_total} "
@@ -6865,10 +6900,11 @@ async def optimize_pdf(
         for idx in sorted(short_indices):
             bp = bullets[idx]
             budget_total = bullet_budgets[idx]["total"]
+            min_overflow = bullet_budgets[idx].get("min_overflow", budget_total)
             current_text = " ".join(l.strip() for l in bullet_replacements[idx])
             short_bullet_texts.append(
                 f"  BULLET {idx+1} ({bp.section_name}) "
-                f"[{len(bp.line_texts)} lines, total {budget_total}-{int(budget_total * 1.3)} chars]:\n"
+                f"[{len(bp.line_texts)} lines, total {min_overflow}-{budget_total} chars]:\n"
                 f"    Current (TOO SHORT at {len(current_text)} chars): {current_text}\n"
                 f"    Original:\n" + "\n".join(f"      {lt}" for lt in bp.line_texts)
             )

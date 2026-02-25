@@ -496,12 +496,16 @@ def _anthropic_messages_to_gemini(messages: list) -> list:
                         tool_id = block.get("id", "")
                         tool_name = block.get("name", "")
                         tool_id_to_name[tool_id] = tool_name
-                        parts.append({
+                        fc_part: Dict[str, Any] = {
                             "functionCall": {
                                 "name": tool_name,
                                 "args": block.get("input", {}),
                             }
-                        })
+                        }
+                        # Restore thought_signature for Gemini 3.x replay
+                        if block.get("thought_signature"):
+                            fc_part["thoughtSignature"] = block["thought_signature"]
+                        parts.append(fc_part)
             if parts:
                 contents.append({"role": "model", "parts": parts})
 
@@ -525,17 +529,24 @@ def _gemini_response_to_anthropic(data: Dict) -> Dict:
     has_tool_call = False
 
     for part in parts:
+        # Skip thinking/thought parts (Gemini 3.x internal reasoning)
+        if part.get("thought"):
+            continue
         if "text" in part and part["text"]:
             content_blocks.append({"type": "text", "text": part["text"]})
         elif "functionCall" in part:
             has_tool_call = True
             fc = part["functionCall"]
-            content_blocks.append({
+            block = {
                 "type": "tool_use",
                 "id": f"toolu_{uuid.uuid4().hex[:20]}",
                 "name": fc.get("name", ""),
                 "input": fc.get("args", {}),
-            })
+            }
+            # Preserve thought_signature for Gemini 3.x replay
+            if "thoughtSignature" in part:
+                block["thought_signature"] = part["thoughtSignature"]
+            content_blocks.append(block)
 
     if not content_blocks:
         content_blocks = [{"type": "text", "text": "Done."}]
