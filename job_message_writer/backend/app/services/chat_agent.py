@@ -368,15 +368,25 @@ def _load_history(conversation_id: int, db: Session) -> list:
             while i < len(db_messages) and db_messages[i].role == "tool_use":
                 tu_msg = db_messages[i]
                 try:
-                    tool_input = json.loads(tu_msg.content)
+                    parsed = json.loads(tu_msg.content)
                 except Exception:
-                    tool_input = {}
-                assistant_content.append({
+                    parsed = {}
+                # Handle both old format (bare input) and new format ({"input": ..., "thought_signature": ...})
+                if isinstance(parsed, dict) and "input" in parsed:
+                    tool_input = parsed["input"]
+                    thought_sig = parsed.get("thought_signature")
+                else:
+                    tool_input = parsed
+                    thought_sig = None
+                tu_block = {
                     "type": "tool_use",
                     "id": tu_msg.tool_call_id,
                     "name": tu_msg.tool_name,
                     "input": tool_input,
-                })
+                }
+                if thought_sig:
+                    tu_block["thought_signature"] = thought_sig
+                assistant_content.append(tu_block)
                 tool_ids.append(tu_msg.tool_call_id)
                 i += 1
 
