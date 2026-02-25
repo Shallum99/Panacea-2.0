@@ -6906,10 +6906,11 @@ async def optimize_pdf(
         for idx in sorted(short_indices):
             bp = bullets[idx]
             budget_total = bullet_budgets[idx]["total"]
+            min_overflow = bullet_budgets[idx].get("min_overflow", budget_total)
             current_text = " ".join(l.strip() for l in bullet_replacements[idx])
             short_bullet_texts.append(
                 f"  BULLET {idx+1} ({bp.section_name}) "
-                f"[{len(bp.line_texts)} lines, total {budget_total}-{int(budget_total * 1.3)} chars]:\n"
+                f"[{len(bp.line_texts)} lines, total {min_overflow}-{budget_total} chars]:\n"
                 f"    Current (TOO SHORT at {len(current_text)} chars): {current_text}\n"
                 f"    Original:\n" + "\n".join(f"      {lt}" for lt in bp.line_texts)
             )
