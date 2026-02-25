@@ -4779,6 +4779,7 @@ def _patch_content_stream(
             # lines.  With _trim_text_to_fit ensuring text fits within budget,
             # there is no need for TJ-level width compensation.
             residual = 0.0
+            num_gaps = len(chars) - 1
 
             # Build compact TJ content: merge consecutive near-zero-kern chars
             # into single hex segments for compactness
