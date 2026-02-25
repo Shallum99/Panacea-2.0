@@ -4664,9 +4664,10 @@ def _patch_content_stream(
             new_w = _calc_hex_width(full_hex)
             if orig_w <= 0:
                 return text
-            # Zero-Tc policy: text must fit within original width.
-            # Allow 3% tolerance for per-pair kerning TJ adjustments.
-            tolerance = orig_w * 0.03 if use_kerned_tj else 0
+            # Zero-Tc, zero-residual policy: text must fit within original
+            # width.  No TJ residual squeeze, so trim strictly.  Allow 0.5%
+            # tolerance only for sub-pixel font-metric rounding.
+            tolerance = orig_w * 0.005
             if new_w <= orig_w + tolerance:
                 return text  # Fits fine
             def _fits(t: str) -> bool:
