@@ -5194,7 +5194,7 @@ def _patch_content_stream(
             _fill_ratio = _total_text_w / _total_budget_w if _total_budget_w > 0 else 0
             if (used_count < num_groups
                     and len(words) >= num_groups * MIN_WORDS_PER_LINE
-                    and _fill_ratio >= 0.60):
+                    and _fill_ratio >= 0.35):
                 # Pre-compute per-word widths (CID-based, same as greedy fill)
                 word_widths_list: List[float] = []
                 for w in words:
