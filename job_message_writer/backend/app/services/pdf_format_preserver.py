@@ -1211,21 +1211,20 @@ async def generate_optimized_content(
             for j, lt in enumerate(bp.line_texts):
                 lines_info.append(f"    Line {j+1}: {lt}")
 
-            # Compute total character budget from pixel-based budgets.
-            # chars ≠ pixels: proportional fonts have variable char widths,
-            # so the avg_char_w estimate has ~8-15% error.  A 0.92x safety
-            # factor prevents most pixel overflows while keeping fill high.
-            # A slightly short bullet (small whitespace gap) is far better
-            # than a long one that gets trimmed into a broken sentence.
+            # Compute character budget using structural overflow guarantee.
+            # min_overflow ensures the LLM generates enough text to spill
+            # onto EVERY visual line (preventing empty-line gaps).
+            # max is the full line capacity — the PDF engine's _trim_text_to_fit
+            # and greedy-fill handle any overflow safely with Tc=0 (no squeeze).
             if bullet_budgets and i in bullet_budgets:
-                total_budget = bullet_budgets[i]["total"]
-                min_total = int(total_budget * 0.80)
-                max_total = int(total_budget * 0.92)  # 8% safety for char→pixel noise
+                bb = bullet_budgets[i]
+                min_total = bb["min_overflow"]
+                max_total = bb["total"]
             else:
                 # Fallback: sum of original line lengths
                 total_chars = sum(len(lt.strip()) for lt in bp.line_texts)
-                min_total = max(20, int(total_chars * 0.80))
-                max_total = int(total_chars * 0.92)
+                min_total = max(20, int(total_chars * 0.85))
+                max_total = total_chars
 
             bullet_texts.append(
                 f"  BULLET {i+1} ({bp.section_name}) "
