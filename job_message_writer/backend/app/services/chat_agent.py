@@ -231,12 +231,16 @@ async def run_agent(
                     if block["type"] == "text":
                         assistant_content.append({"type": "text", "text": block["text"]})
                     elif block["type"] == "tool_use":
-                        assistant_content.append({
+                        tu_block = {
                             "type": "tool_use",
                             "id": block["id"],
                             "name": block["name"],
                             "input": block["input"],
-                        })
+                        }
+                        # Preserve thought_signature for Gemini 3.x replay
+                        if block.get("thought_signature"):
+                            tu_block["thought_signature"] = block["thought_signature"]
+                        assistant_content.append(tu_block)
 
                 messages.append({"role": "assistant", "content": assistant_content})
 
