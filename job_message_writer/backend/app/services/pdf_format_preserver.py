@@ -5180,12 +5180,11 @@ def _patch_content_stream(
             # BUT: don't redistribute if it would create orphan lines
             # (< 3 words on any line).  A 1-word orphan ("improvements",
             # "50%") looks far worse than a small vertical gap.
-            MIN_WORDS_PER_LINE = 3
+            MIN_WORDS_PER_LINE = 2
             used_count = sum(1 for la in line_assignments if la is not None)
-            # Also check: is there enough total text to fill at least 60% of
-            # each line? If not, redistribution spreads thin text even thinner
-            # (e.g., 15 words → 12 + 3, where line 1 gets "microservices workflows").
-            # In that case, keep text on line 0 where it at least fills one line fully.
+            # Check: is there enough total text to put at least 2 words on
+            # each line? With Tc=0 policy, short lines just render left-aligned
+            # (no squeeze) — a short line is always better than an empty gap.
             _total_text_w = sum(
                 (_calc_hex_width(cmap_mgr.encode_text(actual_font, w)[0])
                  if cmap_mgr.encode_text(actual_font, w)[0] else default_w * len(w))
