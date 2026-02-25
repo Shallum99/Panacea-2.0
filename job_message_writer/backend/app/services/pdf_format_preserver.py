@@ -1069,10 +1069,13 @@ def _compute_bullet_char_budgets(
 ) -> Dict[int, Dict]:
     """Compute smart character budgets per bullet based on available pixel space.
 
-    Uses span bounding boxes to estimate how many characters fit on each line
-    up to the right margin, instead of relying on original text length.
+    Uses font-level average character width (computed from ALL spans in the same
+    font across the document) for a robust estimate independent of any single
+    line's text content.  Also computes a structural minimum that guarantees
+    text overflows onto every visual line of a multi-line bullet.
 
-    Returns {bullet_idx: {"total": int, "per_line": [int, ...]}}
+    Returns {bullet_idx: {"total": int, "per_line": [int, ...],
+                          "min_overflow": int}}
     """
     # Compute per-page right margin from all classified lines
     page_margins: Dict[int, float] = {}
@@ -1082,6 +1085,28 @@ def _compute_bullet_char_budgets(
             if s.text.strip():
                 page_margins.setdefault(pn, 0.0)
                 page_margins[pn] = max(page_margins[pn], s.bbox[2])
+
+    # ── Build font-level average character widths ──
+    # Aggregate pixel width and char count across ALL spans per font_name.
+    # This gives a robust avg_char_w that isn't skewed by one line's content.
+    font_total_px: Dict[str, float] = {}   # font_name → total pixel width
+    font_total_ch: Dict[str, int] = {}     # font_name → total char count
+    for cl in classified_lines:
+        for s in cl.spans:
+            t = s.text.strip()
+            if not t or s.is_bullet_char or s.is_zwsp_only:
+                continue
+            fname = s.font_name
+            w = s.bbox[2] - s.bbox[0]
+            if w > 0 and len(t) > 0:
+                font_total_px[fname] = font_total_px.get(fname, 0.0) + w
+                font_total_ch[fname] = font_total_ch.get(fname, 0) + len(t)
+
+    font_avg_char_w: Dict[str, float] = {}
+    for fname, px in font_total_px.items():
+        ch = font_total_ch.get(fname, 1)
+        if ch > 0:
+            font_avg_char_w[fname] = px / ch
 
     budgets: Dict[int, Dict] = {}
 
@@ -1095,34 +1120,50 @@ def _compute_bullet_char_budgets(
                           and s.text.strip()]
 
             if not text_spans:
-                # Fallback: use original text length
                 per_line.append(len(tl.clean_text))
                 continue
 
             # x0 = left edge of first text span
             x0 = text_spans[0].bbox[0]
-            # Right margin for this page
             right_margin = page_margins.get(tl.page_num, 580.0)
-
             available_width_pts = max(0, right_margin - x0)
 
-            # Compute average character width from this line's spans
-            total_text_width = sum(s.bbox[2] - s.bbox[0] for s in text_spans)
-            total_chars = sum(len(s.text) for s in text_spans)
+            # Use font-level avg_char_w (robust across all document text).
+            # Fall back to this line's own spans if font not found.
+            primary_font = text_spans[0].font_name
+            avg_char_w = font_avg_char_w.get(primary_font, 0.0)
+            if avg_char_w <= 0:
+                total_text_width = sum(s.bbox[2] - s.bbox[0] for s in text_spans)
+                total_chars = sum(len(s.text) for s in text_spans)
+                avg_char_w = (total_text_width / total_chars) if total_chars > 0 else 6.0
 
-            if total_chars > 0 and total_text_width > 0:
-                avg_char_w = total_text_width / total_chars
-                char_budget = int(available_width_pts / avg_char_w)
-            else:
-                char_budget = len(tl.clean_text)
-
-            # Ensure budget is at least the original text length
+            char_budget = int(available_width_pts / avg_char_w)
             char_budget = max(char_budget, len(tl.clean_text))
             per_line.append(char_budget)
 
+        total = sum(per_line)
+        num_lines = len(per_line)
+
+        # ── Structural minimum: guarantee overflow onto every line ──
+        # For multi-line bullets the replacement text must exceed the capacity
+        # of lines 1..N-1 so greedy-fill spills onto the last line.
+        # A narrow-char safety factor accounts for the LLM potentially using
+        # narrower characters than the font average (more i/l/t → more chars
+        # fit per line → need even more chars to force overflow).
+        NARROW_CHAR_FACTOR = 0.78  # assume replacement could be 22% narrower
+        MIN_LAST_LINE_CHARS = 12   # at least a few words on the last line
+        if num_lines > 1:
+            first_n_minus_1 = sum(per_line[:-1])
+            min_overflow = int(first_n_minus_1 / NARROW_CHAR_FACTOR) + MIN_LAST_LINE_CHARS
+            # Don't exceed total capacity
+            min_overflow = min(min_overflow, total)
+        else:
+            min_overflow = max(20, int(total * 0.50))
+
         budgets[bp_idx] = {
-            "total": sum(per_line),
+            "total": total,
             "per_line": per_line,
+            "min_overflow": min_overflow,
         }
 
     return budgets
