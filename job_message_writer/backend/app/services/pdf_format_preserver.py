@@ -1254,7 +1254,7 @@ RULES:
 3. PRESERVE: company names, metrics, percentages, dates, and all factual claims — do NOT fabricate
 4. NEVER add technologies, tools, frameworks, or platforms that are NOT already mentioned in the bullet. You may rephrase existing tech to match JD terminology (e.g., "AWS Lambda" → "serverless Lambda functions"), but NEVER introduce completely new technologies the candidate didn't use. If the JD asks for "Node.js" but the bullet mentions "Python/Django", keep "Python/Django" — do NOT swap it for Node.js.
 5. Each bullet must have EXACTLY the same number of lines as the original
-6. CHARACTER BUDGET: Total characters across ALL lines must be within [min-max]. Write a COMPLETE sentence that fits within the budget. A shorter complete sentence is ALWAYS better than a longer fragment. If your sentence exceeds the max, SHORTEN IT — do not leave it incomplete. The PDF engine joins all lines and re-wraps, so per-line length doesn't matter — only the TOTAL.
+6. CHARACTER BUDGET: Total characters across ALL lines must be within [min-max]. AIM FOR THE UPPER END of this range — filling more space is ALWAYS better than leaving it empty. The PDF engine handles overflow safely, but short text creates ugly gaps. Add specific metrics, technologies, scope, or impact details to fill the budget. Per-line length doesn't matter — only the TOTAL.
 7. SEMANTIC COMPLETENESS — THE MOST IMPORTANT RULE:
    - Each bullet (ALL lines combined) must be exactly ONE complete, grammatically correct sentence
    - NEVER write two separate thoughts in one bullet. BAD: "...product recommendations This strategic enhancement improved the user" — this is TWO sentences jammed together
